@@ -1,0 +1,40 @@
+# Keanu Configuration
+# Copy this file to settings.yaml and fill in your values.
+
+imessage_account: "yourbot@icloud.com"
+
+security:
+  # Handles allowed to interact with Keanu (phone numbers or Apple IDs)
+  allowed_numbers:
+    - "+1XXXXXXXXXX"
+    - "family@icloud.com"
+
+  # Handles that get kid-friendly content
+  kids:
+    - "kid@icloud.com"
+
+  # Only this handle can change the meal plan
+  menu_admin: "+1XXXXXXXXXX"
+
+  # Handles allowed to submit recipe ideas
+  idea_submitters:
+    - "+1XXXXXXXXXX"
+
+  # Max messages per hour per handle before rate-limiting
+  rate_limit_per_hour: 50
+
+  # Maps iMessage handles to family member first names (used by schedule agent)
+  handle_to_person:
+    "kid@icloud.com": "Name"
+    "+1XXXXXXXXXX": "Name"
+
+agents:
+  menu:
+    enabled: true
+    description: "Family meal planning and recipe assistant"
+
+# Paths — adjust to match your setup
+paths:
+  cooking_base: "/Users/Shared/cooking"
+  schedule_file: "/path/to/FamilySchedule/schedule.json"
+  dropbox_recipes_url: "https://www.dropbox.com/home/path/to/recipes"
