@@ -375,7 +375,8 @@ def main():
                         else:
                             reply = "Couldn't quite parse that — try something like 'change Thursday to chicken tacos'."
                     else:
-                        reply = "Sorry, only David can change the menu!"
+                        admin_name = config["security"].get("handle_to_person", {}).get(menu_admin, "the admin")
+                        reply = f"Sorry, only {admin_name} can change the menu!"
                     send_imessage(handle, reply)
                     continue
 

@@ -372,12 +372,10 @@ def update_meal_plan(message: str) -> Optional[str]:
 
 # ── Meal feedback ─────────────────────────────────────────────────────────────
 
-HANDLE_TO_NAME = {
-    "+15132950588": "David",
-    "+15132528285": "Ashley",
-    "theallisonfamilia@gmail.com": "Eleanor",
-    "wren.allison@icloud.com": "Wren",
-}
+def _load_handle_to_name() -> dict:
+    config_file = Path(__file__).parent.parent / "config/settings.yaml"
+    config = yaml.safe_load(config_file.read_text())
+    return config.get("security", {}).get("handle_to_person", {})
 
 # Past-tense verbs are strong standalone feedback signals.
 # Adjectives need a past-tense context word to avoid false positives
@@ -480,8 +478,9 @@ def parse_per_person_feedback(message: str, handle: str) -> list:
     import anthropic as _anthropic
     import os as _os
 
-    sender_name = HANDLE_TO_NAME.get(handle, handle)
-    family = ", ".join(HANDLE_TO_NAME.values())
+    handle_to_name = _load_handle_to_name()
+    sender_name = handle_to_name.get(handle, handle)
+    family = ", ".join(handle_to_name.values())
 
     prompt = f"""Extract individual family member reactions from this meal feedback message.
 Family members: {family}
@@ -520,7 +519,7 @@ Only include people explicitly mentioned. Return only the JSON array, no other t
         # Fallback: single entry for the sender
         return [{
             "date": date.today().isoformat(),
-            "person": HANDLE_TO_NAME.get(handle, handle),
+            "person": _load_handle_to_name().get(handle, handle),
             "sentiment": "liked",
             "note": message,
         }]
