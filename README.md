@@ -2,6 +2,8 @@
 
 Keanu is an iMessage bot that answers family questions about dinner, weekly schedules, recipes, and more. It runs 24/7 on a dedicated Mac account and responds via a shared Apple ID.
 
+The key design goal: every family member uses the device they already have. No app to install, no account to create, no new tool to learn — just iMessage.
+
 ## What it does
 
 - **Meal planning** — what's for dinner, ingredients, recipe details
