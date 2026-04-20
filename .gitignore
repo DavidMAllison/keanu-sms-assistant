@@ -1,0 +1,24 @@
+# Personal config — copy settings.yaml.example and fill in your values
+config/settings.yaml
+
+# API key
+.env
+.env.save
+
+# Runtime state and logs
+keanu.log
+capability_gaps.json
+.keanu_state.json
+
+# Scratch files
+Untitled.rtf
+keanu-setup.txt
+test_key.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
