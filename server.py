@@ -22,6 +22,7 @@ from agents.menu_agent import (
     is_recipe_idea, save_recipe_idea, is_menu_change, update_meal_plan,
     detect_feedback, has_feedback_reason, guess_recipe_from_context,
     parse_per_person_feedback, save_feedback,
+    detect_preference, save_preference,
     RECIPES_DIR, find_all_recipe_matches, extract_recipe_text,
     RECIPE_CHUNK_CHARS, split_into_chunks, get_dropbox_preview_url,
 )
@@ -37,6 +38,7 @@ log = logging.getLogger(__name__)
 CONFIG_FILE = Path(__file__).parent / "config/settings.yaml"
 STATE_FILE = Path(__file__).parent / ".keanu_state.json"
 GAPS_FILE = Path(__file__).parent / "capability_gaps.json"
+KEANU_FEEDBACK_FILE = Path(__file__).parent / "keanu_feedback.json"
 CHAT_DB = Path.home() / "Library/Messages/chat.db"
 POLL_INTERVAL = 3  # seconds
 
@@ -62,10 +64,38 @@ def save_gap(handle: str, message: str):
     gaps.append({"date": time.strftime("%Y-%m-%d"), "handle": handle, "request": message, "reviewed": False})
     GAPS_FILE.write_text(json.dumps(gaps, indent=2))
 
+_KEANU_FEEDBACK_SIGNALS = [
+    "keanu", "you should", "you always", "you keep", "you never",
+    "stop responding", "too long", "too short", "too formal", "too casual",
+    "your responses", "your replies", "the bot", "the assistant",
+]
+
+def is_keanu_feedback(text: str) -> bool:
+    lowered = text.lower()
+    return any(p in lowered for p in _KEANU_FEEDBACK_SIGNALS)
+
+def save_keanu_feedback(handle: str, message: str):
+    entries = json.loads(KEANU_FEEDBACK_FILE.read_text()) if KEANU_FEEDBACK_FILE.exists() else []
+    entries.append({"date": time.strftime("%Y-%m-%d"), "handle": handle, "feedback": message, "reviewed": False})
+    KEANU_FEEDBACK_FILE.write_text(json.dumps(entries, indent=2))
+
 def unreviewed_gaps() -> list:
     if not GAPS_FILE.exists():
         return []
     return [g for g in json.loads(GAPS_FILE.read_text()) if not g.get("reviewed")]
+
+# ── Tapback / reaction filter ─────────────────────────────────────────────────
+
+_TAPBACK_PREFIXES = (
+    "Liked ", "Loved ", "Disliked ", "Laughed at ",
+    "Emphasized ", "Questioned ", "Removed a heart from ",
+    "Removed a like from ", "Removed a dislike from ",
+    "Removed a laugh from ", "Removed an exclamation from ",
+    "Removed a question mark from ",
+)
+
+def is_tapback(text: str) -> bool:
+    return any(text.startswith(p) for p in _TAPBACK_PREFIXES)
 
 # ── iMessage send via AppleScript ─────────────────────────────────────────────
 
@@ -279,6 +309,10 @@ def main():
                 text = msg["text"]
                 log.info(f"Message from {handle}: {text[:80]}")
 
+                if is_tapback(text):
+                    log.info(f"Ignoring tapback from {handle}")
+                    continue
+
                 if handle not in config["security"]["allowed_numbers"]:
                     log.warning(f"Rejected from unauthorized handle: {handle}")
                     continue
@@ -363,6 +397,25 @@ def main():
                         reply = f"Good to know — what did you think specifically about {recipe}?"
                         send_imessage(handle, reply)
                         continue
+
+                # Detect standing preferences ("less pasta", "can we try", etc.)
+                if detect_preference(text):
+                    ok = save_preference(text, handle)
+                    if ok:
+                        log.info(f"Preference logged from {handle}: {text[:80]}")
+                        reply = "Noted — I'll keep that in mind for future meal planning!"
+                    else:
+                        reply = "Got it, though I had trouble saving that one."
+                    send_imessage(handle, reply)
+                    continue
+
+                # Detect feedback about Keanu itself
+                if is_keanu_feedback(text):
+                    save_keanu_feedback(handle, text)
+                    log.info(f"Keanu feedback logged from {handle}: {text[:80]}")
+                    reply = "Noted, I'll pass that along!"
+                    send_imessage(handle, reply)
+                    continue
 
                 menu_admin = config["security"].get("menu_admin")
 
