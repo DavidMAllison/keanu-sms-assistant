@@ -23,6 +23,7 @@ INVENTORY_FILE = COOKING_BASE / "inventory.md"
 METADATA_FILE = COOKING_BASE / "recipe_metadata.json"
 SYSTEM_PROMPT_FILE = Path(__file__).parent.parent / "system_prompts/menu.txt"
 DROPBOX_RECIPES_BASE = _paths.get("dropbox_recipes_url", "")
+PREFERENCES_FILE = COOKING_BASE / "family_preferences.json"
 
 DAY_NAMES = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -61,6 +62,16 @@ def load_context() -> str:
     inventory = _load_inventory()
     if inventory:
         sections.append(f"\n--- FOOD INVENTORY ---\n{inventory}")
+
+    # Family preferences (standing requests about future meals)
+    prefs = _load_preferences()
+    if prefs:
+        sections.append(f"\n--- FAMILY PREFERENCES ---\n{prefs}")
+
+    # Recent meal feedback (last 3 weeks)
+    feedback = _load_recent_feedback()
+    if feedback:
+        sections.append(f"\n--- RECENT MEAL FEEDBACK ---\n{feedback}")
 
     return "\n".join(sections)
 
@@ -115,6 +126,43 @@ def _load_inventory() -> Optional[str]:
     if not INVENTORY_FILE.exists():
         return None
     return INVENTORY_FILE.read_text()
+
+
+def _load_preferences() -> Optional[str]:
+    if not PREFERENCES_FILE.exists():
+        return None
+    try:
+        prefs = json.loads(PREFERENCES_FILE.read_text())
+        if not prefs:
+            return None
+        lines = [f"- {p['person']} ({p['date']}): {p['preference']}" for p in prefs[-20:]]
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def _load_recent_feedback() -> Optional[str]:
+    files = sorted(WEEKLYPLAN_DIR.glob("mealplan_*_feedback.json"), reverse=True)[:3]
+    lines = []
+    for f in files:
+        try:
+            data = json.loads(f.read_text())
+            for day, meal in data.get("meals", {}).items():
+                recipe = meal.get("recipe", "")
+                for fb in meal.get("feedback", []):
+                    note = fb.get("note", "")
+                    if not note or note == "did not cook":
+                        continue
+                    person = fb.get("person", "")
+                    sentiment = fb.get("sentiment", "")
+                    parts = [f"- {recipe}"]
+                    if person:
+                        parts.append(f"({person}, {sentiment})" if sentiment else f"({person})")
+                    parts.append(f": {note}")
+                    lines.append(" ".join(parts))
+        except Exception:
+            continue
+    return "\n".join(lines) if lines else None
 
 
 def get_recipe_content(recipe_name: str) -> Optional[str]:
@@ -368,6 +416,40 @@ def update_meal_plan(message: str) -> Optional[str]:
         plan_file.write_text("\n".join(lines))
         return new_recipe
     return None
+
+
+# ── Family preferences ───────────────────────────────────────────────────────
+
+_PREFERENCE_SIGNALS = [
+    "less ", "fewer ", "not as much", "not so many", "not so much",
+    "only once", "only twice", "once a week", "twice a week",
+    "once per week", "twice per week", "one time a week", "two times a week",
+    "more often", "less often", "not every week",
+    "can we try", "can we have", "can we make", "can we do",
+    "in the future", "going forward", "next time",
+    "would prefer", "would rather", "prefer not",
+]
+
+
+def detect_preference(message: str) -> bool:
+    lowered = message.lower()
+    return any(p in lowered for p in _PREFERENCE_SIGNALS)
+
+
+def save_preference(message: str, handle: str) -> bool:
+    handle_to_name = _load_handle_to_name()
+    person = handle_to_name.get(handle, handle)
+    try:
+        prefs = json.loads(PREFERENCES_FILE.read_text()) if PREFERENCES_FILE.exists() else []
+        prefs.append({
+            "date": date.today().isoformat(),
+            "person": person,
+            "preference": message,
+        })
+        PREFERENCES_FILE.write_text(json.dumps(prefs, indent=2))
+        return True
+    except Exception:
+        return False
 
 
 # ── Meal feedback ─────────────────────────────────────────────────────────────
