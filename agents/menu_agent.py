@@ -5,6 +5,7 @@ import yaml
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import pypdf
 
@@ -46,10 +47,12 @@ def load_context() -> str:
     today = now.date()
     sections.append(f"Current date and time: {now.strftime('%A, %B %d, %Y at %-I:%M %p')}")
 
-    # Current week's meal plan
+    # Current week's meal plan (strip Dropbox URLs — Claude uses get_recipe tool instead)
     plan = _load_current_meal_plan(today)
     if plan:
-        sections.append(f"\n--- CURRENT WEEK MEAL PLAN ---\n{plan}")
+        clean_plan = re.sub(r"https?://\S+", "", plan)
+        clean_plan = re.sub(r"\n{3,}", "\n\n", clean_plan).strip()
+        sections.append(f"\n--- CURRENT WEEK MEAL PLAN ---\n{clean_plan}")
     else:
         sections.append("\n--- CURRENT WEEK MEAL PLAN ---\nNo meal plan found for this week.")
 
@@ -264,29 +267,37 @@ RECIPE_CHUNK_CHARS = 800
 
 def find_all_recipe_matches(message: str) -> list[dict]:
     """Return list of {name, filename} for all recipes matching message keywords."""
-    results = []
     msg_lower = message.lower()
     if not METADATA_FILE.exists():
-        return results
+        return []
     try:
         data = json.loads(METADATA_FILE.read_text())
-        for name, meta in data.items():
+        recipes = data.get("recipes", data)
+        candidates = []
+        for name, meta in recipes.items():
             if not isinstance(meta, dict):
                 continue
+            filename = meta.get("filename", "")
+            if not filename or not (RECIPES_DIR / filename).exists():
+                continue
             name_lower = name.lower()
+            # Exact match wins immediately
+            if name_lower == msg_lower:
+                return [{"name": name, "filename": filename}]
             words = [w for w in name_lower.split() if len(w) > 3]
             if len(words) >= 2 and sum(1 for w in words if w in msg_lower) >= 2:
-                filename = meta.get("filename", "")
-                if filename and (RECIPES_DIR / filename).exists():
-                    results.append({"name": name, "filename": filename})
+                candidates.append({"name": name, "filename": filename})
+        return candidates
     except Exception:
-        pass
-    return results
+        return []
 
 
 def extract_recipe_text(pdf_path: Path) -> Optional[str]:
+    path = Path(pdf_path)
     try:
-        reader = pypdf.PdfReader(str(pdf_path))
+        if path.suffix.lower() == ".md":
+            return path.read_text().strip() or None
+        reader = pypdf.PdfReader(str(path))
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
         return text.strip() or None
     except Exception:
@@ -321,23 +332,89 @@ def get_dropbox_preview_url(filename: str) -> str:
 def save_recipe_idea(idea_text: str) -> bool:
     """Save a recipe idea to the recipeideas folder. Returns True on success."""
     try:
+        from datetime import datetime
         IDEAS_DIR.mkdir(exist_ok=True)
-        timestamp = date.today().strftime("%Y-%m-%d")
-        short = re.sub(r"[^\w\s-]", "", idea_text[:40]).strip().replace(" ", "_")
-        filename = IDEAS_DIR / f"{timestamp}_{short}.txt"
+        # For URLs, use the last path segment as the slug; otherwise use the first 40 chars
+        url_match = re.search(r"https?://[^\s]+", idea_text)
+        if url_match:
+            slug = urlparse(url_match.group()).path.rstrip("/").split("/")[-1]
+            slug = re.sub(r"^\d+[-_]?", "", slug)  # strip leading numeric ID
+        else:
+            slug = re.sub(r"[^\w\s-]", "", idea_text[:40]).strip().replace(" ", "_")
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        filename = IDEAS_DIR / f"{timestamp}_{slug}.txt"
         filename.write_text(idea_text)
         return True
     except Exception:
         return False
 
 
+_IDEA_TRIGGERS = (
+    "add this to recipe ideas", "add to recipe ideas", "save to recipe ideas",
+    "recipe idea", "add idea", "save idea", "idea for", "have you tried",
+    "we should make", "can we make", "add to ideas", "put this in ideas",
+)
+
 def is_recipe_idea(message: str) -> bool:
     """Detect if the message is submitting a recipe idea."""
     lowered = message.lower()
-    return any(p in lowered for p in (
-        "recipe idea", "add idea", "save idea", "idea for", "have you tried",
-        "we should make", "can we make", "add to ideas", "put this in ideas",
-    ))
+    return any(p in lowered for p in _IDEA_TRIGGERS)
+
+
+def extract_idea_content(message: str) -> str:
+    """Strip trigger phrases and return the actual recipe content, if any."""
+    if re.search(r"https?://", message):
+        return message
+    remainder = message
+    for t in sorted(_IDEA_TRIGGERS, key=len, reverse=True):
+        remainder = re.sub(re.escape(t), "", remainder, flags=re.IGNORECASE)
+    remainder = re.sub(r"^[\s:,!.?-]+", "", remainder).strip()
+    # Require at least 10 chars of real content so question fragments don't get saved
+    if len(remainder) < 10:
+        return ""
+    return remainder
+
+
+_RECIPE_DOMAINS = {
+    "americastestkitchen.com": "America's Test Kitchen",
+    "cookscountry.com": "Cook's Country",
+    "cooksillustrated.com": "Cook's Illustrated",
+    "cooking.nytimes.com": "NYT Cooking",
+    "nytimes.com": "NYT Cooking",
+    "seriouseats.com": "Serious Eats",
+    "bonappetit.com": "Bon Appétit",
+    "food52.com": "Food52",
+    "epicurious.com": "Epicurious",
+    "allrecipes.com": "AllRecipes",
+    "thekitchn.com": "The Kitchn",
+    "smittenkitchen.com": "Smitten Kitchen",
+    "budgetbytes.com": "Budget Bytes",
+    "patijinich.com": "Pati Jinich",
+    "woksoflife.com": "Woks of Life",
+    "justonecookbook.com": "Just One Cookbook",
+}
+
+def parse_recipe_url(text: str):
+    """If text is a lone URL from a recipe site, return (url, name, source). Otherwise None."""
+    text = text.strip()
+    if not re.match(r"https?://", text):
+        return None
+    url = text.split()[0].rstrip(".,!?")
+    if text[len(url):].strip():
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    domain = parsed.netloc.lower().lstrip("www.")
+    source = next((v for k, v in _RECIPE_DOMAINS.items() if domain.endswith(k)), None)
+    is_recipe_path = bool(re.search(r"/recipes?/", parsed.path, re.IGNORECASE))
+    if not source and not is_recipe_path:
+        return None
+    slug = parsed.path.rstrip("/").split("/")[-1]
+    slug = re.sub(r"^\d+[-_]?", "", slug)
+    name = slug.replace("-", " ").replace("_", " ").title().strip()
+    return url, name or "this recipe", source or domain
 
 
 def is_menu_change(message: str) -> bool:
