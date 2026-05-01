@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import time
 from collections import defaultdict
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +67,103 @@ def drain_outbox():
             log.info(f"Outbox: sent to {entry['handle']}")
     except Exception as e:
         log.error(f"Outbox drain error: {e}")
+
+# ── School countdown ──────────────────────────────────────────────────────────
+
+SCHOOL_LAST_DAY = date(2026, 5, 22)
+_COUNTDOWN_SEND_AFTER = 7   # 7 AM
+_COUNTDOWN_SEND_BEFORE = 10  # stop sending if server was down past 10 AM
+
+
+def _school_days_remaining(from_date: date) -> int:
+    count = 0
+    check = from_date + timedelta(days=1)
+    while check <= SCHOOL_LAST_DAY:
+        if check.weekday() < 5:
+            count += 1
+        check += timedelta(days=1)
+    return count
+
+
+def maybe_send_school_countdown(state: dict, config: dict):
+    today = date.today()
+    now = datetime.now()
+
+    if today.weekday() >= 5:  # skip weekends
+        return
+    if today > SCHOOL_LAST_DAY:
+        return
+    if not (_COUNTDOWN_SEND_AFTER <= now.hour < _COUNTDOWN_SEND_BEFORE):
+        return
+    if state.get("last_countdown_date") == today.isoformat():
+        return
+
+    remaining = _school_days_remaining(today)
+    handle_to_person = config["security"].get("handle_to_person", {})
+    kids = config["security"].get("kids", [])
+
+    for handle in kids:
+        name = handle_to_person.get(handle, "there")
+        if today == SCHOOL_LAST_DAY:
+            msg = f"Good morning, {name}! Today is the LAST day of school — have a brilliant one! Have a great summer!"
+        elif remaining == 1:
+            msg = f"Good morning, {name}! Just 1 school day left after today — nearly there!"
+        else:
+            msg = f"Good morning, {name}! {remaining} school days left until summer!"
+        send_imessage(handle, msg)
+        log.info(f"School countdown sent to {handle}: {remaining} days remaining")
+
+    state["last_countdown_date"] = today.isoformat()
+    save_state(state)
+
+
+# ── Weekly koala fact ─────────────────────────────────────────────────────────
+
+_KOALA_FACT_INTERVAL_DAYS = 7
+_koala_client = anthropic.Anthropic()
+
+
+def _generate_koala_fact() -> str:
+    response = _koala_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        messages=[{
+            "role": "user",
+            "content": (
+                "You are Keanu, an Australian koala texting kids. Share one surprising or funny "
+                "koala fact in your voice — warm, cheeky, Australian slang welcome. "
+                "Two sentences max. No 'Did you know' opener — just dive straight in."
+            ),
+        }],
+    )
+    return response.content[0].text.strip()
+
+
+def maybe_send_koala_fact(state: dict, config: dict):
+    now = datetime.now()
+    today = date.today()
+
+    if not (_COUNTDOWN_SEND_AFTER <= now.hour < _COUNTDOWN_SEND_BEFORE):
+        return
+
+    last_sent = state.get("last_koala_fact_date")
+    if last_sent and (today - date.fromisoformat(last_sent)).days < _KOALA_FACT_INTERVAL_DAYS:
+        return
+
+    try:
+        fact = _generate_koala_fact()
+    except Exception as e:
+        log.error(f"Koala fact generation error: {e}")
+        return
+
+    kids = config["security"].get("kids", [])
+    for handle in kids:
+        send_imessage(handle, fact)
+        log.info(f"Koala fact sent to {handle}")
+
+    state["last_koala_fact_date"] = today.isoformat()
+    save_state(state)
+
 
 # ── Tapback filter ─────────────────────────────────────────────────────────────
 
@@ -261,6 +359,8 @@ def main():
         try:
             drain_outbox()
             config = load_config()
+            maybe_send_school_countdown(state, config)
+            maybe_send_koala_fact(state, config)
             min_date = startup_cutoff if first_poll else None
             messages = poll_new_messages(state["last_rowid"], min_date)
             first_poll = False
@@ -323,6 +423,10 @@ def main():
 
         except Exception as e:
             log.error(f"Main loop error: {e}", exc_info=True)
+            try:
+                send_imessage(handle, "Sorry, I'm having a bit of trouble right now. Try again in a moment!")
+            except Exception:
+                pass
 
         time.sleep(POLL_INTERVAL)
 
