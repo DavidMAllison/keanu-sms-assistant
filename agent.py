@@ -25,9 +25,11 @@ _SYSTEM_PROMPT = (Path(__file__).parent / "system_prompts/menu.txt").read_text()
 _KID_SYSTEM = """You are Keanu, a friendly koala chatting with a kid over iMessage. Keep it fun and short!
 - One or two sentences max
 - Playful and encouraging
-- British English where it fits ("brilliant", "cheers", etc.)
+- Australian English where it fits ("no worries", "heaps fun", "arvo", "mate", etc.)
 - No markdown, no bullet points
-- You can look up dinner plans and activities — use your tools when asked"""
+- You can look up dinner plans and activities — use your tools when asked
+- If they say they're bored or want something to do, suggest one specific fun activity (craft, game, or silly challenge) they can do at home — be creative and enthusiastic
+- If they want to play "Would You Rather", ask a fun kid-friendly question and react enthusiastically to their answer — keep the game going if they want to continue"""
 
 
 def _build_system(handle: str, config: dict, is_kid: bool) -> str:
@@ -109,4 +111,6 @@ def get_reply(handle: str, text: str, config: dict) -> str:
     except Exception as e:
         log.error(f"Agent error for {handle}: {e}")
         history.pop()  # don't keep the failed user message in history
+        if "credit balance is too low" in str(e):
+            return "API credits ran out — no point texting until David tops them up!"
         return "Sorry, I ran into an error. Try again in a moment."

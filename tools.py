@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 _BASE = Path(__file__).parent
 GAPS_FILE = _BASE / "capability_gaps.json"
+INVENTORY_FILE = Path("/Users/Shared/cooking/inventory.md")
 
 
 # ── Tool definitions (sent to Claude API) ─────────────────────────────────────
@@ -80,8 +81,8 @@ _DEFS = {
     "check_recipe_similarity": {
         "name": "check_recipe_similarity",
         "description": (
-            "Check whether a recipe already exists in the ideas list or recipe collection "
-            "before saving it. Always call this before save_recipe_idea."
+            "Search the ideas list and recipe collection by name or keyword. Use this to answer "
+            "'is X on my ideas list?' questions, and always call it before save_recipe_idea."
         ),
         "input_schema": {
             "type": "object",
@@ -190,6 +191,22 @@ _DEFS = {
             "required": ["person", "description", "affects_dinner"],
         },
     },
+    "update_inventory": {
+        "name": "update_inventory",
+        "description": "Add an item to the food inventory (freezer, pantry, etc.).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description": "Item with quantity, e.g. '6 Costco chicken breast packages'"},
+                "section": {
+                    "type": "string",
+                    "enum": ["Frozen - Chicken", "Frozen - Pork", "Frozen - Beef", "Frozen Meals", "Vegetables/Produce", "Pantry Staples", "Dairy", "Other"],
+                    "description": "Which inventory section to add it to",
+                },
+            },
+            "required": ["item", "section"],
+        },
+    },
     "log_capability_gap": {
         "name": "log_capability_gap",
         "description": (
@@ -215,7 +232,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea"]
     if is_admin:
-        names.append("update_meal_plan")
+        names += ["update_meal_plan", "update_inventory"]
     return [_DEFS[n] for n in names]
 
 
@@ -368,6 +385,13 @@ def _tool_add_schedule_event(inputs: dict) -> str:
     if date_str:
         # One-time event → weekly_overrides
         overrides = data.setdefault("weekly_overrides", {})
+        existing = [e for e in overrides.get(date_str, []) if e.get("person") == person]
+        if existing:
+            existing_notes = "; ".join(e.get("note", "") for e in existing)
+            new_times = set(re.findall(r'\d{1,2}:\d{2}', description))
+            existing_times = set(re.findall(r'\d{1,2}:\d{2}', existing_notes))
+            if new_times & existing_times:
+                return f"Already have '{existing_notes}' for {person} on {date_str}. Not added."
         overrides.setdefault(date_str, []).append({
             "person": person,
             "note": description,
@@ -399,6 +423,39 @@ def _tool_add_schedule_event(inputs: dict) -> str:
         return f"Added {person}'s event on {label}."
     except Exception as e:
         return f"Couldn't save schedule: {e}"
+
+
+def _tool_update_inventory(item: str, section: str) -> str:
+    try:
+        lines = INVENTORY_FILE.read_text().splitlines()
+        target = None
+        for i, line in enumerate(lines):
+            if section.lower() in line.lstrip("#").strip().lower():
+                target = i
+                break
+        if target is None:
+            return f"Section '{section}' not found in inventory."
+        insert_at = target + 1
+        none_line = None
+        while insert_at < len(lines):
+            l = lines[insert_at]
+            if l.startswith("#") or l.strip() == "---":
+                break
+            if "None currently" in l:
+                none_line = insert_at
+            insert_at += 1
+        if none_line is not None:
+            lines.pop(none_line)
+            insert_at = none_line
+        lines.insert(insert_at, f"- {item}")
+        for i, line in enumerate(lines):
+            if line.startswith("**Last Updated:**"):
+                lines[i] = f"**Last Updated:** {date.today().strftime('%B %-d, %Y')}"
+                break
+        INVENTORY_FILE.write_text("\n".join(lines) + "\n")
+        return f"Added to {section}: {item}"
+    except Exception as e:
+        return f"Couldn't update inventory: {e}"
 
 
 def _tool_log_capability_gap(description: str, handle: str) -> str:
@@ -433,6 +490,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_log_feedback(inputs["recipe"], inputs["feedback"], handle)
         if name == "log_preference":
             return _tool_log_preference(inputs["preference"], handle)
+        if name == "update_inventory":
+            return _tool_update_inventory(inputs["item"], inputs["section"])
         if name == "log_capability_gap":
             return _tool_log_capability_gap(inputs["description"], handle)
         return f"Unknown tool: {name}"
