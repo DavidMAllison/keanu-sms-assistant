@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import re
+from typing import Optional
 
 from agents.menu_agent import (
     load_context,
@@ -18,11 +19,11 @@ from agents.menu_agent import (
     save_preference,
     _load_handle_to_name,
     RECIPES_DIR,
+    WEEKLYPLAN_DIR,
     RECIPE_CHUNK_CHARS,
     get_dropbox_preview_url,
     METADATA_FILE,
 )
-from agents.menu_agent import IDEAS_DIR
 from agents.schedule_agent import (
     _load_schedule,
     _next_occurrence,
@@ -242,7 +243,54 @@ def _tool_get_meal_plan() -> str:
     return load_context()
 
 
+def _find_in_meal_plan(name: str) -> Optional[tuple]:
+    """Search the current week's meal plan for a meal matching name. Returns (meal_name, url) or None."""
+    today = date.today()
+    plan_files = sorted(WEEKLYPLAN_DIR.glob("mealplan_*.txt"), reverse=True)
+    for pf in plan_files:
+        try:
+            week_start = date.fromisoformat(pf.stem.replace("mealplan_", ""))
+        except ValueError:
+            continue
+        if week_start > today:
+            continue
+        lines = pf.read_text().splitlines()
+        name_lower = name.lower()
+        keywords = [w for w in name_lower.split() if len(w) > 3]
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+            if not keywords or sum(1 for k in keywords if k in line_lower) < max(1, len(keywords) // 2):
+                continue
+            # Look for a URL on the next non-empty line
+            for j in range(i + 1, min(i + 3, len(lines))):
+                stripped = lines[j].strip()
+                if stripped.startswith("http"):
+                    meal_name = line.strip().split("[")[0].split("|")[0].strip()
+                    meal_name = re.sub(r"^[A-Za-z]{3}\s+\d+/\d+\s+", "", meal_name).strip()
+                    return meal_name, stripped
+            break
+        break  # Only check the most recent plan that doesn't start after today
+    return None
+
+
 def _tool_get_recipe(name: str) -> str:
+    # First: check the meal plan for a URL
+    plan_result = _find_in_meal_plan(name)
+    if plan_result:
+        meal_name, url = plan_result
+        if "dropbox.com" in url:
+            # Try to serve from local recipe file via existing machinery
+            matches = find_all_recipe_matches(name)
+            if matches:
+                m = matches[0]
+                text = extract_recipe_text(RECIPES_DIR / m["filename"])
+                if text:
+                    return f"{text}\n\n[Dropbox link if user wants full recipe: {url}]"
+            return f"Full recipe at: {url}"
+        else:
+            return f"That one's from an external site — full recipe and ingredients at: {url}"
+
+    # Fall back: search local recipe collection via JSON metadata
     matches = find_all_recipe_matches(name)
     if not matches:
         return f"No recipe found matching '{name}'."

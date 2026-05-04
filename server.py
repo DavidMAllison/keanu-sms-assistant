@@ -417,15 +417,16 @@ def main():
                             save_state(state)
                             send_imessage(handle, f"Heads up — {count} unreviewed capability gap{'s' if count > 1 else ''} in capability_gaps.json.")
 
-                # Sunday menu feedback from Ashley → forward to admin
+                # Sunday menu feedback from idea submitters → forward to admin
                 admin = config["security"].get("menu_admin")
                 idea_submitters = config["security"].get("idea_submitters", [])
                 if (date.today().weekday() == 6
                         and handle in idea_submitters
                         and handle != admin
                         and admin):
+                    sender_name = config["security"].get("handle_to_person", {}).get(handle, "Family member")
                     outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-                    outbox.append({"handle": admin, "text": f"Ashley re: menu — {text}"})
+                    outbox.append({"handle": admin, "text": f"{sender_name} re: menu — {text}"})
                     OUTBOX_FILE.write_text(json.dumps(outbox))
                     log.info(f"Forwarded Sunday menu feedback from {handle} to admin")
 
