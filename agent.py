@@ -1,6 +1,7 @@
 """Single Claude agent with tool use. Replaces the three separate ask_*_agent functions."""
 
 import logging
+import time
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
@@ -17,8 +18,10 @@ log = logging.getLogger(__name__)
 
 _client = anthropic.Anthropic()
 _conversation_history: dict[str, list[dict]] = defaultdict(list)
+_last_seen: dict[str, float] = {}
 MAX_HISTORY = 10
 MAX_TOOL_ROUNDS = 5
+SESSION_TIMEOUT = 90 * 60  # 90 minutes
 
 _SYSTEM_PROMPT = (Path(__file__).parent / "system_prompts/menu.txt").read_text()
 
@@ -62,6 +65,11 @@ def get_reply(handle: str, text: str, config: dict) -> str:
     max_tokens = 250 if is_kid else 500
     tools = build_tool_list(is_kid, is_admin, is_idea_submitter)
     system = _build_system(handle, config, is_kid)
+
+    now = time.time()
+    if now - _last_seen.get(handle, 0) > SESSION_TIMEOUT:
+        _conversation_history[handle] = []
+    _last_seen[handle] = now
 
     history = _conversation_history[handle]
     history.append({"role": "user", "content": text})

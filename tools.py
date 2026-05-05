@@ -15,9 +15,9 @@ from agents.menu_agent import (
     extract_recipe_text,
     save_recipe_idea as _save_idea,
     update_meal_plan as _update_plan,
-    save_feedback,
     save_preference,
     _load_handle_to_name,
+    COOKING_BASE,
     RECIPES_DIR,
     WEEKLYPLAN_DIR,
     RECIPE_CHUNK_CHARS,
@@ -132,8 +132,13 @@ _DEFS = {
             "properties": {
                 "recipe": {"type": "string", "description": "Recipe name"},
                 "feedback": {"type": "string", "description": "The feedback to log"},
+                "sentiment": {
+                    "type": "string",
+                    "enum": ["liked", "disliked", "mixed"],
+                    "description": "Overall sentiment inferred from the message",
+                },
             },
-            "required": ["recipe", "feedback"],
+            "required": ["recipe", "feedback", "sentiment"],
         },
     },
     "log_preference": {
@@ -405,11 +410,26 @@ def _tool_update_meal_plan(instruction: str) -> str:
     return f"Updated: {result}" if result else "Couldn't parse that — try 'change Thursday to chicken tacos'."
 
 
-def _tool_log_feedback(recipe: str, feedback: str, handle: str) -> str:
+def _tool_log_feedback(recipe: str, feedback: str, sentiment: str, handle: str) -> str:
+    from datetime import datetime
+    queue_file = COOKING_BASE / "feedback_queue.json"
     handle_map = _load_handle_to_name()
-    person = handle_map.get(handle, "Someone")
-    entries = [{"person": person, "text": feedback, "sentiment": "neutral"}]
-    return "Feedback logged." if save_feedback(recipe, entries) else "Couldn't save feedback."
+    entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "handle": handle,
+        "person": handle_map.get(handle, "Someone"),
+        "recipe": recipe,
+        "feedback": feedback,
+        "sentiment": sentiment,
+    }
+    try:
+        existing = json.loads(queue_file.read_text()) if queue_file.exists() else []
+        existing.append(entry)
+        queue_file.write_text(json.dumps(existing, indent=2))
+        return "Feedback logged."
+    except Exception as e:
+        logging.error(f"feedback queue write failed: {e}")
+        return "Couldn't save feedback."
 
 
 def _tool_log_preference(preference: str, handle: str) -> str:
@@ -535,7 +555,7 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
         if name == "update_meal_plan":
             return _tool_update_meal_plan(inputs["instruction"])
         if name == "log_feedback":
-            return _tool_log_feedback(inputs["recipe"], inputs["feedback"], handle)
+            return _tool_log_feedback(inputs["recipe"], inputs["feedback"], inputs["sentiment"], handle)
         if name == "log_preference":
             return _tool_log_preference(inputs["preference"], handle)
         if name == "update_inventory":
