@@ -25,6 +25,7 @@ METADATA_FILE = COOKING_BASE / "recipe_metadata.json"
 SYSTEM_PROMPT_FILE = Path(__file__).parent.parent / "system_prompts/menu.txt"
 DROPBOX_RECIPES_BASE = _paths.get("dropbox_recipes_url", "")
 PREFERENCES_FILE = COOKING_BASE / "family_preferences.json"
+FEEDBACK_CURRENT_FILE = WEEKLYPLAN_DIR / "feedback_current.json"
 
 DAY_NAMES = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -145,27 +146,26 @@ def _load_preferences() -> Optional[str]:
 
 
 def _load_recent_feedback() -> Optional[str]:
-    files = sorted(WEEKLYPLAN_DIR.glob("mealplan_*_feedback.json"), reverse=True)[:3]
-    lines = []
-    for f in files:
-        try:
-            data = json.loads(f.read_text())
-            for day, meal in data.get("meals", {}).items():
-                recipe = meal.get("recipe", "")
-                for fb in meal.get("feedback", []):
-                    note = fb.get("note", "")
-                    if not note or note == "did not cook":
-                        continue
-                    person = fb.get("person", "")
-                    sentiment = fb.get("sentiment", "")
-                    parts = [f"- {recipe}"]
-                    if person:
-                        parts.append(f"({person}, {sentiment})" if sentiment else f"({person})")
-                    parts.append(f": {note}")
-                    lines.append(" ".join(parts))
-        except Exception:
-            continue
-    return "\n".join(lines) if lines else None
+    if not FEEDBACK_CURRENT_FILE.exists():
+        return None
+    try:
+        data = json.loads(FEEDBACK_CURRENT_FILE.read_text())
+        lines = []
+        for e in data.get("entries", []):
+            note = e.get("note", "")
+            if not note or note == "did not cook":
+                continue
+            recipe = e.get("recipe", "")
+            person = e.get("person", "")
+            sentiment = e.get("sentiment", "")
+            parts = [f"- {recipe}"]
+            if person:
+                parts.append(f"({person}, {sentiment})" if sentiment else f"({person})")
+            parts.append(f": {note}")
+            lines.append(" ".join(parts))
+        return "\n".join(lines) if lines else None
+    except Exception:
+        return None
 
 
 def get_recipe_content(recipe_name: str) -> Optional[str]:
@@ -614,18 +614,8 @@ def guess_recipe_from_context(message: str) -> Optional[str]:
     return None
 
 
-def _get_current_feedback_file() -> Optional[Path]:
-    """Find this week's feedback JSON file."""
-    files = sorted(WEEKLYPLAN_DIR.glob("mealplan_*_feedback.json"), reverse=True)
-    today = date.today()
-    for f in files:
-        try:
-            week_start = date.fromisoformat(f.stem.replace("mealplan_", "").replace("_feedback", ""))
-            if week_start <= today:
-                return f
-        except ValueError:
-            continue
-    return None
+def _get_current_feedback_file() -> Path:
+    return FEEDBACK_CURRENT_FILE
 
 
 def parse_per_person_feedback(message: str, handle: str) -> list:
@@ -685,33 +675,19 @@ Only include people explicitly mentioned. Return only the JSON array, no other t
 
 
 def save_feedback(recipe_name: str, entries: list) -> bool:
-    """
-    Append per-person feedback entries to this week's feedback JSON.
-    Matches by recipe name; adds as unplanned entry if not found.
-    """
-    feedback_file = _get_current_feedback_file()
-    if not feedback_file:
-        return False
-
+    """Append per-person feedback entries to feedback_current.json."""
     try:
-        data = json.loads(feedback_file.read_text())
-        meals = data.get("meals", {})
-
-        matched_day = next(
-            (day for day, meal in meals.items()
-             if meal.get("recipe", "").lower() == recipe_name.lower()),
-            None
-        )
-
-        if matched_day:
-            meals[matched_day].setdefault("feedback", []).extend(entries)
-        else:
-            data.setdefault("unplanned", []).append({
+        data = json.loads(FEEDBACK_CURRENT_FILE.read_text()) if FEEDBACK_CURRENT_FILE.exists() else {"entries": []}
+        for e in entries:
+            data["entries"].append({
                 "recipe": recipe_name,
-                "feedback": entries,
+                "date": e.get("date", date.today().isoformat()),
+                "person": e.get("person", ""),
+                "sentiment": e.get("sentiment", ""),
+                "note": e.get("note", ""),
+                "source": "sms",
             })
-
-        feedback_file.write_text(json.dumps(data, indent=2))
+        FEEDBACK_CURRENT_FILE.write_text(json.dumps(data, indent=2))
         return True
     except Exception:
         return False

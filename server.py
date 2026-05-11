@@ -28,7 +28,6 @@ log = logging.getLogger(__name__)
 
 CONFIG_FILE = Path(__file__).parent / "config/settings.yaml"
 STATE_FILE = Path(__file__).parent / ".keanu_state.json"
-GAPS_FILE = Path(__file__).parent / "capability_gaps.json"
 OUTBOX_FILE = Path(__file__).parent / ".outbox.json"
 CHAT_DB = Path.home() / "Library/Messages/chat.db"
 POLL_INTERVAL = 3
@@ -42,17 +41,10 @@ def load_config() -> dict:
 def load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"last_rowid": 0, "last_gap_notify": 0.0}
+    return {"last_rowid": 0}
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state))
-
-# ── Capability gaps ────────────────────────────────────────────────────────────
-
-def unreviewed_gaps() -> list:
-    if not GAPS_FILE.exists():
-        return []
-    return [g for g in json.loads(GAPS_FILE.read_text()) if not g.get("reviewed")]
 
 # ── Outbox ────────────────────────────────────────────────────────────────────
 
@@ -117,52 +109,76 @@ def maybe_send_school_countdown(state: dict, config: dict):
     save_state(state)
 
 
-# ── Weekly koala fact ─────────────────────────────────────────────────────────
-
-_KOALA_FACT_INTERVAL_DAYS = 7
-_koala_client = anthropic.Anthropic()
-
-
-def _generate_koala_fact() -> str:
-    response = _koala_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=100,
-        messages=[{
-            "role": "user",
-            "content": (
-                "You are Keanu, an Australian koala texting kids. Share one surprising or funny "
-                "koala fact in your voice — warm, cheeky, Australian slang welcome. "
-                "Two sentences max. No 'Did you know' opener — just dive straight in."
-            ),
-        }],
-    )
-    return response.content[0].text.strip()
-
-
-def maybe_send_koala_fact(state: dict, config: dict):
-    now = datetime.now()
+def maybe_send_game_day_messages(state: dict, config: dict):
     today = date.today()
+    now = datetime.now()
 
     if not (_COUNTDOWN_SEND_AFTER <= now.hour < _COUNTDOWN_SEND_BEFORE):
         return
 
-    last_sent = state.get("last_koala_fact_date")
-    if last_sent and (today - date.fromisoformat(last_sent)).days < _KOALA_FACT_INTERVAL_DAYS:
+    schedule_path = Path(config.get("paths", {}).get("schedule_file", ""))
+    if not schedule_path.exists():
         return
 
     try:
-        fact = _generate_koala_fact()
+        schedule = json.loads(schedule_path.read_text())
     except Exception as e:
-        log.error(f"Koala fact generation error: {e}")
+        log.error(f"Game day: could not read schedule: {e}")
         return
 
-    kids = config["security"].get("kids", [])
-    for handle in kids:
-        send_imessage(handle, fact)
-        log.info(f"Koala fact sent to {handle}")
+    overrides = schedule.get("weekly_overrides", {}).get(today.isoformat(), [])
+    if not overrides:
+        return
 
-    state["last_koala_fact_date"] = today.isoformat()
-    save_state(state)
+    handle_to_person = config["security"].get("handle_to_person", {})
+    person_to_handle = {v: k for k, v in handle_to_person.items()}
+    kids = config["security"].get("kids", [])
+    already_sent = state.get("game_messages_sent", {}).get(today.isoformat(), [])
+
+    for entry in overrides:
+        person = entry.get("person", "")
+        note = entry.get("note", "")
+        note_lower = note.lower()
+
+        if "game" not in note_lower and "tournament" not in note_lower:
+            continue
+
+        handle = person_to_handle.get(person)
+        if not handle or handle not in kids:
+            continue
+
+        if handle in already_sent:
+            continue
+
+        try:
+            response = _20q_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=100,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"You are Keanu, a friendly Australian koala texting {person} before their soccer game today. "
+                        f"Game details: {note}\n\n"
+                        "Write a short, warm good luck message. Two sentences max. "
+                        "Australian slang welcome (mate, heaps, arvo, etc). No markdown. "
+                        "Be enthusiastic and specific if the note has useful details."
+                    ),
+                }],
+            )
+            msg = response.content[0].text.strip()
+        except Exception as e:
+            log.error(f"Game day message generation error for {person}: {e}")
+            continue
+
+        send_imessage(handle, msg)
+        log.info(f"Game day message sent to {person} ({handle})")
+
+        if "game_messages_sent" not in state:
+            state["game_messages_sent"] = {}
+        if today.isoformat() not in state["game_messages_sent"]:
+            state["game_messages_sent"][today.isoformat()] = []
+        state["game_messages_sent"][today.isoformat()].append(handle)
+        save_state(state)
 
 
 # ── Tapback filter ─────────────────────────────────────────────────────────────
@@ -360,7 +376,7 @@ def main():
             drain_outbox()
             config = load_config()
             maybe_send_school_countdown(state, config)
-            maybe_send_koala_fact(state, config)
+            maybe_send_game_day_messages(state, config)
             min_date = startup_cutoff if first_poll else None
             messages = poll_new_messages(state["last_rowid"], min_date)
             first_poll = False
@@ -406,16 +422,6 @@ def main():
                     reply = start_20q_game(handle, is_kid)
                     send_imessage(handle, reply)
                     continue
-
-                # Remind admin of unreviewed gaps (at most once per day)
-                if handle == config["security"].get("menu_admin"):
-                    if time.time() - state.get("last_gap_notify", 0) > 86400:
-                        gaps = unreviewed_gaps()
-                        if gaps:
-                            count = len(gaps)
-                            state["last_gap_notify"] = time.time()
-                            save_state(state)
-                            send_imessage(handle, f"Heads up — {count} unreviewed capability gap{'s' if count > 1 else ''} in capability_gaps.json.")
 
                 # Sunday menu feedback from idea submitters → forward to admin
                 admin = config["security"].get("menu_admin")
