@@ -18,6 +18,7 @@ from agents.menu_agent import (
     save_preference,
     _load_handle_to_name,
     COOKING_BASE,
+    IDEAS_DIR,
     RECIPES_DIR,
     WEEKLYPLAN_DIR,
     RECIPE_CHUNK_CHARS,
@@ -35,6 +36,7 @@ log = logging.getLogger(__name__)
 
 _BASE = Path(__file__).parent
 GAPS_FILE = _BASE / "capability_gaps.json"
+OUTBOX_FILE = _BASE / ".outbox.json"
 INVENTORY_FILE = Path("/Users/Shared/cooking/inventory.md")
 
 
@@ -227,6 +229,21 @@ _DEFS = {
             "required": ["description"],
         },
     },
+    "relay_message": {
+        "name": "relay_message",
+        "description": (
+            "Send a message to another family member on the admin's behalf. "
+            "Use when the admin asks you to forward something or message someone else."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recipient": {"type": "string", "description": "Name of the recipient (e.g. 'Ashley', 'Wren')"},
+                "message": {"type": "string", "description": "The message text to send"},
+            },
+            "required": ["recipient", "message"],
+        },
+    },
 }
 
 
@@ -238,7 +255,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea"]
     if is_admin:
-        names += ["update_meal_plan", "update_inventory"]
+        names += ["update_meal_plan", "update_inventory", "relay_message"]
     return [_DEFS[n] for n in names]
 
 
@@ -278,6 +295,40 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
     return None
 
 
+def _find_in_condiments(name: str) -> Optional[str]:
+    condiments_file = COOKING_BASE / "condiments.json"
+    if not condiments_file.exists():
+        return None
+    try:
+        data = json.loads(condiments_file.read_text())
+    except Exception:
+        return None
+    name_lower = name.lower()
+    keywords = [w for w in name_lower.split() if len(w) > 2]
+    best = None
+    for key, entry in data.items():
+        key_lower = key.lower()
+        if not keywords or any(k in key_lower for k in keywords):
+            best = (key, entry)
+            break
+    if not best:
+        return None
+    key, entry = best
+    lines = [f"# {entry['name']}"]
+    if entry.get("servings"):
+        lines.append(f"Servings: {entry['servings']}")
+    lines.append("\n## Ingredients")
+    for ing in entry.get("ingredients", []):
+        qty = f"{ing['quantity']} {ing['unit']}".strip()
+        lines.append(f"- {qty} {ing['name']}".strip())
+    lines.append("\n## Instructions")
+    for i, step in enumerate(entry.get("instructions", []), 1):
+        lines.append(f"{i}. {step}")
+    if entry.get("notes"):
+        lines.append(f"\nNotes: {entry['notes']}")
+    return "\n".join(lines)
+
+
 def _tool_get_recipe(name: str) -> str:
     # First: check the meal plan for a URL
     plan_result = _find_in_meal_plan(name)
@@ -294,6 +345,11 @@ def _tool_get_recipe(name: str) -> str:
             return f"Full recipe at: {url}"
         else:
             return f"That one's from an external site — full recipe and ingredients at: {url}"
+
+    # Check condiments collection
+    condiment = _find_in_condiments(name)
+    if condiment:
+        return condiment
 
     # Fall back: search local recipe collection via JSON metadata
     matches = find_all_recipe_matches(name)
@@ -379,22 +435,33 @@ def _tool_check_recipe_similarity(content: str) -> str:
                 if not any(f.name in r for r in results):
                     results.append(f"Similar idea already saved: {f.name}")
 
-    # 3. Keyword match against recipe collection
+    # 3. Keyword match against all JSON entries (active, idea, any status)
     search_term = slug.replace("-", " ").replace("_", " ") if url else content
-    matches = find_all_recipe_matches(search_term)
-    if matches:
-        try:
-            meta_data = json.loads(METADATA_FILE.read_text()).get("recipes", {})
-        except Exception:
-            meta_data = {}
-        for m in matches[:4]:
-            meta = meta_data.get(m["name"], {})
-            cuisine = meta.get("cuisine", "")
-            method = meta.get("cooking_method", "")
-            ingredients = meta.get("ingredients", [])
-            key_ingr = ", ".join(i["name"] for i in ingredients[:4]) if ingredients else ""
-            detail = " | ".join(filter(None, [cuisine, method, key_ingr]))
-            results.append(f"Similar recipe in collection: {m['name']}" + (f" ({detail})" if detail else ""))
+    search_lower = search_term.lower()
+    try:
+        meta_data = json.loads(METADATA_FILE.read_text()).get("recipes", {})
+    except Exception:
+        meta_data = {}
+    json_matches = []
+    for name, meta in meta_data.items():
+        if not isinstance(meta, dict):
+            continue
+        name_lower = name.lower()
+        if name_lower == search_lower:
+            json_matches = [name]
+            break
+        words = [w for w in name_lower.split() if len(w) > 3]
+        if len(words) >= 2 and sum(1 for w in words if w in search_lower) >= 2:
+            json_matches.append(name)
+    for name in json_matches[:4]:
+        meta = meta_data.get(name, {})
+        status = meta.get("status", "active")
+        cuisine = meta.get("cuisine", "")
+        method = meta.get("cooking_method", "")
+        ingredients = meta.get("ingredients", [])
+        key_ingr = ", ".join(i["name"] for i in ingredients[:4]) if ingredients else ""
+        detail = " | ".join(filter(None, [status, cuisine, method, key_ingr]))
+        results.append(f"Already in collection: {name}" + (f" ({detail})" if detail else ""))
 
     if not results:
         return "No duplicates or similar recipes found."
@@ -428,7 +495,7 @@ def _tool_log_feedback(recipe: str, feedback: str, sentiment: str, handle: str) 
         queue_file.write_text(json.dumps(existing, indent=2))
         return "Feedback logged."
     except Exception as e:
-        logging.error(f"feedback queue write failed: {e}")
+        log.error(f"feedback queue write failed: {e}", exc_info=True)
         return "Couldn't save feedback."
 
 
@@ -526,6 +593,17 @@ def _tool_update_inventory(item: str, section: str) -> str:
         return f"Couldn't update inventory: {e}"
 
 
+def _tool_relay_message(recipient: str, message: str, config: dict) -> str:
+    name_to_handle = {v: k for k, v in config.get("security", {}).get("handle_to_person", {}).items()}
+    handle = name_to_handle.get(recipient) or name_to_handle.get(recipient.title())
+    if not handle:
+        return f"Don't know a handle for '{recipient}' — check the name and try again."
+    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
+    outbox.append({"handle": handle, "text": message})
+    OUTBOX_FILE.write_text(json.dumps(outbox))
+    return f"Sent to {recipient}."
+
+
 def _tool_log_capability_gap(description: str, handle: str) -> str:
     gaps = json.loads(GAPS_FILE.read_text()) if GAPS_FILE.exists() else []
     gaps.append({
@@ -562,6 +640,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_update_inventory(inputs["item"], inputs["section"])
         if name == "log_capability_gap":
             return _tool_log_capability_gap(inputs["description"], handle)
+        if name == "relay_message":
+            return _tool_relay_message(inputs["recipient"], inputs["message"], config)
         return f"Unknown tool: {name}"
     except Exception as e:
         log.error(f"Tool error ({name}): {e}")

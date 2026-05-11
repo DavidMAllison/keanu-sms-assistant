@@ -3,7 +3,7 @@
 import logging
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import anthropic
@@ -72,7 +72,8 @@ def get_reply(handle: str, text: str, config: dict) -> str:
     _last_seen[handle] = now
 
     history = _conversation_history[handle]
-    history.append({"role": "user", "content": text})
+    now_str = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p")
+    history.append({"role": "user", "content": f"[{now_str}] {text}"})
     if len(history) > MAX_HISTORY * 2:
         history = history[-(MAX_HISTORY * 2):]
         _conversation_history[handle] = history

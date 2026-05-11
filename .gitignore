@@ -8,6 +8,7 @@ config/settings.yaml
 # Runtime state and logs
 keanu.log
 capability_gaps.json
+keanu_feedback.json
 .keanu_state.json
 
 # Scratch files

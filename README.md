@@ -11,6 +11,8 @@ The key design goal: every family member uses the device they already have. No a
 - **Recipes** — fetches full recipes from a local PDF library or Dropbox
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
 - **Feedback** — logs family reactions to meals for future planning
+- **Proactive messages** — good luck texts on soccer game mornings, school countdown
+- **Relay** — admin can ask Keanu to forward a message to another family member
 
 ## How it works
 
@@ -71,6 +73,8 @@ launchd's `KeepAlive: true` restarts it automatically after the kill.
 
 ```
 server.py                  # Main loop — polls chat.db, routes messages, sends replies
+agent.py                   # Conversation loop — Claude tool use, per-handle history
+tools.py                   # Tool definitions and implementations
 agents/
   menu_agent.py            # Meal plans, recipes, inventory, feedback
   schedule_agent.py        # Games, practices, upcoming events
@@ -91,6 +95,7 @@ Keanu reads from a few external data sources you set up separately:
 | Meal plans | `cooking_base/weeklyplan/` | `.txt` files named `mealplan_YYYY-MM-DD.txt` |
 | Recipes | `cooking_base/Recipes/` | PDF files |
 | Inventory | `cooking_base/inventory.md` | Markdown |
+| Condiments | `cooking_base/condiments.json` | JSON |
 | Family schedule | `paths.schedule_file` in settings | JSON |
 
 Configure paths in `config/settings.yaml` under the `paths` key.
