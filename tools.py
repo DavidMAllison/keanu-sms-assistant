@@ -268,6 +268,23 @@ def _tool_get_meal_plan() -> str:
 def _find_in_meal_plan(name: str) -> Optional[tuple]:
     """Search the current week's meal plan for a meal matching name. Returns (meal_name, url) or None."""
     today = date.today()
+    _DAY_ABBREVS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    _DAY_NAMES = {
+        "monday": "Mon", "tuesday": "Tue", "wednesday": "Wed",
+        "thursday": "Thu", "friday": "Fri", "saturday": "Sat", "sunday": "Sun",
+    }
+
+    # Resolve temporal/day keywords to the 3-letter abbreviation used in meal plan lines
+    name_lower = name.lower().strip()
+    day_prefix = None  # e.g. "Mon" — search by line prefix instead of keywords
+    if any(w in name_lower for w in ("tonight", "today", "dinner")):
+        day_prefix = _DAY_ABBREVS[today.weekday()]
+    else:
+        for day_word, abbrev in _DAY_NAMES.items():
+            if day_word in name_lower:
+                day_prefix = abbrev
+                break
+
     plan_files = sorted(WEEKLYPLAN_DIR.glob("mealplan_*.txt"), reverse=True)
     for pf in plan_files:
         try:
@@ -277,20 +294,33 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
         if week_start > today:
             continue
         lines = pf.read_text().splitlines()
-        name_lower = name.lower()
-        keywords = [w for w in name_lower.split() if len(w) > 3]
-        for i, line in enumerate(lines):
-            line_lower = line.lower()
-            if not keywords or sum(1 for k in keywords if k in line_lower) < max(1, len(keywords) // 2):
-                continue
-            # Look for a URL on the next non-empty line
+
+        def _extract_url_and_name(i: int):
             for j in range(i + 1, min(i + 3, len(lines))):
                 stripped = lines[j].strip()
                 if stripped.startswith("http"):
-                    meal_name = line.strip().split("[")[0].split("|")[0].strip()
+                    meal_name = lines[i].strip().split("[")[0].split("|")[0].strip()
                     meal_name = re.sub(r"^[A-Za-z]{3}\s+\d+/\d+\s+", "", meal_name).strip()
                     return meal_name, stripped
-            break
+            return None
+
+        if day_prefix:
+            # Match the line that starts with the day abbreviation
+            for i, line in enumerate(lines):
+                if line.strip().startswith(day_prefix):
+                    result = _extract_url_and_name(i)
+                    if result:
+                        return result
+        else:
+            keywords = [w for w in name_lower.split() if len(w) > 3]
+            for i, line in enumerate(lines):
+                line_lower = line.lower()
+                if not keywords or sum(1 for k in keywords if k in line_lower) < max(1, len(keywords) // 2):
+                    continue
+                result = _extract_url_and_name(i)
+                if result:
+                    return result
+                break
         break  # Only check the most recent plan that doesn't start after today
     return None
 
@@ -344,6 +374,32 @@ def _tool_get_recipe(name: str) -> str:
                     return f"{text}\n\n[Dropbox link if user wants full recipe: {url}]"
             return f"Full recipe at: {url}"
         else:
+            # External URL — still try local JSON metadata for ingredients first
+            matches = find_all_recipe_matches(meal_name)
+            if matches:
+                m = matches[0]
+                text = extract_recipe_text(RECIPES_DIR / m["filename"])
+                if text:
+                    return f"{text}\n\n[Full recipe at: {url}]"
+            if METADATA_FILE.exists():
+                try:
+                    data = json.loads(METADATA_FILE.read_text()).get("recipes", {})
+                    meal_lower = meal_name.lower()
+                    for rname, meta in data.items():
+                        if not isinstance(meta, dict):
+                            continue
+                        rname_lower = rname.lower()
+                        words = [w for w in rname_lower.split() if len(w) > 3]
+                        if rname_lower == meal_lower or (len(words) >= 2 and sum(1 for w in words if w in meal_lower) >= 2):
+                            ingredients = meta.get("ingredients", [])
+                            if ingredients:
+                                lines = [f"{meal_name} - Ingredients:"]
+                                for ing in ingredients:
+                                    qty = f"{ing.get('quantity', '')} {ing.get('unit', '')}".strip()
+                                    lines.append(f"- {qty} {ing['name']}".strip())
+                                return "\n".join(lines) + f"\n\n[Full recipe at: {url}]"
+                except Exception:
+                    pass
             return f"That one's from an external site — full recipe and ingredients at: {url}"
 
     # Check condiments collection
