@@ -181,6 +181,40 @@ def maybe_send_game_day_messages(state: dict, config: dict):
         save_state(state)
 
 
+# ── Trash reminder ─────────────────────────────────────────────────────────────
+
+_TRASH_SEND_HOUR = 17  # 5 PM
+
+
+def maybe_send_trash_reminder(state: dict, config: dict):
+    today = date.today()
+    now = datetime.now()
+
+    if today.weekday() != 1:  # Tuesday only
+        return
+    if not (_TRASH_SEND_HOUR <= now.hour < _TRASH_SEND_HOUR + 1):
+        return
+    if state.get("last_trash_reminder_date") == today.isoformat():
+        return
+
+    handle_to_person = config["security"].get("handle_to_person", {})
+    person_to_handle = {v: k for k, v in handle_to_person.items()}
+    eleanor_handle = person_to_handle.get("Eleanor")
+    if not eleanor_handle:
+        log.warning("Trash reminder: Eleanor handle not found in config")
+        return
+
+    msg = (
+        "Hey Eleanor! Just a reminder — Tuesday is trash night. "
+        "Bring the bins to the curb before bed if you want your allowance this week!"
+    )
+    send_imessage(eleanor_handle, msg)
+    log.info("Trash reminder sent to Eleanor")
+
+    state["last_trash_reminder_date"] = today.isoformat()
+    save_state(state)
+
+
 # ── Tapback filter ─────────────────────────────────────────────────────────────
 
 _TAPBACK_PREFIXES = (
@@ -377,6 +411,7 @@ def main():
             config = load_config()
             maybe_send_school_countdown(state, config)
             maybe_send_game_day_messages(state, config)
+            maybe_send_trash_reminder(state, config)
             min_date = startup_cutoff if first_poll else None
             messages = poll_new_messages(state["last_rowid"], min_date)
             first_poll = False
