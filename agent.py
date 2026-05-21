@@ -1,5 +1,6 @@
 """Single Claude agent with tool use. Replaces the three separate ask_*_agent functions."""
 
+import json
 import logging
 import time
 from collections import defaultdict
@@ -32,7 +33,8 @@ _KID_SYSTEM = """You are Keanu, a friendly koala chatting with a kid over iMessa
 - No markdown, no bullet points
 - You can look up dinner plans and activities — use your tools when asked
 - If they say they're bored or want something to do, suggest one specific fun activity (craft, game, or silly challenge) they can do at home — be creative and enthusiastic
-- If they want to play "Would You Rather", ask a fun kid-friendly question and react enthusiastically to their answer — keep the game going if they want to continue"""
+- If they want to play "Would You Rather", ask a fun kid-friendly question and react enthusiastically to their answer — keep the game going if they want to continue
+- If they ask if a friend can come to dinner, use check_friend_dinner — if parents_notified is true, tell them mum and dad have been messaged and will reply soon; if the schedule is busy or no dinner is planned, explain why not"""
 
 
 def _build_system(handle: str, config: dict, is_kid: bool) -> str:
@@ -46,14 +48,50 @@ def _build_system(handle: str, config: dict, is_kid: bool) -> str:
         tonight = next((ln for ln in context.splitlines() if ln.strip()), "")
         return f"{_KID_SYSTEM}\n\nToday is {today}. You're chatting with {name}.\n{tonight}"
 
+    pending_note = _pending_friend_request_note()
     return (
         f"{_SYSTEM_PROMPT}\n\n"
         f"Today is {today}. You're chatting with {name}.\n\n"
         f"## Current context\n{context}\n\n"
-        "Use your tools when you need recipe details, schedule info, or to save/log something. "
+        + (f"## Pending friend dinner request\n{pending_note}\n\n" if pending_note else "")
+        + "Use your tools when you need recipe details, schedule info, or to save/log something. "
         "When you can't do something, call log_capability_gap and say exactly: "
         "\"Can't do that one yet, noted.\""
     )
+
+
+def _pending_friend_request_note() -> str:
+    pending_file = Path(__file__).parent / ".pending_friend_requests.json"
+    if not pending_file.exists():
+        return ""
+    try:
+        pending = json.loads(pending_file.read_text())
+    except Exception:
+        return ""
+    if not pending:
+        return ""
+    # Expire requests older than 12 hours
+    from datetime import datetime as _dt
+    now = _dt.now()
+    active = []
+    for p in pending:
+        try:
+            asked = _dt.fromisoformat(p["asked_at"])
+            if (now - asked).total_seconds() < 43200:
+                active.append(p)
+        except Exception:
+            pass
+    if not active:
+        pending_file.write_text("[]")
+        return ""
+    lines = []
+    for p in active:
+        day = p.get("day", "tonight")
+        lines.append(
+            f"{p['kid_name']} asked if a friend can come to dinner on {day} ({p['meal']}). "
+            f"If you're replying yes or no to this, use relay_message with recipient \"{p['kid_name']}\" to pass it on."
+        )
+    return "\n".join(lines)
 
 
 def get_reply(handle: str, text: str, config: dict) -> str:

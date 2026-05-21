@@ -1,3 +1,7 @@
 anthropic
 python-dotenv
 pyyaml==6.0.3
+beautifulsoup4
+httpx
+playwright
+yt-dlp

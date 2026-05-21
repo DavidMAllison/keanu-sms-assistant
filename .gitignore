@@ -10,6 +10,8 @@ keanu.log
 capability_gaps.json
 keanu_feedback.json
 .keanu_state.json
+menu_feedback_pending.json
+.pending_friend_requests.json
 
 # Scratch files
 Untitled.rtf
