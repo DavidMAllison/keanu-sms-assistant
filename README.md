@@ -8,7 +8,7 @@ The key design goal: every family member uses the device they already have. No a
 
 - **Meal planning** — what's for dinner, ingredients, recipe details
 - **Schedule** — upcoming soccer games, practices, events pulled from a calendar
-- **Recipes** — fetches full recipes from a local PDF library or Dropbox
+- **Recipes** — searches local collection first; falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
 - **Feedback** — logs family reactions to meals for future planning
 - **Proactive messages** — good luck texts on soccer game mornings, school countdown
@@ -16,10 +16,10 @@ The key design goal: every family member uses the device they already have. No a
 
 ## How it works
 
-A Python server polls `chat.db` (iMessage's local SQLite database) every 3 seconds for new messages. Incoming messages are routed to the appropriate agent (menu, schedule, fun) based on keyword detection. Agents call the Anthropic API (Claude) and reply via AppleScript.
+A Python server polls `chat.db` (iMessage's local SQLite database) every 3 seconds for new messages. Incoming messages are handled by a Claude agent via tool use — Claude decides which tools to call based on the message, rather than keyword routing.
 
 ```
-iMessage → chat.db → server.py → route → agent → Claude API → AppleScript → iMessage
+iMessage → chat.db → server.py → agent.py → Claude API (tool use) → tools.py → AppleScript → iMessage
 ```
 
 ## Mac setup
@@ -45,6 +45,7 @@ The code lives in `/Users/Shared/sms-assistant/` so both accounts can read and w
 2. Install dependencies (run as the bot account):
    ```bash
    pip3 install -r requirements.txt
+   python3 -m playwright install chromium
    ```
 
 3. Copy and fill in config:

@@ -19,6 +19,8 @@ import yaml
 from dotenv import load_dotenv
 
 from agent import get_reply
+from agents import menu_workflow
+from tools import send_imessage, send_imessage_group, drain_outbox
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -29,6 +31,9 @@ log = logging.getLogger(__name__)
 CONFIG_FILE = Path(__file__).parent / "config/settings.yaml"
 STATE_FILE = Path(__file__).parent / ".keanu_state.json"
 OUTBOX_FILE = Path(__file__).parent / ".outbox.json"
+MENU_PENDING_FILE = Path(__file__).parent / "menu_feedback_pending.json"
+MENU_RESPONSE_FILE = Path("/Users/Shared/cooking/menu_feedback_response.json")
+MENU_SESSION_FILE = Path("/Users/Shared/cooking/menu_session.json")
 CHAT_DB = Path.home() / "Library/Messages/chat.db"
 POLL_INTERVAL = 3
 
@@ -47,18 +52,7 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state))
 
 # ── Outbox ────────────────────────────────────────────────────────────────────
-
-def drain_outbox():
-    if not OUTBOX_FILE.exists():
-        return
-    try:
-        messages = json.loads(OUTBOX_FILE.read_text())
-        OUTBOX_FILE.unlink()
-        for entry in messages:
-            send_imessage(entry["handle"], entry["text"])
-            log.info(f"Outbox: sent to {entry['handle']}")
-    except Exception as e:
-        log.error(f"Outbox drain error: {e}")
+# drain_outbox, send_imessage, send_imessage_group imported from tools
 
 # ── School countdown ──────────────────────────────────────────────────────────
 
@@ -228,22 +222,13 @@ _TAPBACK_PREFIXES = (
 def is_tapback(text: str) -> bool:
     return any(text.startswith(p) for p in _TAPBACK_PREFIXES)
 
-# ── iMessage send ──────────────────────────────────────────────────────────────
+def is_menu_start(text: str) -> bool:
+    return any(p in text.lower() for p in (
+        "start menu", "menu time", "do the menu", "weekly menu", "start the menu",
+    ))
 
-def send_imessage(handle: str, text: str):
-    safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
-    script = f'''
-    tell application "Messages"
-        set targetService to 1st service whose service type = iMessage
-        set targetBuddy to buddy "{handle}" of targetService
-        send "{safe_text}" to targetBuddy
-    end tell
-    '''
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    if result.returncode != 0:
-        log.error(f"AppleScript error sending to {handle}: {result.stderr.strip()}")
-    else:
-        log.info(f"Sent reply to {handle}")
+# ── iMessage send ──────────────────────────────────────────────────────────────
+# send_imessage and send_imessage_group imported from tools
 
 # ── chat.db polling ────────────────────────────────────────────────────────────
 
@@ -268,7 +253,10 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
             SELECT m.rowid, m.text, h.id AS sender_handle
             FROM message m
             JOIN handle h ON m.handle_id = h.rowid
+            JOIN chat_message_join cmj ON cmj.message_id = m.rowid
+            JOIN chat c ON c.rowid = cmj.chat_id
             WHERE m.is_from_me = 0
+              AND c.chat_identifier NOT LIKE 'chat%'
               AND m.rowid > ?
               AND m.text IS NOT NULL
               AND m.text != ''
@@ -295,13 +283,20 @@ def is_rate_limited(handle: str, limit: int) -> bool:
 
 _20q_client = anthropic.Anthropic()
 _active_20q: dict[str, dict] = {}
+_active_20q_reverse: dict[str, dict] = {}
 _20Q_START_PATTERNS = ("20 questions", "twenty questions", "play 20", "play twenty")
+_20Q_REVERSE_PATTERNS = ("you guess", "your turn to guess", "you try to guess", "i'll think", "i will think", "you ask", "reverse 20", "me think of", "i think of something", "my turn to think")
 _20Q_QUIT_PHRASES = ("give up", "i give up", "what is it", "don't know", "no idea", "quit", "stop the game", "end game")
 
 
 def is_20q_start(text: str) -> bool:
     lowered = text.lower()
     return any(p in lowered for p in _20Q_START_PATTERNS)
+
+
+def is_20q_reverse_start(text: str) -> bool:
+    lowered = text.lower()
+    return any(p in lowered for p in _20Q_REVERSE_PATTERNS)
 
 
 def start_20q_game(handle: str, is_kid: bool) -> str:
@@ -386,6 +381,87 @@ def handle_20q_turn(handle: str, text: str) -> tuple[str, bool]:
 
     return reply, game_over
 
+def start_20q_reverse_game(handle: str, is_kid: bool) -> str:
+    prompt = (
+        "You are Keanu, starting a reverse 20 Questions game where the human thinks of something "
+        "and you ask yes/no questions to figure it out.\n\n"
+        "Ask your very first yes/no question to kick things off. "
+        "Be playful and Australian. One sentence, end with (1/20)."
+    )
+    try:
+        response = _20q_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        opening = response.content[0].text.strip()
+        _active_20q_reverse[handle] = {"questions_asked": 1, "history": [], "is_kid": is_kid}
+        log.info(f"20Q reverse started for {handle}")
+        return opening
+    except Exception as e:
+        log.error(f"20Q reverse start error: {e}")
+        return "Couldn't start the game, sorry — try again!"
+
+
+def handle_20q_reverse_turn(handle: str, text: str) -> tuple[str, bool]:
+    game = _active_20q_reverse.get(handle)
+    if not game:
+        return "No game in progress!", True
+
+    n = game["questions_asked"]
+    lowered = text.lower()
+
+    if any(p in lowered for p in _20Q_QUIT_PHRASES):
+        del _active_20q_reverse[handle]
+        return "No worries, maybe next time!", True
+
+    history_text = "\n".join(
+        f"{'Keanu' if m['role'] == 'assistant' else 'Player'}: {m['content']}"
+        for m in game["history"]
+    ) or "None yet."
+
+    system = (
+        "You are Keanu, playing reverse 20 Questions. The human is thinking of something secret "
+        "and you're asking yes/no questions to figure it out.\n\n"
+        f"Questions asked so far: {n}/20\n"
+        f"Q&A so far:\n{history_text}\n\n"
+        "Rules:\n"
+        "- React briefly to the answer, then ask ONE new yes/no question — OR make a guess if confident\n"
+        "- To guess say \"Is it [X]?\" and wait for confirmation\n"
+        f"- If the player says yes to your guess, celebrate and write GAME_OVER on a new line\n"
+        "- If your guess is wrong, keep asking questions\n"
+        f"- If this is question 20, make your best guess and write GAME_OVER regardless\n"
+        f"- Append \"({n + 1}/20)\" after your question or guess\n"
+        "- Playful Australian tone. Two sentences max."
+    )
+
+    try:
+        response = _20q_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            system=system,
+            messages=game["history"] + [{"role": "user", "content": text}],
+        )
+        reply = response.content[0].text.strip()
+    except Exception as e:
+        log.error(f"20Q reverse turn error: {e}")
+        return "Something went wrong — try again!", False
+
+    game_over = "GAME_OVER" in reply
+    reply = reply.replace("GAME_OVER", "").strip()
+
+    if game_over:
+        del _active_20q_reverse[handle]
+    else:
+        game["questions_asked"] += 1
+        game["history"].append({"role": "user", "content": text})
+        game["history"].append({"role": "assistant", "content": reply})
+        if game["questions_asked"] > 20:
+            del _active_20q_reverse[handle]
+
+    return reply, game_over
+
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 STARTUP_GRACE_SECONDS = 120
@@ -445,18 +521,82 @@ def main():
                     send_imessage(handle, "The assistant is currently disabled.")
                     continue
 
-                # 20Q game intercepts all messages while active
+                # 20Q games intercept all messages while active
                 if handle in _active_20q:
                     reply, _ = handle_20q_turn(handle, text)
                     send_imessage(handle, reply)
                     continue
 
+                if handle in _active_20q_reverse:
+                    reply, _ = handle_20q_reverse_turn(handle, text)
+                    send_imessage(handle, reply)
+                    continue
+
+                is_kid = handle in config["security"].get("kids", [])
+
+                if is_20q_reverse_start(text):
+                    log.info(f"Starting 20Q reverse game for {handle} (is_kid={is_kid})")
+                    reply = start_20q_reverse_game(handle, is_kid)
+                    send_imessage(handle, reply)
+                    continue
+
                 if is_20q_start(text):
-                    is_kid = handle in config["security"].get("kids", [])
                     log.info(f"Starting 20Q game for {handle} (is_kid={is_kid})")
                     reply = start_20q_game(handle, is_kid)
                     send_imessage(handle, reply)
                     continue
+
+                # Menu workflow — admin only
+                menu_admin = config["security"].get("menu_admin")
+                if handle == menu_admin and is_menu_start(text):
+                    reply = menu_workflow.handle_start(config)
+                    send_imessage(handle, reply)
+                    continue
+
+                if handle == menu_admin and MENU_SESSION_FILE.exists():
+                    try:
+                        session = json.loads(MENU_SESSION_FILE.read_text())
+                        state = session.get("state", "idle")
+                        if state not in ("idle", "complete", None):
+                            if "cancel menu" in text.lower():
+                                MENU_SESSION_FILE.write_text(json.dumps({"state": "idle"}))
+                                send_imessage(handle, "Menu session cancelled.")
+                            else:
+                                reply = menu_workflow.dispatch(text, session, config)
+                                if reply:
+                                    send_imessage(handle, reply)
+                            continue
+                    except Exception as e:
+                        log.error(f"Menu session routing error: {e}")
+
+                # Menu approval pending — capture partner's response
+                if MENU_PENDING_FILE.exists():
+                    try:
+                        pending = json.loads(MENU_PENDING_FILE.read_text())
+                        if handle == pending.get("partner_handle"):
+                            MENU_RESPONSE_FILE.write_text(json.dumps({
+                                "received_at": datetime.now().isoformat(),
+                                "message": text,
+                            }))
+                            MENU_PENDING_FILE.unlink()
+                            admin_handle = config["security"].get("menu_admin")
+                            if admin_handle:
+                                outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
+                                outbox.append({"handle": admin_handle, "text": f"Ashley replied to the menu: {text}"})
+                                OUTBOX_FILE.write_text(json.dumps(outbox))
+                            send_imessage(handle, "Thanks! Passed it on to David.")
+                            log.info(f"Menu feedback captured from {handle}: {text[:80]}")
+                            # Also advance the menu workflow if awaiting Ashley's signoff
+                            if MENU_SESSION_FILE.exists():
+                                try:
+                                    wf_session = json.loads(MENU_SESSION_FILE.read_text())
+                                    if wf_session.get("state") == "awaiting_ashley_signoff":
+                                        menu_workflow.handle_ashley_reply(text, wf_session, config)
+                                except Exception as e:
+                                    log.error(f"Ashley reply session update error: {e}")
+                            continue
+                    except Exception as e:
+                        log.error(f"Menu pending check error: {e}")
 
                 # Sunday menu feedback from idea submitters → forward to admin
                 admin = config["security"].get("menu_admin")

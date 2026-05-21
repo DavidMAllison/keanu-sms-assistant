@@ -2,6 +2,7 @@
 
 import json
 import logging
+import subprocess
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -32,12 +33,87 @@ from agents.schedule_agent import (
     _format_time,
 )
 
+import sys as _sys
+_sys.path.insert(0, "/Users/davidallison/projects/personal/MenuBuilder")
+from recipe_agent import run_agent as _recipe_run_agent, search_local_collection as _search_local_collection
+
 log = logging.getLogger(__name__)
+
+_DAVID_HOME = "/Users/davidallison"
+
+
+def _search_local_collection_safe(query: str) -> list:
+    import os
+    orig = os.environ.get("HOME")
+    os.environ["HOME"] = _DAVID_HOME
+    try:
+        results = _search_local_collection(query)
+        return [r for r in results if isinstance(r, dict)]
+    except Exception:
+        return []
+    finally:
+        if orig is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = orig
 
 _BASE = Path(__file__).parent
 GAPS_FILE = _BASE / "capability_gaps.json"
 OUTBOX_FILE = _BASE / ".outbox.json"
+PENDING_FRIEND_FILE = _BASE / ".pending_friend_requests.json"
 INVENTORY_FILE = Path("/Users/Shared/cooking/inventory.md")
+
+
+def send_imessage(handle: str, text: str):
+    safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'''
+    tell application "Messages"
+        set targetService to 1st service whose service type = iMessage
+        set targetBuddy to buddy "{handle}" of targetService
+        send "{safe_text}" to targetBuddy
+    end tell
+    '''
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(f"AppleScript error sending to {handle}: {result.stderr.strip()}")
+    else:
+        log.info(f"Sent reply to {handle}")
+
+
+def send_imessage_group(handles: list, text: str):
+    safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
+    buddy_refs = ", ".join(f'buddy "{h}"' for h in handles)
+    script = f'''
+    tell application "Messages"
+        set theService to 1st service whose service type = iMessage
+        tell theService
+            set theChat to make new chat with properties {{participants: {{{buddy_refs}}}}}
+        end tell
+        send "{safe_text}" to theChat
+    end tell
+    '''
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(f"AppleScript error sending group message to {handles}: {result.stderr.strip()}")
+    else:
+        log.info(f"Sent group message to {handles}")
+
+
+def drain_outbox():
+    if not OUTBOX_FILE.exists():
+        return
+    try:
+        messages = json.loads(OUTBOX_FILE.read_text())
+        OUTBOX_FILE.unlink()
+        for entry in messages:
+            if "handles" in entry:
+                send_imessage_group(entry["handles"], entry["text"])
+                log.info(f"Outbox: sent group message to {entry['handles']}")
+            else:
+                send_imessage(entry["handle"], entry["text"])
+                log.info(f"Outbox: sent to {entry['handle']}")
+    except Exception as e:
+        log.error(f"Outbox drain error: {e}")
 
 
 # ── Tool definitions (sent to Claude API) ─────────────────────────────────────
@@ -51,13 +127,15 @@ _DEFS = {
     "get_recipe": {
         "name": "get_recipe",
         "description": (
-            "Get the full recipe for a meal by name. Returns the recipe text if it's short enough "
-            "to send, or a Dropbox link if it's long."
+            "Look up or find a recipe. Use for both lookup ('show me the lamb barbacoa') and "
+            "discovery ('find a carnitas recipe', 'suggest something with chicken'). "
+            "Searches the local collection first; searches online sources for discovery requests "
+            "or when nothing is found locally. Returns recipe text or a link."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Recipe name to look up"},
+                "name": {"type": "string", "description": "Recipe name or search query"},
             },
             "required": ["name"],
         },
@@ -229,6 +307,24 @@ _DEFS = {
             "required": ["description"],
         },
     },
+    "check_friend_dinner": {
+        "name": "check_friend_dinner",
+        "description": (
+            "Check if it's OK for a friend to join dinner on a given night. "
+            "Checks the family schedule for kid activities and whether the meal has enough servings. "
+            "Automatically notifies parents if the schedule is clear."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD to check (defaults to today if omitted). Always use the next upcoming occurrence — e.g. if today is Monday and the kid says 'Sunday', use the coming Sunday's date.",
+                },
+            },
+            "required": [],
+        },
+    },
     "relay_message": {
         "name": "relay_message",
         "description": (
@@ -249,13 +345,13 @@ _DEFS = {
 
 def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> list:
     if is_kid:
-        return [_DEFS["get_meal_plan"], _DEFS["get_schedule"]]
+        return [_DEFS["get_meal_plan"], _DEFS["get_schedule"], _DEFS["check_friend_dinner"]]
     names = ["get_meal_plan", "get_recipe", "get_schedule", "add_schedule_event",
-             "log_feedback", "log_preference", "log_capability_gap"]
+             "log_feedback", "log_preference", "log_capability_gap", "relay_message"]
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea"]
     if is_admin:
-        names += ["update_meal_plan", "update_inventory", "relay_message"]
+        names += ["update_meal_plan", "update_inventory"]
     return [_DEFS[n] for n in names]
 
 
@@ -325,6 +421,13 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
     return None
 
 
+def _parse_min_servings(s: str) -> Optional[int]:
+    if not s:
+        return None
+    m = re.search(r'(\d+)', s)
+    return int(m.group(1)) if m else None
+
+
 def _find_in_condiments(name: str) -> Optional[str]:
     condiments_file = COOKING_BASE / "condiments.json"
     if not condiments_file.exists():
@@ -359,7 +462,7 @@ def _find_in_condiments(name: str) -> Optional[str]:
     return "\n".join(lines)
 
 
-def _tool_get_recipe(name: str) -> str:
+def _tool_get_recipe(name: str, handle: str = "") -> str:
     # First: check the meal plan for a URL
     plan_result = _find_in_meal_plan(name)
     if plan_result:
@@ -407,19 +510,46 @@ def _tool_get_recipe(name: str) -> str:
     if condiment:
         return condiment
 
-    # Fall back: search local recipe collection via JSON metadata
-    matches = find_all_recipe_matches(name)
-    if not matches:
-        return f"No recipe found matching '{name}'."
-    if len(matches) > 1:
-        names = ", ".join(m["name"] for m in matches)
-        return f"Found multiple matches: {names}. Which one?"
-    m = matches[0]
-    text = extract_recipe_text(RECIPES_DIR / m["filename"])
-    if not text:
-        return f"Couldn't read that recipe. Dropbox link: {get_dropbox_preview_url(m['filename'])}"
-    dropbox = get_dropbox_preview_url(m["filename"])
-    return f"{text}\n\n[Dropbox link if user wants full recipe: {dropbox}]"
+    # Search local collection first, fall back to external search
+    local_results = _search_local_collection_safe(name)
+    if local_results:
+        if len(local_results) > 1:
+            titles = ", ".join(r["title"] for r in local_results)
+            return f"Found multiple matches: {titles}. Which one?"
+        r = local_results[0]
+        title = r.get("title", name)
+        url = r.get("url", "")
+        matches = find_all_recipe_matches(title)
+        if matches:
+            text = extract_recipe_text(RECIPES_DIR / matches[0]["filename"])
+            if text:
+                hint = "Dropbox link if user wants full recipe" if "dropbox.com" in url else "Full recipe"
+                suffix = f"\n\n[{hint}: {url}]" if url else ""
+                return f"{text}{suffix}\n\n[Found in local collection. Offer to search online for alternatives if wanted.]"
+        if url:
+            return f"{title}: {url}"
+
+    # Not found locally — search externally
+    if handle:
+        outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
+        outbox.append({"handle": handle, "text": "Nothing in the local collection — searching online, this takes about a minute..."})
+        OUTBOX_FILE.write_text(json.dumps(outbox))
+        drain_outbox()
+    try:
+        results = _recipe_run_agent(name)
+        if results:
+            lines = [f"Found {len(results)} recipe(s) online:"]
+            for r in results[:3]:
+                title = r.get("title", "Unknown")
+                url = r.get("url", "")
+                source = r.get("source", "")
+                if url:
+                    lines.append(f"- {title} ({source}): {url}" if source else f"- {title}: {url}")
+            return "\n".join(lines)
+    except Exception as e:
+        import traceback
+        log.error(f"run_agent error: {e}\n{traceback.format_exc()}")
+    return f"No recipe found matching '{name}'."
 
 
 def _tool_get_schedule(person: str, event_type: str = "any") -> str:
@@ -649,6 +779,118 @@ def _tool_update_inventory(item: str, section: str) -> str:
         return f"Couldn't update inventory: {e}"
 
 
+def _notify_parents_individual(kid_handle: str, kid_name: str, meal: str, food_ok, food_reason: str, day_label: str, config: dict) -> None:
+    name_to_handle = {v: k for k, v in config.get("security", {}).get("handle_to_person", {}).items()}
+    parent_handles = [h for h in [name_to_handle.get("David"), name_to_handle.get("Ashley")] if h]
+
+    if food_ok is True:
+        msg = (
+            f"{kid_name} wants to bring a friend to dinner on {day_label} ({meal}). "
+            f"Schedule's clear and there's plenty of food. Reply yes or no and I'll pass it on!"
+        )
+    elif food_ok == "tight":
+        msg = (
+            f"{kid_name} wants to bring a friend to dinner on {day_label} ({meal}). "
+            f"Schedule's clear but it {food_reason}. Reply yes or no and I'll pass it on!"
+        )
+    else:
+        msg = (
+            f"{kid_name} wants to bring a friend to dinner on {day_label} ({meal}). "
+            f"Schedule's clear but I don't have serving info. Reply yes or no and I'll pass it on!"
+        )
+
+    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
+    for h in parent_handles:
+        outbox.append({"handle": h, "text": msg})
+    OUTBOX_FILE.write_text(json.dumps(outbox))
+
+    import time as _time
+    pending = json.loads(PENDING_FRIEND_FILE.read_text()) if PENDING_FRIEND_FILE.exists() else []
+    pending = [p for p in pending if p.get("kid_handle") != kid_handle]
+    pending.append({
+        "kid_handle": kid_handle,
+        "kid_name": kid_name,
+        "meal": meal,
+        "day": day_label,
+        "asked_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+    PENDING_FRIEND_FILE.write_text(json.dumps(pending))
+
+
+def _tool_check_friend_dinner(handle: str, config: dict, date_str: Optional[str] = None) -> str:
+    today = date.today()
+    check_date = date.fromisoformat(date_str) if date_str else today
+    day_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][check_date.weekday()]
+    day_label = "tonight" if check_date == today else day_name
+
+    handle_map = config.get("security", {}).get("handle_to_person", {})
+    kid_name = handle_map.get(handle, "One of the kids")
+
+    schedule = _load_schedule()
+    kids = {"Eleanor", "Wren"}
+    activities = []
+
+    for entry in schedule.get("weekly_overrides", {}).get(check_date.isoformat(), []):
+        if entry.get("person") in kids:
+            activities.append(f"{entry['person']} has {entry.get('note', 'an activity')}")
+
+    for entry in schedule.get("standing", {}).get(day_name, []):
+        if entry.get("person") in kids:
+            activities.append(f"{entry['person']} has {entry.get('activity', 'an activity')}")
+
+    if activities:
+        return json.dumps({"can_join": False, "reason": "busy_schedule", "activities": activities})
+
+    meal_result = _find_in_meal_plan(day_name.lower() if check_date != today else "tonight")
+    if not meal_result:
+        return json.dumps({"can_join": False, "reason": "no_dinner_planned"})
+
+    meal_name, _ = meal_result
+
+    try:
+        meta_data = json.loads(METADATA_FILE.read_text()).get("recipes", {})
+    except Exception:
+        meta_data = {}
+
+    servings_str = ""
+    meal_lower = meal_name.lower()
+    for rname, meta in meta_data.items():
+        if not isinstance(meta, dict):
+            continue
+        rname_lower = rname.lower()
+        if rname_lower == meal_lower:
+            servings_str = meta.get("servings", "")
+            break
+        words = [w for w in meal_lower.split() if len(w) > 3]
+        if words and sum(1 for w in words if w in rname_lower) >= max(1, len(words) // 2):
+            candidate = meta.get("servings", "")
+            if candidate:
+                servings_str = candidate
+                break
+
+    min_servings = _parse_min_servings(servings_str)
+    if min_servings is None:
+        food_ok = "unknown"
+        food_reason = "no serving info"
+    elif min_servings >= 5:
+        food_ok = True
+        food_reason = f"serves {servings_str}"
+    else:
+        food_ok = "tight"
+        food_reason = f"only serves {servings_str}"
+
+    _notify_parents_individual(handle, kid_name, meal_name, food_ok, food_reason, day_label, config)
+
+    return json.dumps({
+        "can_join": food_ok is True,
+        "food_ok": food_ok,
+        "meal": meal_name,
+        "food_reason": food_reason,
+        "day": day_label,
+        "parents_notified": True,
+    })
+
+
 def _tool_relay_message(recipient: str, message: str, config: dict) -> str:
     name_to_handle = {v: k for k, v in config.get("security", {}).get("handle_to_person", {}).items()}
     handle = name_to_handle.get(recipient) or name_to_handle.get(recipient.title())
@@ -677,7 +919,7 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
         if name == "get_meal_plan":
             return _tool_get_meal_plan()
         if name == "get_recipe":
-            return _tool_get_recipe(inputs["name"])
+            return _tool_get_recipe(inputs["name"], handle)
         if name == "get_schedule":
             return _tool_get_schedule(inputs["person"], inputs.get("event_type", "any"))
         if name == "add_schedule_event":
@@ -696,6 +938,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_update_inventory(inputs["item"], inputs["section"])
         if name == "log_capability_gap":
             return _tool_log_capability_gap(inputs["description"], handle)
+        if name == "check_friend_dinner":
+            return _tool_check_friend_dinner(handle, config, inputs.get("date"))
         if name == "relay_message":
             return _tool_relay_message(inputs["recipient"], inputs["message"], config)
         return f"Unknown tool: {name}"
