@@ -32,7 +32,7 @@ DRY_RUN = False
 
 MENU_SESSION_FILE = Path("/Users/Shared/cooking/menu_session.json")
 OUTBOX_FILE = Path("/Users/Shared/sms-assistant/.outbox.json")
-MENUBUILDER_DIR = Path.home() / "projects/personal/MenuBuilder"
+MENUBUILDER_DIR = Path("/Users/davidallison/projects/personal/MenuBuilder")
 
 DAYS_ORDER = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
@@ -60,6 +60,52 @@ def _save_session(session: dict):
         log.info(f"[DRY_RUN] Would write session state={session.get('state')}")
         return
     MENU_SESSION_FILE.write_text(json.dumps(session, indent=2))
+
+
+# ── MenuBuilder MCP bridge ────────────────────────────────────────────────────
+
+_MB_VENV_PYTHON = "/Users/davidallison/projects/personal/MenuBuilder/.venv/bin/python3.12"
+_MB_SERVER_PATH = "/Users/davidallison/projects/personal/MenuBuilder/mcp/menu_server.py"
+_MB_PROJECT_PATH = "/Users/davidallison/projects/personal/MenuBuilder"
+
+
+def call_menubuilder_tool(tool_name: str, **kwargs) -> dict:
+    """Call a MenuBuilder MCP tool via subprocess bridge (handles Python 3.9/3.12 gap)."""
+    script = f"""
+import sys, json
+sys.path.insert(0, {repr(_MB_PROJECT_PATH)})
+import importlib.util
+spec = importlib.util.spec_from_file_location('menu_server', {repr(_MB_SERVER_PATH)})
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+result = getattr(mod, {repr(tool_name)})(**{repr(kwargs)})
+print(json.dumps(result))
+"""
+    try:
+        r = subprocess.run(
+            [_MB_VENV_PYTHON, "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            log.error(f"MenuBuilder tool {tool_name} failed: {r.stderr.strip()}")
+            return {"error": r.stderr.strip()}
+        return json.loads(r.stdout.strip())
+    except Exception as e:
+        log.error(f"MenuBuilder bridge error ({tool_name}): {e}")
+        return {"error": str(e)}
+
+
+def _sync_session_state(state: str):
+    """Write just the state to menu_session.json so server.py routing stays current."""
+    if DRY_RUN:
+        log.info(f"[DRY_RUN] Would sync session state={state}")
+        return
+    try:
+        existing = json.loads(MENU_SESSION_FILE.read_text()) if MENU_SESSION_FILE.exists() else {}
+        existing["state"] = state
+        MENU_SESSION_FILE.write_text(json.dumps(existing, indent=2))
+    except Exception as e:
+        log.error(f"Could not sync session state: {e}")
 
 
 def _send_outbox(handle: str, text: str):
@@ -437,6 +483,89 @@ def _parse_swap(text: str, selected: dict, week_start: date) -> Optional[dict]:
     return None
 
 
+def _claude_swap(
+    text: str,
+    selected: dict,
+    cuisine_direction: Optional[str],
+    metadata: dict,
+) -> Optional[dict]:
+    """
+    Fall back to Claude (Haiku) when _parse_swap can't read a structured command.
+    Interprets natural language feedback, identifies which meals to replace, and
+    picks replacements from active metadata (preferring uncooked + cuisine match).
+    Returns updated selected dict, or None if no changes can be determined.
+    """
+    import anthropic as _anthropic
+
+    ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
+    meal_list = "\n".join(
+        f"{i + 1}. {day}: {name}" for i, (day, name) in enumerate(ordered)
+    )
+
+    already_selected = set(selected.values())
+    direction_lower = (cuisine_direction or "").lower()
+
+    # Build replacement pool: active, not in use, sorted by least-cooked then cuisine match
+    candidates = [
+        (name, meta)
+        for name, meta in metadata.items()
+        if meta.get("status") == "active" and name not in already_selected
+    ]
+
+    def _score(item: tuple) -> tuple:
+        name, meta = item
+        times = meta.get("times_cooked", 0)
+        cuisine_bonus = -1 if direction_lower and direction_lower in meta.get("cuisine", "").lower() else 0
+        return (times, cuisine_bonus)
+
+    candidates.sort(key=_score)
+    candidate_names = [name for name, _ in candidates[:60]]
+
+    try:
+        client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "A user is reviewing a weekly dinner plan and giving natural language feedback.\n\n"
+                    f"Current plan:\n{meal_list}\n\n"
+                    f"User feedback: \"{text}\"\n\n"
+                    f"Available replacements (in preference order): {json.dumps(candidate_names)}\n\n"
+                    "Identify which meals the user wants replaced (by day abbreviation like Mon/Tue/Wed) "
+                    "and choose the best replacement from the available list. "
+                    "Return JSON array only, no explanation:\n"
+                    '[{"day": "Mon", "to": "Replacement Meal Name"}, ...]\n\n'
+                    "If the feedback doesn't clearly request any changes, return []."
+                ),
+            }],
+        )
+        raw = resp.content[0].text.strip()
+        # Strip markdown fences if model wraps output
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+
+        swaps = json.loads(raw)
+        if not isinstance(swaps, list) or not swaps:
+            return None
+
+        new_selected = dict(selected)
+        changed = False
+        for swap in swaps:
+            day = (swap.get("day") or "").strip()
+            to_meal = (swap.get("to") or "").strip()
+            if day and to_meal and day in new_selected:
+                new_selected[day] = to_meal
+                changed = True
+
+        return new_selected if changed else None
+
+    except Exception as e:
+        log.error(f"Claude natural-language swap error: {e}")
+        return None
+
+
 # ── Plan generation ───────────────────────────────────────────────────────────
 
 def _build_plan_text(selected: dict, week_start: date, schedule_notes: list, config: dict) -> str:
@@ -718,35 +847,14 @@ def handle_finalize(session: dict, config: dict):
 # ── State handlers ────────────────────────────────────────────────────────────
 
 def handle_start(config: dict) -> str:
-    """idle → awaiting_meal_logging. Called when admin texts 'start menu' etc."""
-    # Drain feedback queue
-    cmd = [sys.executable, str(MENUBUILDER_DIR / "process_feedback_queue.py")]
-    if DRY_RUN:
-        log.info(f"[DRY_RUN] Would run: {' '.join(cmd)}")
-    else:
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-            if result.returncode != 0:
-                log.warning(f"process_feedback_queue.py: {result.stderr.strip()}")
-        except Exception as e:
-            log.warning(f"Could not drain feedback queue: {e}")
+    """idle → awaiting_meal_logging. Delegates to MenuBuilder via bridge."""
+    result = call_menubuilder_tool("start_menu_workflow")
+    if "error" in result:
+        return "Sorry, couldn't start the menu workflow. Check the logs."
 
-    meals = _parse_last_plan()
-    meals = _merge_feedback_into_meals(meals)
-    week_start = _get_week_start()
+    _sync_session_state(result.get("state", "awaiting_meal_logging"))
 
-    session = {
-        "state": "awaiting_meal_logging",
-        "initiated_at": datetime.now().isoformat(),
-        "week_start": week_start.isoformat(),
-        "last_week_meals": meals,
-        "schedule_notes": [],
-        "cuisine_direction": None,
-        "selected_meals": {},
-        "ideas_on_menu": [],
-    }
-    _save_session(session)
-
+    meals = result.get("last_week_meals", [])
     meal_list = _format_meal_list(meals)
     if meal_list:
         return (
@@ -885,7 +993,7 @@ def _handle_meal_approval(text: str, session: dict, config: dict) -> str:
         _save_session(session)
         return "Sent to Ashley."
 
-    # Try swap
+    # Try structured swap first ("swap 3 to X", "change tuesday to X")
     selected = session.get("selected_meals", {})
     week_start = date.fromisoformat(session["week_start"])
     new_selected = _parse_swap(text, selected, week_start)
@@ -896,11 +1004,22 @@ def _handle_meal_approval(text: str, session: dict, config: dict) -> str:
         quick_days = session.get("quick_days", [])
         return _format_numbered_list(new_selected, week_start, quick_days)
 
-    # Can't parse
+    # Fall back to Claude for natural language ("we've had X too much", "just had Y", etc.)
+    metadata = _load_metadata()
+    new_selected = _claude_swap(text, selected, session.get("cuisine_direction"), metadata)
+
+    if new_selected:
+        session["selected_meals"] = new_selected
+        _save_session(session)
+        quick_days = session.get("quick_days", [])
+        return _format_numbered_list(new_selected, week_start, quick_days)
+
+    # Can't parse — show current list with hints
     quick_days = session.get("quick_days", [])
     current_list = _format_numbered_list(selected, week_start, quick_days)
     return (
-        "Say 'looks good' to approve, or e.g. 'swap 3 to pasta' / 'change tuesday to tacos'.\n\n"
+        "Say 'looks good' to approve, or just tell me what to change — e.g. 'swap 3 to pasta', "
+        "'change tuesday to tacos', or 'we've had X too much'.\n\n"
         + current_list
     )
 
@@ -908,54 +1027,27 @@ def _handle_meal_approval(text: str, session: dict, config: dict) -> str:
 def handle_ashley_reply(text: str, session: dict, config: dict):
     """
     Called from server.py after Ashley replies while awaiting_ashley_signoff.
-    Finalizes the plan or applies her changes and re-sends.
+    Delegates to MenuBuilder via bridge.
     """
-    lowered = text.lower().strip()
     admin_handle = config["security"].get("menu_admin")
-    approval = ("looks good", "good", "ok", "okay", "perfect", "great", "sounds good",
-                "love it", "fine", "yes", "yeah", "sure", "\U0001f44d")
+    result = call_menubuilder_tool("handle_ashley_reply", reply=text)
+    new_state = result.get("state", "")
+    _sync_session_state(new_state)
 
-    if any(lowered == p or lowered.startswith(p + " ") for p in approval):
-        handle_finalize(session, config)
-        return
-
-    # Try to parse a swap from Ashley
-    selected = session.get("selected_meals", {})
-    week_start = date.fromisoformat(session.get("week_start", date.today().isoformat()))
-    new_selected = _parse_swap(text, selected, week_start)
-
-    if new_selected:
-        session["selected_meals"] = new_selected
-        day_to_date = _day_date_map(week_start)
-        meals_json = []
-        for day in DAYS_ORDER:
-            if day in new_selected:
-                dt = day_to_date.get(day)
-                date_str = dt.strftime("%-m/%-d") if dt else ""
-                meals_json.append({"day": f"{day} {date_str}", "recipe": new_selected[day]})
-
-        cmd = [
-            sys.executable, str(MENUBUILDER_DIR / "send_menu_partner.py"),
-            "--meals", json.dumps(meals_json),
-        ]
-        if DRY_RUN:
-            log.info("[DRY_RUN] Would re-send updated menu to Ashley")
-        else:
-            try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            except Exception as e:
-                log.error(f"Re-send to Ashley error: {e}")
-
-        _save_session(session)
+    if new_state == "complete":
+        if admin_handle:
+            _send_outbox(admin_handle, "Plan written, apps launched.")
+    elif new_state == "awaiting_idea_activation":
+        pending_ideas = result.get("pending_ideas", [])
+        if admin_handle and pending_ideas:
+            _send_outbox(admin_handle, f"Couldn't fetch '{pending_ideas[0]}' — paste the recipe content and I'll activate it.")
+    elif new_state == "awaiting_ashley_signoff":
+        # Ashley requested a change — MenuBuilder re-sent the updated menu
         if admin_handle:
             _send_outbox(admin_handle, f"Ashley requested a change: '{text}'. Updated and re-sent.")
     else:
-        # Forward to admin for manual handling
         if admin_handle:
-            _send_outbox(
-                admin_handle,
-                f"Ashley replied but I couldn't parse it: '{text}'. Handle manually.",
-            )
+            _send_outbox(admin_handle, f"Ashley replied but something went wrong. Handle manually: '{text}'")
 
 
 def _handle_idea_content(text: str, session: dict, config: dict) -> str:
@@ -991,21 +1083,71 @@ def _handle_idea_content(text: str, session: dict, config: dict) -> str:
 # ── Main dispatch ─────────────────────────────────────────────────────────────
 
 def dispatch(text: str, session: dict, config: dict) -> str:
-    """Route to the correct state handler. Called from server.py."""
-    state = session.get("state", "idle")
+    """Route to the correct MenuBuilder tool based on current workflow state."""
+    # State is source-of-truth from MenuBuilder, not the local session file
+    state_result = call_menubuilder_tool("get_workflow_state")
+    state = state_result.get("state", "idle")
 
-    if state == "awaiting_meal_logging":
-        return _handle_meal_logging(text, session, config)
-    if state == "awaiting_schedule":
-        return _handle_schedule(text, session, config)
-    if state == "awaiting_cuisine":
-        return _handle_cuisine(text, session, config)
-    if state == "awaiting_meal_approval":
-        return _handle_meal_approval(text, session, config)
-    if state == "awaiting_idea_content":
-        return _handle_idea_content(text, session, config)
     if state in ("idle", "complete", None):
         return ""
 
-    log.warning(f"Unknown menu session state: {state}")
+    if state == "awaiting_meal_logging":
+        result = call_menubuilder_tool("log_meal_feedback", feedback=text)
+        _sync_session_state(result.get("state", state))
+        if result.get("state") == "awaiting_suggestions":
+            return "What are you feeling this week? Mediterranean / Asian / Mexican / surprise me?"
+        meals = result.get("last_week_meals", [])
+        meal_list = _format_meal_list(meals)
+        return f"Got it. Updated:\n{meal_list}\n\nAnything else? Reply 'done' when finished."
+
+    if state == "awaiting_suggestions":
+        result = call_menubuilder_tool("get_meal_suggestions", cuisine_direction=text, constraints="")
+        _sync_session_state(result.get("state", state))
+        selected = result.get("selected_meals", {})
+        week_start = date.fromisoformat(result.get("week_start", date.today().isoformat()))
+        return _format_numbered_list(selected, week_start)
+
+    if state == "awaiting_meal_approval":
+        lowered = text.lower().strip()
+        approval = ("looks good", "good", "ok", "okay", "approved", "go ahead", "perfect",
+                    "great", "sounds good", "yes", "yep", "yeah")
+        if any(lowered == p or lowered.startswith(p + " ") for p in approval):
+            result = call_menubuilder_tool("approve_menu")
+            _sync_session_state(result.get("state", "awaiting_ashley_signoff"))
+            return "Sent to Ashley."
+        else:
+            result = call_menubuilder_tool("swap_meal", reason=text)
+            _sync_session_state(result.get("state", state))
+            selected = result.get("selected_meals", {})
+            week_start = date.fromisoformat(result.get("week_start", date.today().isoformat()))
+            if selected:
+                return _format_numbered_list(selected, week_start)
+            return (
+                "Say 'looks good' to approve, or tell me what to change — "
+                "e.g. 'swap 3 to pasta', 'change tuesday to tacos', or 'we've had X too much'.\n\n"
+                + _format_numbered_list(state_result.get("selected_meals", {}), date.today())
+            )
+
+    if state == "awaiting_ashley_signoff":
+        # Ashley's reply is handled separately via handle_ashley_reply() in server.py
+        # David texting during this state gets a status update
+        return "Waiting on Ashley's OK. I'll let you know when she replies."
+
+    if state == "awaiting_idea_activation":
+        pending = state_result.get("pending_idea", "")
+        result = call_menubuilder_tool("activate_idea_recipe", name=pending, content=text)
+        _sync_session_state(result.get("state", state))
+        if result.get("remaining_pending", 0) == 0:
+            call_menubuilder_tool("finalize_plan")
+            _sync_session_state("complete")
+            return "Thanks! Finishing up the plan..."
+        next_idea = result.get("next_pending", "")
+        return f"Got it! Now paste the content for '{next_idea}'."
+
+    if state == "awaiting_finalization":
+        result = call_menubuilder_tool("finalize_plan")
+        _sync_session_state("complete")
+        return "Plan ready!"
+
+    log.warning(f"Unknown menu workflow state from MenuBuilder: {state}")
     return ""

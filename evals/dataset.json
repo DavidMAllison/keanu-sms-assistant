@@ -2,14 +2,14 @@
   {
     "id": "meal_plan_basic",
     "message": "what's for dinner tonight?",
-    "handle": "+15132528285",
+    "handle": "+10000000002",
     "date": "2026-04-30",
     "expected_calls": []
   },
   {
     "id": "feedback_requires_lookup",
     "message": "the lamb Ragu was great tonight",
-    "handle": "+15132950588",
+    "handle": "+10000000001",
     "date": "2026-04-30",
     "expected_calls": [
       {"tool": "log_feedback", "args": {"recipe": "Lamb Ragu with Pappardelle"}}
@@ -18,7 +18,7 @@
   {
     "id": "schedule_by_name",
     "message": "when is Child1's next game?",
-    "handle": "+15132950588",
+    "handle": "+10000000001",
     "date": "2026-04-30",
     "expected_calls": [
       {"tool": "get_schedule", "args": {"person": "Child1", "event_type": "game"}}
@@ -27,7 +27,7 @@
   {
     "id": "recipe_fetch_exact",
     "message": "can you send me the lamb ragu recipe?",
-    "handle": "+15132950588",
+    "handle": "+10000000001",
     "date": "2026-04-30",
     "expected_calls": [
       {"tool": "get_recipe", "args": {"name": "Lamb Ragu with Pappardelle"}}
@@ -36,7 +36,7 @@
   {
     "id": "recipe_fetch_fuzzy",
     "message": "can you send me the lamb ragu recipe?",
-    "handle": "+15132950588",
+    "handle": "+10000000001",
     "date": "2026-04-30",
     "expected_calls": [
       {"tool": "get_recipe", "args": {"name": {"contains": "lamb ragu"}}}
@@ -45,28 +45,28 @@
   {
     "id": "no_tool_chitchat",
     "message": "hey thanks for the help yesterday",
-    "handle": "+15132950588",
+    "handle": "+10000000001",
     "date": "2026-04-30",
     "expected_calls": []
   },
   {
     "id": "meal_plan_tomorrow",
     "message": "what are we having tomorrow?",
-    "handle": "+15132528285",
+    "handle": "+10000000002",
     "date": "2026-04-30",
     "expected_calls": []
   },
   {
     "id": "meal_plan_weekend",
     "message": "what's the plan for the weekend?",
-    "handle": "+15132528285",
+    "handle": "+10000000002",
     "date": "2026-04-30",
     "expected_calls": []
   },
   {
     "id": "preference_vs_feedback",
     "message": "I don't want tacos again",
-    "handle": "+15132950588",
+    "handle": "+10000000001",
     "date": "2026-04-30",
     "expected_calls": [
       {"tool": "log_preference"}
@@ -75,7 +75,7 @@
   {
     "id": "meal_change_admin",
     "message": "can we do pizza this week?",
-    "handle": "+15132950588",
+    "handle": "+10000000001",
     "date": "2026-04-30",
     "expected_calls": [
       {"tool": "update_meal_plan"}
@@ -84,7 +84,7 @@
   {
     "id": "meal_change_non_admin",
     "message": "can we do pizza this week?",
-    "handle": "+15132528285",
+    "handle": "+10000000002",
     "date": "2026-04-30",
     "expected_calls": [
       {"tool": "log_capability_gap"}

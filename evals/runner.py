@@ -35,14 +35,8 @@ FAKE_CONFIG = {
     },
 }
 
-# Map dataset handles to fake handles so we preserve persona (admin/kid/etc)
-# without using real phone numbers in the test run
-HANDLE_MAP = {
-    "+15132950588": "+10000000001",  # admin
-    "+15132528285": "+10000000002",  # idea submitter
-    "theallisonfamilia@gmail.com": "+10000000003",  # kid
-    "wren.allison@icloud.com": "+10000000003",
-}
+# dataset.json uses fake handles directly — no mapping needed
+HANDLE_MAP = {}
 
 
 # ── Assertion helpers ─────────────────────────────────────────────────────────
