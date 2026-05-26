@@ -37,6 +37,8 @@ import sys as _sys
 _sys.path.insert(0, "/Users/davidallison/projects/personal/MenuBuilder")
 from recipe_agent import run_agent as _recipe_run_agent, search_local_collection as _search_local_collection
 
+from menubuilder_bridge import call_menubuilder_tool as _call_menubuilder_tool
+
 log = logging.getLogger(__name__)
 
 _DAVID_HOME = "/Users/davidallison"
@@ -340,6 +342,21 @@ _DEFS = {
             "required": ["recipient", "message"],
         },
     },
+    "get_prep_guide": {
+        "name": "get_prep_guide",
+        "description": (
+            "Returns the authoritative Sunday batch prep list for this week — "
+            "tasks, timings, and order pulled directly from the current meal plan. "
+            "Call this whenever the user asks what they can prep ahead, what the Sunday prep is, "
+            "what to batch cook, or any variation of those questions. "
+            "Do not generate prep advice from recipe files or your own reasoning — always use this tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     "swap_meal": {
         "name": "swap_meal",
         "description": (
@@ -376,7 +393,8 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
     if is_kid:
         return [_DEFS["get_meal_plan"], _DEFS["get_schedule"], _DEFS["check_friend_dinner"]]
     names = ["get_meal_plan", "get_recipe", "get_schedule", "add_schedule_event",
-             "log_feedback", "log_preference", "log_capability_gap", "relay_message"]
+             "log_feedback", "log_preference", "log_capability_gap", "relay_message",
+             "get_prep_guide"]
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal"]
     if is_admin:
@@ -982,6 +1000,14 @@ def _tool_swap_meal(day: str, outgoing: str, incoming: str,
     return result.get("message", f"Swapped {outgoing} → {incoming} on {day}.")
 
 
+def _tool_get_prep_guide() -> str:
+    result = _call_menubuilder_tool("get_prep_guide")
+    if "error" in result:
+        log.error(f"get_prep_guide bridge error: {result['error']}")
+        return "Sorry, couldn't fetch the prep guide right now."
+    return result.get("prep_guide", "No prep guide available for this week.")
+
+
 def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
     try:
         if name == "get_meal_plan":
@@ -1013,6 +1039,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
         if name == "swap_meal":
             return _tool_swap_meal(inputs["day"], inputs["outgoing"], inputs["incoming"],
                                    inputs.get("incoming_content"))
+        if name == "get_prep_guide":
+            return _tool_get_prep_guide()
         return f"Unknown tool: {name}"
     except Exception as e:
         log.error(f"Tool error ({name}): {e}")
