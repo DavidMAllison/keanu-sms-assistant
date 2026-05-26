@@ -45,7 +45,13 @@ def load_config() -> dict:
 
 def load_state() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+            log.error(f"State file corrupt (got {type(data).__name__}), resetting to defaults")
+        except Exception as e:
+            log.error(f"Could not read state file: {e}")
     return {"last_rowid": 0}
 
 def save_state(state: dict):
@@ -54,125 +60,72 @@ def save_state(state: dict):
 # ── Outbox ────────────────────────────────────────────────────────────────────
 # drain_outbox, send_imessage, send_imessage_group imported from tools
 
-# ── School countdown ──────────────────────────────────────────────────────────
-
-SCHOOL_LAST_DAY = date(2026, 5, 22)
-_COUNTDOWN_SEND_AFTER = 7   # 7 AM
-_COUNTDOWN_SEND_BEFORE = 10  # stop sending if server was down past 10 AM
 
 
-def _school_days_remaining(from_date: date) -> int:
-    count = 0
-    check = from_date + timedelta(days=1)
-    while check <= SCHOOL_LAST_DAY:
-        if check.weekday() < 5:
-            count += 1
-        check += timedelta(days=1)
-    return count
+# ── Holiday messages ───────────────────────────────────────────────────────────
+
+_HOLIDAYS = {
+    "2026-01-01": "New Year's Day",
+    "2026-01-19": "Martin Luther King Jr. Day",
+    "2026-02-16": "Presidents' Day",
+    "2026-05-25": "Memorial Day",
+    "2026-07-04": "Independence Day",
+    "2026-09-07": "Labor Day",
+    "2026-11-26": "Thanksgiving",
+    "2026-12-25": "Christmas Day",
+}
+
+_HOLIDAY_SEND_AFTER = 8   # 8 AM
+_HOLIDAY_SEND_BEFORE = 10  # 10 AM
 
 
-def maybe_send_school_countdown(state: dict, config: dict):
+def maybe_send_holiday_message(state: dict, config: dict):
     today = date.today()
     now = datetime.now()
 
-    if today.weekday() >= 5:  # skip weekends
+    holiday_name = _HOLIDAYS.get(today.isoformat())
+    if not holiday_name:
         return
-    if today > SCHOOL_LAST_DAY:
-        return
-    if not (_COUNTDOWN_SEND_AFTER <= now.hour < _COUNTDOWN_SEND_BEFORE):
-        return
-    if state.get("last_countdown_date") == today.isoformat():
+    if not (_HOLIDAY_SEND_AFTER <= now.hour < _HOLIDAY_SEND_BEFORE):
         return
 
-    remaining = _school_days_remaining(today)
-    handle_to_person = config["security"].get("handle_to_person", {})
+    already_sent = state.get("holiday_messages_sent", {})
+    if already_sent.get(today.isoformat()):
+        return
+
     kids = config["security"].get("kids", [])
-
-    for handle in kids:
-        name = handle_to_person.get(handle, "there")
-        if today == SCHOOL_LAST_DAY:
-            msg = f"Good morning, {name}! Today is the LAST day of school — have a brilliant one! Have a great summer!"
-        elif remaining == 1:
-            msg = f"Good morning, {name}! Just 1 school day left after today — nearly there!"
-        else:
-            msg = f"Good morning, {name}! {remaining} school days left until summer!"
-        send_imessage(handle, msg)
-        log.info(f"School countdown sent to {handle}: {remaining} days remaining")
-
-    state["last_countdown_date"] = today.isoformat()
-    save_state(state)
-
-
-def maybe_send_game_day_messages(state: dict, config: dict):
-    today = date.today()
-    now = datetime.now()
-
-    if not (_COUNTDOWN_SEND_AFTER <= now.hour < _COUNTDOWN_SEND_BEFORE):
-        return
-
-    schedule_path = Path(config.get("paths", {}).get("schedule_file", ""))
-    if not schedule_path.exists():
-        return
-
-    try:
-        schedule = json.loads(schedule_path.read_text())
-    except Exception as e:
-        log.error(f"Game day: could not read schedule: {e}")
-        return
-
-    overrides = schedule.get("weekly_overrides", {}).get(today.isoformat(), [])
-    if not overrides:
-        return
-
     handle_to_person = config["security"].get("handle_to_person", {})
     person_to_handle = {v: k for k, v in handle_to_person.items()}
-    kids = config["security"].get("kids", [])
-    already_sent = state.get("game_messages_sent", {}).get(today.isoformat(), [])
 
-    for entry in overrides:
-        person = entry.get("person", "")
-        note = entry.get("note", "")
-        note_lower = note.lower()
-
-        if "game" not in note_lower and "tournament" not in note_lower:
+    for person, handle in person_to_handle.items():
+        if handle not in kids:
             continue
-
-        handle = person_to_handle.get(person)
-        if not handle or handle not in kids:
-            continue
-
-        if handle in already_sent:
-            continue
-
         try:
             response = _20q_client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=100,
+                max_tokens=120,
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"You are Keanu, a friendly Australian koala texting {person} before their soccer game today. "
-                        f"Game details: {note}\n\n"
-                        "Write a short, warm good luck message. Two sentences max. "
-                        "Australian slang welcome (mate, heaps, arvo, etc). No markdown. "
-                        "Be enthusiastic and specific if the note has useful details."
+                        f"You are Keanu, a friendly British koala texting {person} on {holiday_name}. "
+                        "Write a short, fun, quirky holiday greeting. Two sentences max. "
+                        "Be warm and a little silly — use a funny or unexpected emoji. "
+                        "No markdown. No generic greetings like 'Happy holidays!'"
                     ),
                 }],
             )
             msg = response.content[0].text.strip()
         except Exception as e:
-            log.error(f"Game day message generation error for {person}: {e}")
+            log.error(f"Holiday message generation error for {person}: {e}")
             continue
 
         send_imessage(handle, msg)
-        log.info(f"Game day message sent to {person} ({handle})")
+        log.info(f"Holiday message ({holiday_name}) sent to {person} ({handle})")
 
-        if "game_messages_sent" not in state:
-            state["game_messages_sent"] = {}
-        if today.isoformat() not in state["game_messages_sent"]:
-            state["game_messages_sent"][today.isoformat()] = []
-        state["game_messages_sent"][today.isoformat()].append(handle)
-        save_state(state)
+    if "holiday_messages_sent" not in state:
+        state["holiday_messages_sent"] = {}
+    state["holiday_messages_sent"][today.isoformat()] = True
+    save_state(state)
 
 
 # ── Trash reminder ─────────────────────────────────────────────────────────────
@@ -483,11 +436,13 @@ def main():
 
     while True:
         try:
+            if not isinstance(state, dict):
+                log.error(f"Server state corrupted in memory (type={type(state).__name__}), reloading from disk")
+                state = load_state()
             drain_outbox()
             config = load_config()
-            maybe_send_school_countdown(state, config)
-            maybe_send_game_day_messages(state, config)
             maybe_send_trash_reminder(state, config)
+            maybe_send_holiday_message(state, config)
             min_date = startup_cutoff if first_poll else None
             messages = poll_new_messages(state["last_rowid"], min_date)
             first_poll = False
@@ -556,8 +511,8 @@ def main():
                 if handle == menu_admin and MENU_SESSION_FILE.exists():
                     try:
                         session = json.loads(MENU_SESSION_FILE.read_text())
-                        state = session.get("state", "idle")
-                        if state not in ("idle", "complete", None):
+                        wf_state = session.get("state", "idle")
+                        if wf_state not in ("idle", "complete", None):
                             if "cancel menu" in text.lower():
                                 MENU_SESSION_FILE.write_text(json.dumps({"state": "idle"}))
                                 send_imessage(handle, "Menu session cancelled.")

@@ -11,7 +11,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Recipes** — searches local collection first; falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
 - **Feedback** — logs family reactions to meals for future planning
-- **Proactive messages** — good luck texts on soccer game mornings, school countdown
+- **Proactive messages** — holiday morning messages, trash reminders
 - **Relay** — admin can ask Keanu to forward a message to another family member
 
 ## How it works
@@ -77,14 +77,15 @@ server.py                  # Main loop — polls chat.db, routes messages, sends
 agent.py                   # Conversation loop — Claude tool use, per-handle history
 tools.py                   # Tool definitions and implementations
 agents/
+  menu_workflow.py         # Weekly menu build workflow (SMS Activity, delegates to MenuBuilder MCP)
   menu_agent.py            # Meal plans, recipes, inventory, feedback
-  schedule_agent.py        # Games, practices, upcoming events
-  fun_agent.py             # Jokes, riddles, trivia
 system_prompts/
   menu.txt                 # Keanu's main personality prompt
-  fun.txt                  # Prompt for fun/jokes mode
 config/
   settings.yaml.example    # Config template — copy to settings.yaml
+evals/
+  dataset.json             # Eval test cases (fake handles only — no real numbers)
+  runner.py                # Eval harness
 ```
 
 ## Data files (not in repo)

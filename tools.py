@@ -340,6 +340,35 @@ _DEFS = {
             "required": ["recipient", "message"],
         },
     },
+    "swap_meal": {
+        "name": "swap_meal",
+        "description": (
+            "Swap a meal in the current week's plan. Confirm day + outgoing recipe with the user first. "
+            "Pass incoming as a recipe name (existing collection) or a URL (new recipe). "
+            "If the result starts with 'fetch_failed', ask the user to paste the recipe content and "
+            "call again with incoming_content."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "day": {"type": "string", "description": "Day label as shown in the meal plan, e.g. 'Thu 5/21'"},
+                "outgoing": {"type": "string", "description": "Exact recipe name being replaced"},
+                "incoming": {"type": "string", "description": "Replacement recipe name (from collection) or a URL"},
+                "incoming_content": {
+                    "type": "object",
+                    "description": "Parsed recipe content when URL fetch failed — only set on retry after fetch_failed",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "time": {"type": "string"},
+                        "servings": {"type": "string"},
+                        "ingredients": {"type": "array", "items": {"type": "string"}},
+                        "instructions": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "required": ["day", "outgoing", "incoming"],
+        },
+    },
 }
 
 
@@ -349,7 +378,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
     names = ["get_meal_plan", "get_recipe", "get_schedule", "add_schedule_event",
              "log_feedback", "log_preference", "log_capability_gap", "relay_message"]
     if is_idea_submitter:
-        names += ["check_recipe_similarity", "save_recipe_idea"]
+        names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal"]
     if is_admin:
         names += ["update_meal_plan", "update_inventory"]
     return [_DEFS[n] for n in names]
@@ -914,6 +943,45 @@ def _tool_log_capability_gap(description: str, handle: str) -> str:
     return "Noted."
 
 
+def _tool_swap_meal(day: str, outgoing: str, incoming: str,
+                    incoming_content: Optional[dict] = None) -> str:
+    import os
+    is_url = incoming.startswith("http")
+    kwargs = {"day": day, "outgoing_recipe": outgoing}
+    if incoming_content:
+        kwargs["incoming_content"] = incoming_content
+    elif is_url:
+        kwargs["incoming_url"] = incoming
+    else:
+        kwargs["incoming_name"] = incoming
+
+    orig = os.environ.get("HOME")
+    os.environ["HOME"] = _DAVID_HOME
+    try:
+        from meal_swap import execute_swap
+        result = execute_swap(**kwargs)
+    except Exception as e:
+        log.error(f"execute_swap error: {e}", exc_info=True)
+        return f"Swap failed: {e}"
+    finally:
+        if orig is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = orig
+
+    if not result.get("success"):
+        if result.get("message") == "fetch_failed":
+            return (
+                "fetch_failed: Couldn't fetch that recipe automatically. "
+                "Ask the user to paste the full recipe content (title, cook time, servings, "
+                "ingredients as a list, and instructions), then call swap_meal again with "
+                "incoming_content set to {title, time, servings, ingredients: [str], instructions: [str]}."
+            )
+        return f"Swap failed: {result.get('message', 'unknown error')}"
+
+    return result.get("message", f"Swapped {outgoing} → {incoming} on {day}.")
+
+
 def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
     try:
         if name == "get_meal_plan":
@@ -942,6 +1010,9 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_check_friend_dinner(handle, config, inputs.get("date"))
         if name == "relay_message":
             return _tool_relay_message(inputs["recipient"], inputs["message"], config)
+        if name == "swap_meal":
+            return _tool_swap_meal(inputs["day"], inputs["outgoing"], inputs["incoming"],
+                                   inputs.get("incoming_content"))
         return f"Unknown tool: {name}"
     except Exception as e:
         log.error(f"Tool error ({name}): {e}")
