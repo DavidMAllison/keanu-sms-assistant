@@ -3,14 +3,19 @@ Keanu - iMessage AI assistant
 Polls chat.db for new messages, routes to Claude via tool use, replies via AppleScript.
 """
 
+import base64
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
+import tempfile
+import threading
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +25,7 @@ from dotenv import load_dotenv
 
 from agent import get_reply
 from agents import menu_workflow
+from groceryagent_bridge import call_receipt_parser
 from tools import send_imessage, send_imessage_group, drain_outbox
 
 load_dotenv()
@@ -31,6 +37,7 @@ log = logging.getLogger(__name__)
 CONFIG_FILE = Path(__file__).parent / "config/settings.yaml"
 STATE_FILE = Path(__file__).parent / ".keanu_state.json"
 OUTBOX_FILE = Path(__file__).parent / ".outbox.json"
+_outbox_lock = threading.Lock()
 MENU_PENDING_FILE = Path(__file__).parent / "menu_feedback_pending.json"
 MENU_RESPONSE_FILE = Path("/Users/Shared/cooking/menu_feedback_response.json")
 MENU_SESSION_FILE = Path("/Users/Shared/cooking/menu_session.json")
@@ -175,6 +182,190 @@ _TAPBACK_PREFIXES = (
 def is_tapback(text: str) -> bool:
     return any(text.startswith(p) for p in _TAPBACK_PREFIXES)
 
+def _prepare_image_file(att: dict) -> Optional[tuple]:
+    """Convert attachment to a (file_path, mime_type) tuple ready for API use.
+
+    Returns None on failure. Caller is responsible for cleaning up any temp file
+    created during HEIC conversion (check if returned path differs from original).
+    """
+    raw_path = att["filename"]
+    mime_type = att["mime_type"]
+    file_path = Path(raw_path).expanduser()
+
+    if not file_path.exists():
+        log.warning(f"Attachment file not found: {file_path}")
+        return None
+
+    # iPhones send HEIC by default — convert to JPEG with sips (built-in macOS)
+    if mime_type in ("image/heic", "image/heif"):
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            subprocess.run(
+                ["sips", "-s", "format", "jpeg", str(file_path), "--out", tmp_path],
+                check=True, capture_output=True,
+            )
+            file_path = Path(tmp_path)
+            mime_type = "image/jpeg"
+            log.info(f"Converted HEIC to JPEG: {tmp_path}")
+        except Exception as e:
+            log.error(f"HEIC conversion failed: {e}")
+            return None
+
+    supported = ("image/jpeg", "image/png", "image/gif", "image/webp")
+    if mime_type not in supported:
+        log.warning(f"Unsupported image type: {mime_type}")
+        return None
+
+    return file_path, mime_type
+
+
+def _run_receipt_bridge(image_path: str, handle: str):
+    """Call the grocery agent bridge and send the reply to handle via outbox.
+
+    Cleans up the temp file after the call regardless of outcome.
+    """
+    try:
+        result = call_receipt_parser(image_path)
+        reply = result.get("reply")
+        if not reply:
+            error = result.get("error", "unknown error")
+            log.error(f"Receipt bridge returned no reply for {handle}: {error}")
+            reply = "Sorry, something went wrong on my end processing that receipt — let David know."
+        send_imessage(handle, reply)
+        log.info(f"Receipt processed for {handle}: {reply[:80]}")
+    finally:
+        try:
+            Path(image_path).unlink(missing_ok=True)
+            log.info(f"Cleaned up temp receipt file: {image_path}")
+        except Exception as e:
+            log.warning(f"Could not delete temp file {image_path}: {e}")
+
+
+def _is_grocery_receipt_caption(text: str) -> bool:
+    """Return True if the message caption suggests a grocery receipt."""
+    lowered = text.lower()
+    return any(kw in lowered for kw in _GROCERY_CAPTION_KEYWORDS)
+
+
+def _vision_is_receipt(image_path: str, mime_type: str) -> bool:
+    """Ask Claude Haiku whether the image is a grocery receipt. Returns True/False."""
+    try:
+        image_data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
+        response = _20q_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime_type, "data": image_data},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Is this image a grocery receipt? Reply with only 'yes' or 'no'.",
+                    },
+                ],
+            }],
+        )
+        answer = response.content[0].text.strip().lower()
+        log.info(f"Vision receipt check answered: {answer!r}")
+        return answer.startswith("yes")
+    except Exception as e:
+        log.error(f"Vision receipt check error: {e}")
+        return False
+
+
+def route_image_message(attachments: list, text: str, handle: str):
+    """Route an inbound image through grocery detection or general vision.
+
+    - Path A (caption keyword): parse immediately, no confirmation.
+    - Path B (no keyword):
+        - If Haiku thinks it's a receipt: ask user to confirm, set pending state.
+        - Otherwise: fall through to general vision handler and return a reply string.
+
+    Returns a reply string only for the general-vision fallback (Path B, not-a-receipt).
+    For Path A and receipt-confirmation paths, replies are sent directly and None is returned.
+    """
+    if not attachments:
+        return "Sorry, I couldn't read that image — try resending?"
+
+    # Use the first image attachment only
+    prepared = _prepare_image_file(attachments[0])
+    if prepared is None:
+        return "Sorry, I couldn't read that image — try resending?"
+
+    file_path, mime_type = prepared
+    image_path = str(file_path)
+
+    # Path A — caption explicitly mentions a grocery store or receipt
+    if _is_grocery_receipt_caption(text):
+        log.info(f"Path A: grocery caption from {handle}, routing to receipt bridge")
+        _run_receipt_bridge(image_path, handle)
+        return None  # reply already sent inside _run_receipt_bridge
+
+    # Path B — ask Haiku to check
+    if _vision_is_receipt(image_path, mime_type):
+        log.info(f"Path B: vision says receipt from {handle}, requesting confirmation")
+        # Write receipt to a stable temp path so it survives until confirmation
+        ts = int(time.time())
+        stable_path = f"/tmp/receipt_{ts}.jpg"
+        try:
+            shutil.copy2(image_path, stable_path)
+            # Clean up original converted temp if it was a new temp file
+            if image_path != stable_path:
+                Path(image_path).unlink(missing_ok=True)
+        except Exception as e:
+            log.error(f"Could not copy receipt to stable path: {e}")
+            stable_path = image_path  # fall back to original path
+
+        _pending_receipt[handle] = {"image_path": stable_path}
+        send_imessage(handle, "Looks like a grocery receipt — want me to process it? (yes/no)")
+        return None  # confirmation message already sent
+
+    # Not a receipt — general vision handler
+    log.info(f"Not a receipt from {handle}, routing to general vision handler")
+    image_contents = []
+    try:
+        image_data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
+        image_contents.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": image_data},
+        })
+
+        prompt = text.strip() if text.strip() else "What's in this image?"
+        image_contents.append({"type": "text", "text": prompt})
+
+        response = _20q_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system=(
+                "You are Keanu, a friendly British koala family assistant. "
+                "Describe or interpret images helpfully and conversationally. "
+                "Keep replies concise — this is SMS."
+            ),
+            messages=[{"role": "user", "content": image_contents}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        log.error(f"Vision API / read error for {image_path}: {e}")
+        return "Sorry, I had trouble processing that image — try again?"
+    finally:
+        # Clean up converted HEIC temp file (no-op if it's the original attachment path)
+        Path(image_path).unlink(missing_ok=True)
+
+
+def handle_image_message(attachments: list, text: str, handle: str) -> str:
+    """Legacy wrapper — kept for callers that expect a return value.
+
+    New code should call route_image_message() directly.
+    """
+    result = route_image_message(attachments, text, handle)
+    return result if result is not None else ""
+
+
 def is_menu_start(text: str) -> bool:
     return any(p in text.lower() for p in (
         "start menu", "menu time", "do the menu", "weekly menu", "start the menu",
@@ -203,20 +394,42 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
             date_filter = "AND m.date >= ?"
             params.append(int((min_date - APPLE_EPOCH_OFFSET) * 1e9))
         cursor = conn.execute(f"""
-            SELECT m.rowid, m.text, h.id AS sender_handle
+            SELECT m.rowid, m.text, h.id AS sender_handle,
+                   a.filename AS att_filename,
+                   a.mime_type AS att_mime_type
             FROM message m
             JOIN handle h ON m.handle_id = h.rowid
             JOIN chat_message_join cmj ON cmj.message_id = m.rowid
             JOIN chat c ON c.rowid = cmj.chat_id
+            LEFT JOIN message_attachment_join maj ON maj.message_id = m.rowid
+            LEFT JOIN attachment a ON a.rowid = maj.attachment_id
             WHERE m.is_from_me = 0
               AND c.chat_identifier NOT LIKE 'chat%'
               AND m.rowid > ?
-              AND m.text IS NOT NULL
-              AND m.text != ''
+              AND (
+                (m.text IS NOT NULL AND m.text != '')
+                OR (a.mime_type LIKE 'image/%')
+              )
               {date_filter}
             ORDER BY m.rowid ASC
         """, params)
-        return [{"rowid": row[0], "text": row[1], "handle": row[2]} for row in cursor.fetchall()]
+        # Deduplicate by rowid — one message can have multiple attachments
+        seen: dict = {}
+        for row in cursor.fetchall():
+            rowid, text, handle, att_filename, att_mime_type = row
+            if rowid not in seen:
+                seen[rowid] = {
+                    "rowid": rowid,
+                    "text": text or "",
+                    "handle": handle,
+                    "attachments": [],
+                }
+            if att_filename and att_mime_type and att_mime_type.startswith("image/"):
+                seen[rowid]["attachments"].append({
+                    "filename": att_filename,
+                    "mime_type": att_mime_type,
+                })
+        return sorted(seen.values(), key=lambda m: m["rowid"])
     finally:
         conn.close()
 
@@ -231,6 +444,15 @@ def is_rate_limited(handle: str, limit: int) -> bool:
         return True
     _rate_limit_store[handle].append(now)
     return False
+
+# ── Receipt pending state ──────────────────────────────────────────────────────
+
+# Keyed by handle. Value: {"image_path": str} — held until user confirms or denies.
+_pending_receipt: dict = {}
+
+_GROCERY_CAPTION_KEYWORDS = (
+    "receipt", "grocery", "kroger", "costco", "trader joe", "aldi", "whole foods",
+)
 
 # ── 20 Questions ───────────────────────────────────────────────────────────────
 
@@ -420,8 +642,49 @@ def handle_20q_reverse_turn(handle: str, text: str) -> tuple[str, bool]:
 STARTUP_GRACE_SECONDS = 120
 
 
+class _SendHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != "/send":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body)
+            handle = payload["handle"]
+            text = payload["text"]
+        except (json.JSONDecodeError, KeyError):
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "missing handle or text"}')
+            return
+        with _outbox_lock:
+            outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
+            outbox.append({"handle": handle, "text": text})
+            OUTBOX_FILE.write_text(json.dumps(outbox))
+        log.info(f"API /send: queued message to {handle}")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+
+    def log_message(self, format, *args):  # suppress default HTTP access log
+        log.debug("API: " + format % args)
+
+
+def start_api_server(port: int):
+    server = HTTPServer(("127.0.0.1", port), _SendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info(f"API server listening on http://127.0.0.1:{port}")
+
+
 def main():
     log.info("Keanu starting up...")
+    cfg = load_config()
+    start_api_server(cfg.get("api_port", 5050))
     state = load_state()
 
     if state["last_rowid"] == 0:
@@ -453,13 +716,15 @@ def main():
 
                 handle = msg["handle"]
                 text = msg["text"]
-                log.info(f"Message from {handle}: {text[:80]}")
+                attachments = msg.get("attachments", [])
+                has_image = len(attachments) > 0
+                log.info(f"Message from {handle}: {text[:80]}" + (f" [{len(attachments)} image(s)]" if has_image else ""))
 
                 if is_tapback(text):
                     log.info(f"Ignoring tapback from {handle}")
                     continue
 
-                if not text.strip():
+                if not text.strip() and not has_image:
                     log.info(f"Ignoring empty message from {handle}")
                     continue
 
@@ -474,6 +739,37 @@ def main():
 
                 if not config["agents"]["menu"]["enabled"]:
                     send_imessage(handle, "The assistant is currently disabled.")
+                    continue
+
+                # Pending receipt confirmation — intercept yes/no before other routing
+                if handle in _pending_receipt and not has_image:
+                    lowered = text.strip().lower()
+                    _YES = ("yes", "y", "yep", "yeah", "sure", "ok", "okay")
+                    _NO  = ("no", "n", "nope", "nah", "cancel", "never mind", "nevermind")
+                    if lowered in _YES:
+                        pending = _pending_receipt.pop(handle)
+                        log.info(f"Receipt confirmed by {handle}, running bridge")
+                        _run_receipt_bridge(pending["image_path"], handle)
+                        continue
+                    elif lowered in _NO:
+                        pending = _pending_receipt.pop(handle)
+                        try:
+                            Path(pending["image_path"]).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        log.info(f"Receipt declined by {handle}, discarding")
+                        send_imessage(handle, "No worries, I'll leave it!")
+                        continue
+                    else:
+                        # Not a yes/no — fall through to normal routing without consuming
+                        log.info(f"Pending receipt for {handle} but reply was not yes/no, falling through")
+
+                # Image messages — route via grocery detection or general vision
+                if has_image:
+                    log.info(f"Routing image from {handle} to image router")
+                    reply = route_image_message(attachments, text, handle)
+                    if reply:
+                        send_imessage(handle, reply)
                     continue
 
                 # 20Q games intercept all messages while active

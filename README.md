@@ -8,11 +8,14 @@ The key design goal: every family member uses the device they already have. No a
 
 - **Meal planning** — what's for dinner, ingredients, recipe details
 - **Schedule** — upcoming soccer games, practices, events pulled from a calendar
-- **Recipes** — searches local collection first; falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally
+- **Recipes** — searches local collection first (all statuses, scored by keyword match); falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally; returns GitHub Pages URL for collection hits
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
 - **Feedback** — logs family reactions to meals for future planning
-- **Proactive messages** — holiday morning messages, trash reminders
+- **Proactive messages** — holiday morning messages, trash reminders, game-day good-luck texts
 - **Relay** — admin can ask Keanu to forward a message to another family member
+- **Grocery receipts** — send a photo of a receipt and Keanu parses it into the shopping inventory
+- **Image vision** — reads images sent via iMessage (HEIC auto-converted to JPEG)
+- **Sunday menu trigger** — launchd job fires at 9 AM Sunday to kick off the weekly menu workflow automatically
 
 ## How it works
 
@@ -73,11 +76,14 @@ launchd's `KeepAlive: true` restarts it automatically after the kill.
 ## Project structure
 
 ```
-server.py                  # Main loop — polls chat.db, routes messages, sends replies
+server.py                  # Main loop — polls chat.db, routes messages, sends replies; HTTP API on :5050
 agent.py                   # Conversation loop — Claude tool use, per-handle history
 tools.py                   # Tool definitions and implementations
+trigger_menu.py            # Sunday 9 AM launchd entry point — fires handle_start() and sends opening SMS
+groceryagent_bridge.py     # Subprocess bridge to GroceryAgent receipt parser
+menubuilder_bridge.py      # Subprocess bridge to MenuBuilder MCP (Python 3.9→3.12)
 agents/
-  menu_workflow.py         # Weekly menu build workflow (SMS Activity, delegates to MenuBuilder MCP)
+  menu_workflow.py         # Weekly menu workflow — local phase (feedback/schedule/cuisine) + MenuBuilder MCP bridge
   menu_agent.py            # Meal plans, recipes, inventory, feedback
 system_prompts/
   menu.txt                 # Keanu's main personality prompt
