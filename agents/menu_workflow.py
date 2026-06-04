@@ -396,30 +396,9 @@ def _day_date_map(week_start: date) -> dict:
 
 
 def _format_numbered_list(selected: dict, week_start: date, quick_days: Optional[list] = None) -> str:
-    """Format selected meals as a numbered list for SMS approval."""
-    metadata = _load_metadata()
-    day_to_date = _day_date_map(week_start)
-    quick_set = {d.lower() for d in (quick_days or [])}
+    """Format selected meals as compact Sun-Sat list for SMS approval."""
     ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
-
-    lines = []
-    for i, (day, name) in enumerate(ordered, 1):
-        dt = day_to_date.get(day)
-        date_str = dt.strftime("%-m/%-d") if dt else ""
-        key = _find_recipe_key(name, metadata)
-        time_str = metadata[key].get("time", "") if key else ""
-
-        quick_flag = ""
-        if day.lower() in quick_set or day[:3].lower() in quick_set:
-            quick_flag = " [quick night]"
-
-        line = f"{i}. {day} {date_str}: {name}"
-        if time_str:
-            line += f" ({time_str}){quick_flag}"
-        else:
-            line += quick_flag
-        lines.append(line)
-
+    lines = [f"{day}: {name}" for day, name in ordered]
     return "\n".join(lines)
 
 
@@ -819,59 +798,60 @@ def handle_finalize(session: dict, config: dict):
 # ── State handlers ────────────────────────────────────────────────────────────
 
 def handle_start(config: dict) -> str:
-    """idle → awaiting_meal_logging. Delegates to MenuBuilder via bridge."""
+    """idle → awaiting_meal_logging (local) or awaiting_schedule (local)."""
     result = call_menubuilder_tool("start_menu_workflow")
     if "error" in result:
         return "Sorry, couldn't start the menu workflow. Check the logs."
 
-    _sync_session_state(result.get("state", "awaiting_meal_logging"))
-
     meals = result.get("last_week_meals", [])
-    meal_list = _format_meal_list(meals)
-    if meal_list:
-        return (
-            f"Last week's meals:\n{meal_list}\n\n"
-            "Any feedback to add? Reply 'done' when finished."
-        )
-    return "Couldn't find last week's plan. Reply 'done' to skip meal logging."
+    missing = [m for m in meals if not m.get("sms_feedback")]
+
+    session = _load_session()
+    session["last_week_meals"] = meals
+    session["week_start"] = result.get("week_start") or _get_week_start().isoformat()
+
+    if not missing:
+        # All feedback already captured — skip straight to schedule
+        session["state"] = "awaiting_schedule"
+        _save_session(session)
+        return "Let's make this week's menu.\n\nAny schedule changes this week?"
+
+    session["state"] = "awaiting_meal_logging"
+    session["feedback_queue"] = [m["name"] for m in missing]
+    _save_session(session)
+
+    first = missing[0]["name"]
+    return f"Let's make this week's menu.\n\nHow did {first} go?"
 
 
 def _handle_meal_logging(text: str, session: dict, config: dict) -> str:
-    lowered = text.lower().strip()
-
-    if "done" in lowered:
-        meals = session.get("last_week_meals", [])
-        _update_metadata_for_cooked_meals(meals)
-        if not DRY_RUN:
-            FEEDBACK_CURRENT_FILE.write_text(json.dumps({"entries": []}, indent=2))
-
-        session["state"] = "awaiting_schedule"
-        _save_session(session)
-        return (
-            "Any schedule changes this week? Busy nights, games, nights out? "
-            "Reply 'no changes' if all good."
-        )
-
-    # Append feedback to the best-matching meal
     meals = session.get("last_week_meals", [])
-    matched = False
-    for meal in meals:
-        words = [w for w in meal["name"].lower().split() if len(w) > 3]
-        if words and any(w in lowered for w in words):
-            existing = meal.get("sms_feedback") or ""
-            meal["sms_feedback"] = (existing + " " + text).strip()
-            matched = True
-            break
+    queue = session.get("feedback_queue", [])
 
-    if not matched and meals:
-        existing = meals[-1].get("sms_feedback") or ""
-        meals[-1]["sms_feedback"] = (existing + " " + text).strip()
+    # Record reply against the current (first in queue) meal
+    if queue:
+        current_name = queue[0]
+        for meal in meals:
+            if meal["name"] == current_name:
+                meal["sms_feedback"] = text.strip()
+                break
+        queue = queue[1:]
 
     session["last_week_meals"] = meals
+    session["feedback_queue"] = queue
     _save_session(session)
 
-    meal_list = _format_meal_list(meals)
-    return f"Got it. Updated:\n{meal_list}\n\nAnything else? Reply 'done' when finished."
+    if queue:
+        return f"How did {queue[0]} go?"
+
+    # All done — write metadata updates, clear feedback file, advance to schedule
+    _update_metadata_for_cooked_meals(meals)
+    if not DRY_RUN:
+        FEEDBACK_CURRENT_FILE.write_text(json.dumps({"entries": []}, indent=2))
+
+    session["state"] = "awaiting_schedule"
+    _save_session(session)
+    return "Any schedule changes this week?"
 
 
 def _handle_schedule(text: str, session: dict, config: dict) -> str:
@@ -925,6 +905,15 @@ def _handle_cuisine(text: str, session: dict, config: dict) -> str:
     session["selected_meals"] = selected
     session["state"] = "awaiting_meal_approval"
     _save_session(session)
+
+    # Hand off to bridge: write selected meals into MenuBuilder's activity file
+    call_menubuilder_tool(
+        "advance_to_meal_approval",
+        selected_meals=selected,
+        quick_days=quick_days,
+        schedule_notes=session.get("schedule_notes", []),
+        cuisine_direction=session.get("cuisine_direction", ""),
+    )
 
     week_start = date.fromisoformat(session["week_start"])
     return _format_numbered_list(selected, week_start, quick_days)
@@ -1055,29 +1044,35 @@ def _handle_idea_content(text: str, session: dict, config: dict) -> str:
 # ── Main dispatch ─────────────────────────────────────────────────────────────
 
 def dispatch(text: str, session: dict, config: dict) -> str:
-    """Route to the correct MenuBuilder tool based on current workflow state."""
-    # State is source-of-truth from MenuBuilder, not the local session file
+    """Route to correct handler based on current workflow state.
+
+    Local phase (awaiting_meal_logging / awaiting_schedule / awaiting_cuisine):
+      reads from local menu_session.json and calls the standalone handlers.
+    Bridge phase (awaiting_meal_approval onward):
+      reads state from MenuBuilder via MCP bridge.
+    """
+    # Hold — leave state as-is, user picks up on Mac
+    if any(p in text.lower() for p in ("hold", "pause", "not now", "later", "stop for now")):
+        return "Got it — pick it up on your Mac whenever you're ready."
+
+    # --- Local phase ---
+    local_state = session.get("state", "idle")
+
+    if local_state == "awaiting_meal_logging":
+        return _handle_meal_logging(text, session, config)
+
+    if local_state == "awaiting_schedule":
+        return _handle_schedule(text, session, config)
+
+    if local_state == "awaiting_cuisine":
+        return _handle_cuisine(text, session, config)
+
+    # --- Bridge phase ---
     state_result = call_menubuilder_tool("get_workflow_state")
     state = state_result.get("state", "idle")
 
     if state in ("idle", "complete", None):
         return ""
-
-    if state == "awaiting_meal_logging":
-        result = call_menubuilder_tool("log_meal_feedback", feedback=text)
-        _sync_session_state(result.get("state", state))
-        if result.get("state") == "awaiting_suggestions":
-            return "What are you feeling this week? Mediterranean / Asian / Mexican / surprise me?"
-        meals = result.get("last_week_meals", [])
-        meal_list = _format_meal_list(meals)
-        return f"Got it. Updated:\n{meal_list}\n\nAnything else? Reply 'done' when finished."
-
-    if state == "awaiting_suggestions":
-        result = call_menubuilder_tool("get_meal_suggestions", cuisine_direction=text, constraints="")
-        _sync_session_state(result.get("state", state))
-        selected = result.get("selected_meals", {})
-        week_start = date.fromisoformat(result.get("week_start", date.today().isoformat()))
-        return _format_numbered_list(selected, week_start)
 
     if state == "awaiting_meal_approval":
         lowered = text.lower().strip()
@@ -1096,7 +1091,7 @@ def dispatch(text: str, session: dict, config: dict) -> str:
                 return _format_numbered_list(selected, week_start)
             return (
                 "Say 'looks good' to approve, or tell me what to change — "
-                "e.g. 'swap 3 to pasta', 'change tuesday to tacos', or 'we've had X too much'.\n\n"
+                "e.g. 'swap Wed to pasta' or 'change tuesday to tacos'.\n\n"
                 + _format_numbered_list(state_result.get("selected_meals", {}), date.today())
             )
 
@@ -1121,5 +1116,5 @@ def dispatch(text: str, session: dict, config: dict) -> str:
         _sync_session_state("complete")
         return "Plan ready!"
 
-    log.warning(f"Unknown menu workflow state from MenuBuilder: {state}")
+    log.warning(f"Unknown menu workflow state: local={local_state} bridge={state}")
     return ""

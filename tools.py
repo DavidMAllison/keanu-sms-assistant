@@ -63,7 +63,7 @@ _BASE = Path(__file__).parent
 GAPS_FILE = _BASE / "capability_gaps.json"
 OUTBOX_FILE = _BASE / ".outbox.json"
 PENDING_FRIEND_FILE = _BASE / ".pending_friend_requests.json"
-INVENTORY_FILE = Path("/Users/Shared/cooking/inventory.md")
+INVENTORY_FILE = Path("/Users/Shared/cooking/inventory.json")
 
 
 def send_imessage(handle: str, text: str):
@@ -295,6 +295,24 @@ _DEFS = {
             "required": ["item", "section"],
         },
     },
+    "check_inventory": {
+        "name": "check_inventory",
+        "description": (
+            "Check whether a specific ingredient, protein, or food item is in the family's inventory. "
+            "Use when someone asks 'do we have X?', 'is there any Y?', 'what chicken do we have?', etc. "
+            "Returns matching items with quantities, or a clear 'not in stock' answer."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The ingredient or item to look up, e.g. 'chicken', 'pasta', 'heavy cream'",
+                },
+            },
+            "required": ["query"],
+        },
+    },
     "log_capability_gap": {
         "name": "log_capability_gap",
         "description": (
@@ -394,7 +412,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
         return [_DEFS["get_meal_plan"], _DEFS["get_schedule"], _DEFS["check_friend_dinner"]]
     names = ["get_meal_plan", "get_recipe", "get_schedule", "add_schedule_event",
              "log_feedback", "log_preference", "log_capability_gap", "relay_message",
-             "get_prep_guide"]
+             "get_prep_guide", "check_inventory"]
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal"]
     if is_admin:
@@ -557,7 +575,39 @@ def _tool_get_recipe(name: str, handle: str = "") -> str:
     if condiment:
         return condiment
 
-    # Search local collection first, fall back to external search
+    # Try direct file-based match first (no status filter — searches all recipes by file existence)
+    direct_matches = find_all_recipe_matches(name)
+    if direct_matches:
+        # Score by number of query words found in recipe name; surface top scorer unambiguously
+        query_words = [w for w in name.lower().split() if len(w) > 2]
+        def _score(m):
+            rname = m["name"].lower()
+            return sum(1 for w in query_words if w in rname)
+        direct_matches.sort(key=_score, reverse=True)
+        top_score = _score(direct_matches[0])
+        tied = [m for m in direct_matches if _score(m) == top_score]
+
+        if len(tied) > 1:
+            titles = ", ".join(m["name"] for m in tied)
+            return f"Found these in your collection: {titles}. Which one?"
+
+        m = direct_matches[0]
+        try:
+            _mb_cfg = json.loads(
+                Path("/Users/davidallison/projects/personal/MenuBuilder/config.json").read_text()
+            )
+            _base = _mb_cfg.get("github_pages_base_url", "")
+            _url = f"{_base}/{Path(m['filename']).stem}" if _base else ""
+        except Exception:
+            _url = ""
+        if _url:
+            return f"{m['name']}\n{_url}"
+        # No URL available — fall back to recipe text
+        text = extract_recipe_text(RECIPES_DIR / m["filename"])
+        if text:
+            return text
+
+    # Fall back to search_local_collection (includes URLs, active recipes only)
     local_results = _search_local_collection_safe(name)
     if local_results:
         if len(local_results) > 1:
@@ -572,7 +622,7 @@ def _tool_get_recipe(name: str, handle: str = "") -> str:
             if text:
                 hint = "Dropbox link if user wants full recipe" if "dropbox.com" in url else "Full recipe"
                 suffix = f"\n\n[{hint}: {url}]" if url else ""
-                return f"{text}{suffix}\n\n[Found in local collection. Offer to search online for alternatives if wanted.]"
+                return f"{text}{suffix}"
         if url:
             return f"{title}: {url}"
 
@@ -794,36 +844,88 @@ def _tool_add_schedule_event(inputs: dict) -> str:
 
 
 def _tool_update_inventory(item: str, section: str) -> str:
+    """Add an item to inventory.json."""
     try:
-        lines = INVENTORY_FILE.read_text().splitlines()
-        target = None
-        for i, line in enumerate(lines):
-            if section.lower() in line.lstrip("#").strip().lower():
-                target = i
-                break
-        if target is None:
-            return f"Section '{section}' not found in inventory."
-        insert_at = target + 1
-        none_line = None
-        while insert_at < len(lines):
-            l = lines[insert_at]
-            if l.startswith("#") or l.strip() == "---":
-                break
-            if "None currently" in l:
-                none_line = insert_at
-            insert_at += 1
-        if none_line is not None:
-            lines.pop(none_line)
-            insert_at = none_line
-        lines.insert(insert_at, f"- {item}")
-        for i, line in enumerate(lines):
-            if line.startswith("**Last Updated:**"):
-                lines[i] = f"**Last Updated:** {date.today().strftime('%B %-d, %Y')}"
-                break
-        INVENTORY_FILE.write_text("\n".join(lines) + "\n")
-        return f"Added to {section}: {item}"
+        data = json.loads(INVENTORY_FILE.read_text()) if INVENTORY_FILE.exists() else {"last_updated": "", "items": []}
     except Exception as e:
-        return f"Couldn't update inventory: {e}"
+        return f"Couldn't read inventory: {e}"
+
+    # Map section enum values to JSON category names
+    SECTION_TO_CATEGORY = {
+        "Frozen - Chicken": "Proteins",
+        "Frozen - Pork": "Proteins",
+        "Frozen - Beef": "Proteins",
+        "Frozen Meals": "Frozen Meals",
+        "Vegetables/Produce": "Produce",
+        "Pantry Staples": "Pantry",
+        "Dairy": "Dairy",
+        "Other": "Other",
+    }
+    category = SECTION_TO_CATEGORY.get(section, "Other")
+
+    # Parse "6 Costco chicken breast packages" → name + quantity
+    import re
+    m = re.match(r'^(\d+(?:\.\d+)?)\s+(.+)$', item.strip())
+    if m:
+        qty = float(m.group(1))
+        name = m.group(2).strip()
+    else:
+        qty = 1.0
+        name = item.strip()
+
+    # Check if item already exists (case-insensitive)
+    existing = {entry["name"].lower(): entry for entry in data["items"]}
+    key = name.lower()
+    if key in existing:
+        existing[key]["quantity"] = round(existing[key].get("quantity", 0) + qty, 3)
+    else:
+        data["items"].append({
+            "name": name,
+            "quantity": qty,
+            "unit": "ea",
+            "category": category,
+            "subcategory": "",
+            "date_added": date.today().isoformat(),
+        })
+
+    data["last_updated"] = date.today().isoformat()
+    try:
+        INVENTORY_FILE.write_text(json.dumps(data, indent=2))
+        return f"Added to {category}: {item}"
+    except Exception as e:
+        return f"Couldn't save inventory: {e}"
+
+
+def _tool_check_inventory(query: str) -> str:
+    """Search inventory.json for items matching the query."""
+    try:
+        data = json.loads(INVENTORY_FILE.read_text()) if INVENTORY_FILE.exists() else {"items": []}
+    except Exception as e:
+        return f"Couldn't read inventory: {e}"
+
+    items = [i for i in data.get("items", []) if i.get("quantity", 0) > 0]
+    if not items:
+        return "Inventory is empty."
+
+    query_lower = query.lower().strip()
+    query_words = [w for w in query_lower.split() if len(w) > 2]
+
+    matches = []
+    for item in items:
+        name = item.get("name", "").lower()
+        # Match if any query word appears in the item name
+        if query_lower in name or any(w in name for w in query_words):
+            qty = item.get("quantity", 0)
+            unit = item.get("unit", "")
+            qty_int = int(qty) if qty == int(qty) else qty
+            qty_str = f"{qty_int} {unit}".strip() if unit not in ("ea", "") else str(qty_int)
+            matches.append(f"{item['name']} ({qty_str})")
+
+    if not matches:
+        return f"No {query} in the inventory."
+    if len(matches) == 1:
+        return f"Yes — {matches[0]}."
+    return "Yes:\n" + "\n".join(f"- {m}" for m in matches)
 
 
 def _notify_parents_individual(kid_handle: str, kid_name: str, meal: str, food_ok, food_reason: str, day_label: str, config: dict) -> None:
@@ -1041,6 +1143,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
                                    inputs.get("incoming_content"))
         if name == "get_prep_guide":
             return _tool_get_prep_guide()
+        if name == "check_inventory":
+            return _tool_check_inventory(inputs["query"])
         return f"Unknown tool: {name}"
     except Exception as e:
         log.error(f"Tool error ({name}): {e}")
