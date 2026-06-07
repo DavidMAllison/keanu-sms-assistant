@@ -14,6 +14,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Proactive messages** — holiday morning messages, trash reminders, game-day good-luck texts
 - **Relay** — admin can ask Keanu to forward a message to another family member
 - **Grocery receipts** — send a photo of a receipt and Keanu parses it into the shopping inventory
+- **Recipe ideas from photos** — caption a recipe photo with "save this as an idea" and Keanu drops the raw image into the recipe ideas inbox for later review
 - **Image vision** — reads images sent via iMessage (HEIC auto-converted to JPEG)
 - **Sunday menu trigger** — launchd job fires at 9 AM Sunday to kick off the weekly menu workflow automatically
 
