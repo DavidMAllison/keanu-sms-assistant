@@ -27,6 +27,7 @@ from agent import get_reply
 from agents import menu_workflow
 from groceryagent_bridge import call_receipt_parser
 from tools import send_imessage, send_imessage_group, drain_outbox
+from agents.menu_agent import save_recipe_idea as _save_recipe_idea_fn, IDEAS_DIR as _RECIPE_IDEAS_DIR
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -249,6 +250,43 @@ def _is_grocery_receipt_caption(text: str) -> bool:
     return any(kw in lowered for kw in _GROCERY_CAPTION_KEYWORDS)
 
 
+def _is_recipe_idea_caption(text: str) -> bool:
+    """Return True if the message caption indicates the user wants to save a recipe idea."""
+    lowered = text.lower()
+    return any(kw in lowered for kw in _RECIPE_IDEA_CAPTION_KEYWORDS)
+
+
+def _run_recipe_idea_from_image(image_path: str, mime_type: str, handle: str) -> str:
+    """Copy the raw image file into the recipe ideas inbox for MenuBuilder to process.
+
+    Does not extract the recipe name — MenuBuilder reads images directly.
+    Cleans up the temp file in all cases via finally.
+    """
+    _MIME_TO_EXT = {
+        "image/jpeg": ".jpg",
+        "image/png":  ".png",
+        "image/gif":  ".gif",
+        "image/webp": ".webp",
+    }
+    try:
+        _RECIPE_IDEAS_DIR.mkdir(exist_ok=True)
+        ext = _MIME_TO_EXT.get(mime_type, ".jpg")
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        dest = _RECIPE_IDEAS_DIR / f"{timestamp}_recipe{ext}"
+        shutil.copy2(image_path, dest)
+        log.info(f"Saved recipe idea image from {handle} to {dest}")
+        return "Saved the recipe photo to ideas — just ask me to review your ideas when you're ready!"
+    except Exception as e:
+        log.error(f"Recipe idea image save error for {handle}: {e}", exc_info=True)
+        return "Something went wrong on my end — try sending it again?"
+    finally:
+        try:
+            Path(image_path).unlink(missing_ok=True)
+            log.info(f"Cleaned up temp recipe idea image: {image_path}")
+        except Exception as e:
+            log.warning(f"Could not delete temp recipe idea file {image_path}: {e}")
+
+
 def _vision_is_receipt(image_path: str, mime_type: str) -> bool:
     """Ask Claude Haiku whether the image is a grocery receipt. Returns True/False."""
     try:
@@ -278,16 +316,19 @@ def _vision_is_receipt(image_path: str, mime_type: str) -> bool:
         return False
 
 
-def route_image_message(attachments: list, text: str, handle: str):
-    """Route an inbound image through grocery detection or general vision.
+def route_image_message(attachments: list, text: str, handle: str,
+                        idea_submitters: Optional[list] = None):
+    """Route an inbound image through recipe-idea, grocery, or general vision handling.
 
-    - Path A (caption keyword): parse immediately, no confirmation.
+    - Path 0 (recipe idea caption + authorised handle): extract name via Vision, save idea.
+    - Path A (grocery caption keyword): parse receipt immediately, no confirmation.
     - Path B (no keyword):
         - If Haiku thinks it's a receipt: ask user to confirm, set pending state.
         - Otherwise: fall through to general vision handler and return a reply string.
 
     Returns a reply string only for the general-vision fallback (Path B, not-a-receipt).
-    For Path A and receipt-confirmation paths, replies are sent directly and None is returned.
+    For Path 0, A, and receipt-confirmation paths, replies are sent directly and None is returned.
+    idea_submitters: if provided, only handles in this list may trigger Path 0.
     """
     if not attachments:
         return "Sorry, I couldn't read that image — try resending?"
@@ -299,6 +340,16 @@ def route_image_message(attachments: list, text: str, handle: str):
 
     file_path, mime_type = prepared
     image_path = str(file_path)
+
+    # Path 0 — caption indicates a recipe idea save request
+    if _is_recipe_idea_caption(text):
+        if idea_submitters is not None and handle not in idea_submitters:
+            log.info(f"Path 0: recipe idea caption from non-submitter {handle}, falling through")
+        else:
+            log.info(f"Path 0: recipe idea caption from {handle}, extracting recipe name via Vision")
+            reply = _run_recipe_idea_from_image(image_path, mime_type, handle)
+            send_imessage(handle, reply)
+            return None
 
     # Path A — caption explicitly mentions a grocery store or receipt
     if _is_grocery_receipt_caption(text):
@@ -452,6 +503,12 @@ _pending_receipt: dict = {}
 
 _GROCERY_CAPTION_KEYWORDS = (
     "receipt", "grocery", "kroger", "costco", "trader joe", "aldi", "whole foods",
+)
+
+_RECIPE_IDEA_CAPTION_KEYWORDS = (
+    "save this as an idea", "save as an idea", "recipe idea", "add this as an idea",
+    "add as an idea", "save this recipe", "we should make this", "add to ideas",
+    "save as idea", "save as a recipe",
 )
 
 # ── 20 Questions ───────────────────────────────────────────────────────────────
@@ -767,7 +824,9 @@ def main():
                 # Image messages — route via grocery detection or general vision
                 if has_image:
                     log.info(f"Routing image from {handle} to image router")
-                    reply = route_image_message(attachments, text, handle)
+                    _idea_submitters = config["security"].get("idea_submitters", [])
+                    reply = route_image_message(attachments, text, handle,
+                                               idea_submitters=_idea_submitters)
                     if reply:
                         send_imessage(handle, reply)
                     continue
