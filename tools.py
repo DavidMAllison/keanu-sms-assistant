@@ -363,15 +363,23 @@ _DEFS = {
     "get_prep_guide": {
         "name": "get_prep_guide",
         "description": (
-            "Returns the authoritative Sunday batch prep list for this week — "
-            "tasks, timings, and order pulled directly from the current meal plan. "
-            "Call this whenever the user asks what they can prep ahead, what the Sunday prep is, "
-            "what to batch cook, or any variation of those questions. "
-            "Do not generate prep advice from recipe files or your own reasoning — always use this tool."
+            "Returns a prep guide for the current week's meal plan. "
+            "Use mode='weekly' when the user asks what they can prep for the week, "
+            "prep for Sunday, or prep for the rest of the week. "
+            "Use mode='tonight' when the user asks what to prep for tonight's dinner. "
+            "Omit mode (or pass 'auto') when intent is unclear — Sunday defaults to weekly, "
+            "weekdays default to tonight. "
+            "Never generate prep advice from recipe files or your own reasoning — always call this tool."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "weekly", "tonight"],
+                    "description": "Prep scope: 'weekly' = remaining meals this week, 'tonight' = tonight's dinner only, 'auto' = detect from day of week",
+                }
+            },
             "required": [],
         },
     },
@@ -1102,8 +1110,8 @@ def _tool_swap_meal(day: str, outgoing: str, incoming: str,
     return result.get("message", f"Swapped {outgoing} → {incoming} on {day}.")
 
 
-def _tool_get_prep_guide() -> str:
-    result = _call_menubuilder_tool("get_prep_guide")
+def _tool_get_prep_guide(mode: str = "auto") -> str:
+    result = _call_menubuilder_tool("get_prep_guide", {"mode": mode})
     if "error" in result:
         log.error(f"get_prep_guide bridge error: {result['error']}")
         return "Sorry, couldn't fetch the prep guide right now."
@@ -1142,7 +1150,7 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_swap_meal(inputs["day"], inputs["outgoing"], inputs["incoming"],
                                    inputs.get("incoming_content"))
         if name == "get_prep_guide":
-            return _tool_get_prep_guide()
+            return _tool_get_prep_guide(inputs.get("mode", "auto"))
         if name == "check_inventory":
             return _tool_check_inventory(inputs["query"])
         return f"Unknown tool: {name}"
