@@ -701,31 +701,56 @@ STARTUP_GRACE_SECONDS = 120
 
 class _SendHandler(BaseHTTPRequestHandler):
     def do_POST(self):
-        if self.path != "/send":
-            self.send_response(404)
-            self.end_headers()
-            return
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        try:
-            payload = json.loads(body)
-            handle = payload["handle"]
-            text = payload["text"]
-        except (json.JSONDecodeError, KeyError):
-            self.send_response(400)
+        if self.path == "/send":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body)
+                handle = payload["handle"]
+                text = payload["text"]
+            except (json.JSONDecodeError, KeyError):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "missing handle or text"}')
+                return
+            with _outbox_lock:
+                outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
+                outbox.append({"handle": handle, "text": text})
+                OUTBOX_FILE.write_text(json.dumps(outbox))
+            log.info(f"API /send: queued message to {handle}")
+            self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"error": "missing handle or text"}')
-            return
-        with _outbox_lock:
-            outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-            outbox.append({"handle": handle, "text": text})
-            OUTBOX_FILE.write_text(json.dumps(outbox))
-        log.info(f"API /send: queued message to {handle}")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"ok": true}')
+            self.wfile.write(b'{"ok": true}')
+
+        elif self.path == "/start_menu_workflow":
+            # Triggered by launchd (davidallison user) — runs as allisonbot so file writes succeed.
+            try:
+                cfg = load_config()
+                admin_handle = cfg["security"].get("menu_admin")
+                if not admin_handle:
+                    raise ValueError("no menu_admin in config")
+                reply = menu_workflow.handle_start(cfg)
+                with _outbox_lock:
+                    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
+                    outbox.append({"handle": admin_handle, "text": reply})
+                    OUTBOX_FILE.write_text(json.dumps(outbox))
+                log.info(f"API /start_menu_workflow: queued opening message to {admin_handle}")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+            except Exception as e:
+                log.error(f"API /start_menu_workflow error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, format, *args):  # suppress default HTTP access log
         log.debug("API: " + format % args)
@@ -822,7 +847,24 @@ def main():
                         log.info(f"Pending receipt for {handle} but reply was not yes/no, falling through")
 
                 # Image messages — route via grocery detection or general vision
+                # Exception: if admin is in awaiting_idea_content, pass caption text
+                # to the menu session handler instead of the image router.
                 if has_image:
+                    _skip_image_route = False
+                    menu_admin = config["security"].get("menu_admin")
+                    if handle == menu_admin and MENU_SESSION_FILE.exists():
+                        try:
+                            _ms = json.loads(MENU_SESSION_FILE.read_text())
+                            if _ms.get("state") == "awaiting_idea_content" and text.strip():
+                                log.info(f"Admin in awaiting_idea_content — routing image caption to menu handler")
+                                reply = menu_workflow.menu_agent_reply(text, _ms, config)
+                                if reply:
+                                    send_imessage(handle, reply)
+                                _skip_image_route = True
+                        except Exception as e:
+                            log.error(f"Image/menu state check error: {e}")
+                    if _skip_image_route:
+                        continue
                     log.info(f"Routing image from {handle} to image router")
                     _idea_submitters = config["security"].get("idea_submitters", [])
                     reply = route_image_message(attachments, text, handle,
@@ -872,7 +914,7 @@ def main():
                                 MENU_SESSION_FILE.write_text(json.dumps({"state": "idle"}))
                                 send_imessage(handle, "Menu session cancelled.")
                             else:
-                                reply = menu_workflow.dispatch(text, session, config)
+                                reply = menu_workflow.menu_agent_reply(text, session, config)
                                 if reply:
                                     send_imessage(handle, reply)
                             continue

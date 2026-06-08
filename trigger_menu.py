@@ -2,22 +2,14 @@
 """
 trigger_menu.py — Sunday 9 AM launchd entry point.
 
-Called by com.menubuilder.sundaymenu.plist. Calls handle_start() directly
-and sends the opening message to the admin via Keanu's HTTP API.
-Does not go through the SMS routing layer.
+Called by com.menubuilder.sundaymenu.plist as the davidallison user.
+POSTs to Keanu's HTTP API so all file writes happen inside the allisonbot
+process, which owns the relevant files.
 """
 import json
 import logging
-import sys
 import urllib.request
 import urllib.error
-from pathlib import Path
-
-# Add sms-assistant to path
-sys.path.insert(0, str(Path(__file__).parent))
-
-import yaml
-from agents import menu_workflow
 
 logging.basicConfig(
     filename="/Users/Shared/sms-assistant/trigger_menu.log",
@@ -27,23 +19,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def load_config() -> dict:
-    settings_path = Path("/Users/Shared/sms-assistant/config/settings.yaml")
-    with open(settings_path) as f:
-        return yaml.safe_load(f)
-
-
-def send_via_keanu(handle: str, text: str, port: int = 5050) -> bool:
-    payload = json.dumps({"handle": handle, "text": text}).encode()
+def trigger_via_keanu(port: int = 5050) -> bool:
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/send",
-        data=payload,
+        f"http://127.0.0.1:{port}/start_menu_workflow",
+        data=b"{}",
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            log.info(f"Sent opening message to {handle}, status={resp.status}")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log.info(f"Menu workflow triggered via Keanu API, status={resp.status}")
             return True
     except urllib.error.URLError as e:
         log.error(f"Could not reach Keanu at port {port}: {e}")
@@ -52,21 +37,8 @@ def send_via_keanu(handle: str, text: str, port: int = 5050) -> bool:
 
 def main():
     log.info("Sunday menu trigger fired")
-    try:
-        config = load_config()
-        admin_handle = config["security"].get("menu_admin")
-        if not admin_handle:
-            log.error("No menu_admin in config — aborting")
-            return
-
-        reply = menu_workflow.handle_start(config)
-        log.info(f"handle_start returned: {reply[:80]}")
-
-        if not send_via_keanu(admin_handle, reply):
-            log.error("Failed to send opening message — Keanu may not be running")
-
-    except Exception as e:
-        log.exception(f"Trigger failed: {e}")
+    if not trigger_via_keanu():
+        log.error("Failed to trigger menu workflow — Keanu may not be running")
 
 
 if __name__ == "__main__":

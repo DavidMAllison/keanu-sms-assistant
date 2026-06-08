@@ -77,14 +77,14 @@ launchd's `KeepAlive: true` restarts it automatically after the kill.
 ## Project structure
 
 ```
-server.py                  # Main loop — polls chat.db, routes messages, sends replies; HTTP API on :5050
+server.py                  # Main loop — polls chat.db, routes messages, sends replies; HTTP API on :5050 (/send, /start_menu_workflow)
 agent.py                   # Conversation loop — Claude tool use, per-handle history
 tools.py                   # Tool definitions and implementations
-trigger_menu.py            # Sunday 9 AM launchd entry point — fires handle_start() and sends opening SMS
+trigger_menu.py            # Sunday 9 AM launchd entry point — POSTs to /start_menu_workflow on Keanu's HTTP API
 groceryagent_bridge.py     # Subprocess bridge to GroceryAgent receipt parser
 menubuilder_bridge.py      # Subprocess bridge to MenuBuilder MCP (Python 3.9→3.12)
 agents/
-  menu_workflow.py         # Weekly menu workflow — local phase (feedback/schedule/cuisine) + MenuBuilder MCP bridge
+  menu_workflow.py         # Weekly menu workflow — feedback/schedule/cuisine via agent tool-use; all plan/selection/finalization delegates to MenuBuilder MCP
   menu_agent.py            # Meal plans, recipes, inventory, feedback
 system_prompts/
   menu.txt                 # Keanu's main personality prompt

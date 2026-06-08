@@ -1,12 +1,12 @@
 """
-menu_workflow.py — SMS-triggered weekly menu state machine.
+menu_workflow.py — SMS-triggered weekly menu workflow, agent-driven.
 
 State lives in /Users/Shared/cooking/menu_session.json.
-Each SMS from the admin advances one state.
+"start menu" from admin triggers handle_start(). Subsequent messages
+from admin route to menu_agent_reply(), which uses Claude Sonnet with
+tool use to drive the conversation naturally.
 """
 
-import csv
-import io
 import json
 import logging
 import os
@@ -18,12 +18,8 @@ from pathlib import Path
 from typing import Optional
 
 from agents.menu_agent import (
-    COOKING_BASE,
     FEEDBACK_CURRENT_FILE,
-    IDEAS_DIR,
     METADATA_FILE,
-    RECIPES_DIR,
-    WEEKLYPLAN_DIR,
 )
 
 log = logging.getLogger(__name__)
@@ -42,6 +38,8 @@ DAY_NAME_MAP = {
     "mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu",
     "fri": "Fri", "sat": "Sat", "sun": "Sun",
 }
+
+_MENU_SYSTEM = (Path(__file__).parent.parent / "system_prompts/menu.txt").read_text()
 
 
 # ── Session I/O ───────────────────────────────────────────────────────────────
@@ -89,63 +87,6 @@ def _send_outbox(handle: str, text: str):
     OUTBOX_FILE.write_text(json.dumps(outbox))
 
 
-# ── Last-week plan parsing ────────────────────────────────────────────────────
-
-_PLAN_LINE_RE = re.compile(
-    r"^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+\d+/\d+\s+(.+?)\s*(?:\[|$)"
-)
-
-
-def _parse_last_plan() -> list:
-    """Return [{name, day, sms_feedback}] from the most recent mealplan file."""
-    if not WEEKLYPLAN_DIR.exists():
-        return []
-
-    today = date.today()
-    dated = []
-    for f in WEEKLYPLAN_DIR.glob("mealplan_*.txt"):
-        try:
-            d = date.fromisoformat(f.stem.replace("mealplan_", ""))
-            dated.append((d, f))
-        except ValueError:
-            continue
-
-    dated.sort(key=lambda x: x[0], reverse=True)
-    plan_file = next((f for d, f in dated if d <= today), None)
-    if not plan_file:
-        return []
-
-    meals = []
-    for line in plan_file.read_text().splitlines():
-        m = _PLAN_LINE_RE.match(line.strip())
-        if m:
-            meals.append({"name": m.group(2).strip(), "day": m.group(1), "sms_feedback": None})
-    return meals
-
-
-def _merge_feedback_into_meals(meals: list) -> list:
-    """Overlay feedback_current.json entries onto matching meals."""
-    if not FEEDBACK_CURRENT_FILE.exists():
-        return meals
-    try:
-        data = json.loads(FEEDBACK_CURRENT_FILE.read_text())
-        for entry in data.get("entries", []):
-            recipe = entry.get("recipe", "")
-            note = entry.get("note", "")
-            sentiment = entry.get("sentiment", "")
-            if not recipe or not note:
-                continue
-            recipe_lower = recipe.lower()
-            for meal in meals:
-                if recipe_lower in meal["name"].lower() or meal["name"].lower() in recipe_lower:
-                    if not meal["sms_feedback"]:
-                        meal["sms_feedback"] = f"{sentiment}: {note}" if sentiment else note
-                    break
-    except Exception as e:
-        log.warning(f"Could not merge feedback: {e}")
-    return meals
-
-
 def _format_meal_list(meals: list) -> str:
     lines = []
     for m in meals:
@@ -165,19 +106,6 @@ def _load_metadata() -> dict:
         return {}
 
 
-def _save_metadata(recipes: dict):
-    if DRY_RUN:
-        log.info("[DRY_RUN] Would save metadata updates.")
-        return
-    try:
-        raw = json.loads(METADATA_FILE.read_text()) if METADATA_FILE.exists() else {}
-        raw["recipes"] = recipes
-        raw["last_updated"] = date.today().isoformat()
-        METADATA_FILE.write_text(json.dumps(raw, indent=2))
-    except Exception as e:
-        log.error(f"Could not save metadata: {e}")
-
-
 def _find_recipe_key(name: str, recipes: dict) -> Optional[str]:
     """Return the best-matching key in recipes dict, or None."""
     name_lower = name.lower()
@@ -189,20 +117,6 @@ def _find_recipe_key(name: str, recipes: dict) -> Optional[str]:
         if len(words) >= 2 and sum(1 for w in words if w in name_lower) >= 2:
             return key
     return None
-
-
-def _update_metadata_for_cooked_meals(meals: list):
-    recipes = _load_metadata()
-    today_str = date.today().isoformat()
-    for meal in meals:
-        key = _find_recipe_key(meal["name"], recipes)
-        if not key:
-            log.warning(f"Could not find '{meal['name']}' in metadata")
-            continue
-        recipes[key]["times_cooked"] = recipes[key].get("times_cooked", 0) + 1
-        recipes[key]["last_cooked_date"] = today_str
-        log.info(f"Updated '{key}': times_cooked={recipes[key]['times_cooked']}")
-    _save_metadata(recipes)
 
 
 # ── Meal suggestion / selection ───────────────────────────────────────────────
@@ -293,6 +207,16 @@ def _get_protein(name: str) -> str:
     return "Other"
 
 
+def _parse_minutes(time_str: str) -> int:
+    """Parse a time string like '30 min' or '1 hr 15 min' into total minutes. Returns 0 if unparseable."""
+    import re
+    if not time_str:
+        return 0
+    hours = sum(int(m) for m in re.findall(r'(\d+)\s*hr', time_str))
+    mins  = sum(int(m) for m in re.findall(r'(\d+)\s*min', time_str))
+    return hours * 60 + mins
+
+
 def _select_meals(candidates: list, quick_days: list, cuisine_direction: Optional[str], metadata: dict) -> dict:
     """
     Select up to 7 meals for Sun–Sat.
@@ -303,22 +227,25 @@ def _select_meals(candidates: list, quick_days: list, cuisine_direction: Optiona
     if cuisine_direction and cuisine_direction.lower() not in ("what we've got", ""):
         c_lower = cuisine_direction.lower()
         for name, meta in metadata.items():
-            if meta.get("status") == "idea" and c_lower in meta.get("cuisine", "").lower():
+            idea_cuisine = meta.get("cuisine_type", meta.get("cuisine", ""))
+            if meta.get("status") == "idea" and idea_cuisine.lower() in c_lower:
+                idea_minutes = _parse_minutes(meta.get("time", ""))
                 extra.append({
                     "name": name,
-                    "cuisine": meta.get("cuisine", ""),
-                    "health": meta.get("health", "Moderate"),
-                    "minutes": 30,
+                    "cuisine": idea_cuisine,
+                    "health": meta.get("health_classification", meta.get("health", "Moderate")),
+                    "minutes": idea_minutes if idea_minutes else 30,
                     "time_str": meta.get("time", "30 min"),
-                    "is_quick": True,
-                    "meal_type": "Weeknight",
+                    "is_quick": idea_minutes <= 35 if idea_minutes else True,
+                    "meal_type": meta.get("meal_type", "Weeknight"),
                 })
 
     # Prefer cuisine direction at front of pool
     pool = list(candidates) + extra
     if cuisine_direction and cuisine_direction.lower() not in ("what we've got", ""):
         c_lower = cuisine_direction.lower()
-        pool.sort(key=lambda c: 0 if c_lower in c.get("cuisine", "").lower() else 1)
+        pool.sort(key=lambda c: 0 if c.get("cuisine", "").lower() in c_lower else 1)
+
 
     # Deduplicate by name
     seen = set()
@@ -332,10 +259,11 @@ def _select_meals(candidates: list, quick_days: list, cuisine_direction: Optiona
     selected = {}
     used_proteins = set()
     heart_healthy_count = 0
+    indulgent_count = 0
     quick_set = {d.lower() for d in quick_days}
 
     def pick_for(days_subset, require_quick=False, require_weekend=False):
-        nonlocal heart_healthy_count
+        nonlocal heart_healthy_count, indulgent_count
         for day in days_subset:
             if day in selected:
                 continue
@@ -347,6 +275,9 @@ def _select_meals(candidates: list, quick_days: list, cuisine_direction: Optiona
                     continue
                 if require_weekend and c["meal_type"] != "Weekend":
                     continue
+                # Cap indulgent meals at 1 per week
+                if c["health"] == "Indulgent" and indulgent_count >= 1:
+                    continue
                 # Soft protein dedup — only enforce if we have room to be picky
                 protein = _get_protein(c["name"])
                 if protein in used_proteins and len(pool) > len(days_subset) * 2:
@@ -355,27 +286,58 @@ def _select_meals(candidates: list, quick_days: list, cuisine_direction: Optiona
                 used_proteins.add(protein)
                 if c["health"] == "Heart-Healthy":
                     heart_healthy_count += 1
+                if c["health"] == "Indulgent":
+                    indulgent_count += 1
                 break
 
     # 1. Weekend slots from weekend candidates
     pick_for(["Sat", "Sun"], require_weekend=True)
 
-    # 2. Quick nights
+    # 2. Explicitly quick nights (user-specified)
     quick_abbrevs = [a for a in DAYS_ORDER if a.lower() in quick_set or a[:3].lower() in quick_set]
     pick_for(quick_abbrevs, require_quick=True)
 
-    # 3. Fill remaining with any candidate
-    pick_for(DAYS_ORDER)
+    # 3. Fill weeknights with quick meals, weekends with anything
+    weeknights = [d for d in DAYS_ORDER if d not in ("Sat", "Sun")]
+    weekends = [d for d in DAYS_ORDER if d in ("Sat", "Sun")]
+    pick_for(weeknights, require_quick=True)
+    pick_for(weekends)
 
-    # 4. Fill any still-empty slots with leftovers (no constraints)
-    leftovers = [c for c in pool if c["name"] not in selected.values()]
-    for day in DAYS_ORDER:
-        if day not in selected and leftovers:
-            c = leftovers.pop(0)
-            selected[day] = c["name"]
+    # 4. Safety fallback — fill any still-empty slots with no constraints
+    pick_for(DAYS_ORDER)
 
     return selected
 
+
+def _format_numbered_list(selected: dict, week_start: date, quick_days: Optional[list] = None) -> str:
+    """Format selected meals as compact Sun-Sat list for SMS approval."""
+    ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
+    lines = [f"{day}: {name}" for day, name in ordered]
+    return "\n".join(lines)
+
+
+# ── handle_finalize ───────────────────────────────────────────────────────────
+
+def handle_finalize(session: dict, config: dict):
+    """Delegates fully to MenuBuilder's finalize_plan MCP tool."""
+    result = call_menubuilder_tool("finalize_plan")
+    admin_handle = config["security"].get("menu_admin")
+    if result.get("state") == "complete":
+        if admin_handle:
+            _send_outbox(admin_handle, "Plan ready — apps launched.")
+            prep = result.get("prep_guide", "")
+            if prep:
+                _send_outbox(admin_handle, prep)
+        session["state"] = "complete"
+        _save_session(session)
+        log.info("Menu workflow complete.")
+    else:
+        log.error(f"finalize_plan returned unexpected result: {result}")
+        if admin_handle:
+            _send_outbox(admin_handle, f"Finalization failed: {result.get('error', 'unknown')}")
+
+
+# ── Week helpers ──────────────────────────────────────────────────────────────
 
 def _get_week_start() -> date:
     """Return next Monday (or this Monday if today is Monday)."""
@@ -386,604 +348,66 @@ def _get_week_start() -> date:
     return today + timedelta(days=days_ahead)
 
 
-def _day_date_map(week_start: date) -> dict:
-    """Map day abbreviation → date for a week starting on Monday."""
-    m = {}
-    m["Sun"] = week_start - timedelta(days=1)
-    for i, day in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]):
-        m[day] = week_start + timedelta(days=i)
-    return m
-
-
-def _format_numbered_list(selected: dict, week_start: date, quick_days: Optional[list] = None) -> str:
-    """Format selected meals as compact Sun-Sat list for SMS approval."""
-    ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
-    lines = [f"{day}: {name}" for day, name in ordered]
-    return "\n".join(lines)
-
-
-def _parse_swap(text: str, selected: dict, week_start: date) -> Optional[dict]:
-    """
-    Parse a swap instruction like 'swap 3 to pasta' or 'change tuesday to tacos'.
-    Returns updated selected dict or None.
-    """
-    lowered = text.lower()
-    ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
-
-    # Numbered swap: "swap 3 to X" / "change 2 with Y"
-    num_m = re.search(r'(?:swap|change|replace)\s+(\d+)\s+(?:to|with|for)\s+(.+)', lowered)
-    if num_m:
-        idx = int(num_m.group(1)) - 1
-        new_name = num_m.group(2).strip().rstrip(".").title()
-        if 0 <= idx < len(ordered):
-            day = ordered[idx][0]
-            new_selected = dict(selected)
-            new_selected[day] = new_name
-            return new_selected
-
-    # Day-named swap: "change tuesday to X"
-    for day_name, abbrev in DAY_NAME_MAP.items():
-        if day_name in lowered and abbrev in selected:
-            day_m = re.search(rf'{re.escape(day_name)}\s+(?:to|with|for)\s+(.+)', lowered)
-            if day_m:
-                new_name = day_m.group(1).strip().rstrip(".").title()
-                new_selected = dict(selected)
-                new_selected[abbrev] = new_name
-                return new_selected
-
-    return None
-
-
-def _claude_swap(
-    text: str,
-    selected: dict,
-    cuisine_direction: Optional[str],
-    metadata: dict,
-) -> Optional[dict]:
-    """
-    Fall back to Claude (Haiku) when _parse_swap can't read a structured command.
-    Interprets natural language feedback, identifies which meals to replace, and
-    picks replacements from active metadata (preferring uncooked + cuisine match).
-    Returns updated selected dict, or None if no changes can be determined.
-    """
-    import anthropic as _anthropic
-
-    ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
-    meal_list = "\n".join(
-        f"{i + 1}. {day}: {name}" for i, (day, name) in enumerate(ordered)
-    )
-
-    already_selected = set(selected.values())
-    direction_lower = (cuisine_direction or "").lower()
-
-    # Build replacement pool: active, not in use, sorted by least-cooked then cuisine match
-    candidates = [
-        (name, meta)
-        for name, meta in metadata.items()
-        if meta.get("status") == "active" and name not in already_selected
-    ]
-
-    def _score(item: tuple) -> tuple:
-        name, meta = item
-        times = meta.get("times_cooked", 0)
-        cuisine_bonus = -1 if direction_lower and direction_lower in meta.get("cuisine", "").lower() else 0
-        return (times, cuisine_bonus)
-
-    candidates.sort(key=_score)
-    candidate_names = [name for name, _ in candidates[:60]]
-
-    try:
-        client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "A user is reviewing a weekly dinner plan and giving natural language feedback.\n\n"
-                    f"Current plan:\n{meal_list}\n\n"
-                    f"User feedback: \"{text}\"\n\n"
-                    f"Available replacements (in preference order): {json.dumps(candidate_names)}\n\n"
-                    "Identify which meals the user wants replaced (by day abbreviation like Mon/Tue/Wed) "
-                    "and choose the best replacement from the available list. "
-                    "Return JSON array only, no explanation:\n"
-                    '[{"day": "Mon", "to": "Replacement Meal Name"}, ...]\n\n'
-                    "If the feedback doesn't clearly request any changes, return []."
-                ),
-            }],
-        )
-        raw = resp.content[0].text.strip()
-        # Strip markdown fences if model wraps output
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-
-        swaps = json.loads(raw)
-        if not isinstance(swaps, list) or not swaps:
-            return None
-
-        new_selected = dict(selected)
-        changed = False
-        for swap in swaps:
-            day = (swap.get("day") or "").strip()
-            to_meal = (swap.get("to") or "").strip()
-            if day and to_meal and day in new_selected:
-                new_selected[day] = to_meal
-                changed = True
-
-        return new_selected if changed else None
-
-    except Exception as e:
-        log.error(f"Claude natural-language swap error: {e}")
-        return None
-
-
-# ── Plan generation ───────────────────────────────────────────────────────────
-
-def _build_plan_text(selected: dict, week_start: date, schedule_notes: list, config: dict) -> str:
-    """Generate the mealplan_*.txt content via Claude (REMINDERS section)."""
-    import anthropic as _anthropic
-
-    try:
-        mb_config = json.loads((MENUBUILDER_DIR / "config.json").read_text())
-        base_url = mb_config.get("github_pages_base_url", "")
-    except Exception:
-        base_url = ""
-
-    metadata = _load_metadata()
-    day_to_date = _day_date_map(week_start)
-    ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
-
-    # Build per-meal info
-    meals_info = []
-    for day, name in ordered:
-        key = _find_recipe_key(name, metadata)
-        meta = metadata.get(key, {}) if key else {}
-        health = meta.get("health", "Moderate")
-        time_str = meta.get("time", "?")
-        filename = meta.get("filename", "")
-
-        if base_url and filename:
-            stem = Path(filename).stem
-            url = f"{base_url}/{stem}"
-        else:
-            url = ""
-
-        dt = day_to_date.get(day)
-        date_str = dt.strftime("%-m/%-d") if dt else ""
-        meals_info.append({
-            "day": day, "date": date_str, "name": name,
-            "health": health, "time": time_str, "url": url,
-        })
-
-    # Week header range
-    week_end = week_start + timedelta(days=5)
-    week_start_display = (week_start - timedelta(days=1)).strftime("%B %d")
-    week_end_display = week_end.strftime("%B %d, %Y")
-
-    # DINNERS block
-    dinners_lines = []
-    for m in meals_info:
-        dinners_lines.append(f"{m['day']} {m['date']}  {m['name']} [{m['health']}] | {m['time']}")
-        if m["url"]:
-            dinners_lines.append(f"          {m['url']}")
-    dinners_text = "\n".join(dinners_lines)
-
-    # BALANCE line
-    health_counts: dict = {}
-    for m in meals_info:
-        h = m["health"]
-        health_counts[h] = health_counts.get(h, 0) + 1
-    balance_parts = [f"{v} {k}" for k, v in sorted(health_counts.items())]
-    balance_line = "BALANCE: " + ", ".join(balance_parts)
-
-    # Ask Claude to generate REMINDERS
-    schedule_context = "\n".join(schedule_notes) if schedule_notes else "No special schedule notes."
-    meal_lines = "\n".join(
-        f"{m['day']} {m['date']}: {m['name']} ({m['health']}, {m['time']})"
-        for m in meals_info
-    )
-
-    reminder_prompt = (
-        f"Generate the REMINDERS section for this weekly meal plan.\n\n"
-        f"Week: {week_start_display} - {week_end_display}\n"
-        f"Schedule notes: {schedule_context}\n\n"
-        f"Meals:\n{meal_lines}\n\n"
-        "Format: One line per day that has a meal, like:\n"
-        "- MON: one-line timing/prep note\n\n"
-        "Rules:\n"
-        "- Only include days that have meals\n"
-        "- Include suggested start times for weeknight meals over 30 min\n"
-        "- Note schedule constraints from the schedule notes\n"
-        "- Note special prep (marinating, chilling, slow cooker setup)\n"
-        "- One line per day — these populate calendar events\n\n"
-        "Return ONLY the reminder lines, no header."
-    )
-
-    try:
-        client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=500,
-            messages=[{"role": "user", "content": reminder_prompt}],
-        )
-        reminders = response.content[0].text.strip()
-    except Exception as e:
-        log.error(f"Claude reminders generation error: {e}")
-        reminders = "\n".join(f"- {m['day'].upper()}: {m['name']}" for m in meals_info)
-
-    return (
-        f"WEEKLY MEAL PLAN: {week_start_display} - {week_end_display}\n\n"
-        f"========================================\n"
-        f"DINNERS\n"
-        f"========================================\n\n"
-        f"{dinners_text}\n\n"
-        f"{balance_line}\n\n"
-        f"========================================\n"
-        f"REMINDERS\n"
-        f"========================================\n"
-        f"{reminders}"
-    )
-
-
-def _build_shopping_csv(selected: dict) -> str:
-    metadata = _load_metadata()
-    rows = []
-    for name in selected.values():
-        key = _find_recipe_key(name, metadata)
-        if not key:
-            continue
-        for ing in metadata[key].get("ingredients", []):
-            rows.append({
-                "Recipe": name,
-                "Item": ing.get("name", ""),
-                "Quantity": ing.get("quantity", ""),
-                "Unit": ing.get("unit", ""),
-                "Category": ing.get("category", ""),
-            })
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["Recipe", "Item", "Quantity", "Unit", "Category"])
-    writer.writeheader()
-    writer.writerows(rows)
-    return buf.getvalue()
-
-
-def _build_prep_guide(selected: dict) -> str:
-    metadata = _load_metadata()
-    lines = ["PREP GUIDE:"]
-    for name in selected.values():
-        key = _find_recipe_key(name, metadata)
-        if not key:
-            continue
-        prep = metadata[key].get("prep_components", [])
-        if prep:
-            lines.append(f"\n{name}:")
-            for p in prep:
-                lines.append(f"  - {p}")
-    return "\n".join(lines) if len(lines) > 1 else ""
-
-
-# ── Idea activation ───────────────────────────────────────────────────────────
-
-def _check_ideas_on_menu(selected: dict, metadata: dict) -> list:
-    return [
-        name for name in selected.values()
-        if _find_recipe_key(name, metadata) and
-           metadata[_find_recipe_key(name, metadata)].get("status") == "idea"
-    ]
-
-
-def _fetch_and_activate_idea(name: str, metadata: dict) -> bool:
-    """Fetch recipe from source URL and create .md file. Returns True on success."""
-    key = _find_recipe_key(name, metadata)
-    if not key:
-        return False
-
-    source_url = metadata[key].get("source_url", "")
-    if not source_url:
-        return False
-
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-
-        resp = requests.get(source_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        content = None
-        for selector in ["article", ".recipe-card", ".recipe", "main"]:
-            el = soup.select_one(selector)
-            if el:
-                content = el.get_text(separator="\n", strip=True)
-                break
-        if not content:
-            content = soup.get_text(separator="\n", strip=True)
-
-        if not content or len(content) < 100:
-            return False
-
-        filename = re.sub(r"[^\w\s-]", "", name).strip().replace(" ", "_") + ".md"
-        md_path = RECIPES_DIR / filename
-        source_label = metadata[key].get("source", source_url)
-
-        if not DRY_RUN:
-            md_path.write_text(
-                f"# {name}\n\nAdapted from [{source_label}]({source_url})\n\n{content[:3000]}"
-            )
-            metadata[key]["status"] = "active"
-            metadata[key]["filename"] = filename
-            log.info(f"Activated idea '{name}' → {filename}")
-
-        return True
-
-    except Exception as e:
-        log.warning(f"Could not fetch '{name}' from {source_url}: {e}")
-        return False
-
-
-# ── handle_finalize ───────────────────────────────────────────────────────────
-
-def handle_finalize(session: dict, config: dict):
-    """
-    Called after Ashley approves. Not a state — invoked internally.
-    Activates idea recipes, generates plan text, writes files, sends prep guide.
-    """
-    selected = session.get("selected_meals", {})
-    week_start_str = session.get("week_start")
-    week_start = date.fromisoformat(week_start_str) if week_start_str else _get_week_start()
-    schedule_notes = session.get("schedule_notes", [])
-    admin_handle = config["security"].get("menu_admin")
-
-    metadata = _load_metadata()
-
-    # 1. Check for ideas on menu
-    ideas_on_menu = _check_ideas_on_menu(selected, metadata)
-    session["ideas_on_menu"] = ideas_on_menu
-
-    # 2. Activate ideas
-    failed_ideas = []
-    for name in ideas_on_menu:
-        if not _fetch_and_activate_idea(name, metadata):
-            failed_ideas.append(name)
-
-    if failed_ideas:
-        session["pending_idea"] = failed_ideas[0]
-        session["remaining_ideas"] = failed_ideas[1:]
-        session["state"] = "awaiting_idea_content"
-        _save_session(session)
-        if admin_handle:
-            _send_outbox(
-                admin_handle,
-                f"Couldn't fetch '{failed_ideas[0]}' — paste the recipe content and I'll activate it.",
-            )
-        return
-
-    # 3. Generate plan text
-    plan_text = _build_plan_text(selected, week_start, schedule_notes, config)
-
-    # 4. Write plan files
-    plan_path = WEEKLYPLAN_DIR / f"mealplan_{week_start.isoformat()}.txt"
-    shopping_path = WEEKLYPLAN_DIR / f"shopping_{week_start.isoformat()}.csv"
-
-    if DRY_RUN:
-        log.info(f"[DRY_RUN] Would write:\n  {plan_path}\n  {shopping_path}")
-    else:
-        WEEKLYPLAN_DIR.mkdir(exist_ok=True)
-        plan_path.write_text(plan_text)
-        shopping_path.write_text(_build_shopping_csv(selected))
-        log.info(f"Wrote plan to {plan_path}")
-
-    # 5. Write trigger file (launchd watcher not yet built — notify admin to run manually)
-    trigger = Path("/Users/Shared/cooking/.run_apps_trigger")
-    if not DRY_RUN:
-        trigger.write_text("")
-
-    # 6. Notify admin
-    if admin_handle:
-        summary_lines = plan_text.split("\n")[:12]
-        summary = "\n".join(summary_lines)
-        _send_outbox(admin_handle, f"Plan written. Run the apps manually.\n\n{summary}")
-
-        prep = _build_prep_guide(selected)
-        if prep:
-            _send_outbox(admin_handle, prep)
-
-    # 7. Complete
-    session["state"] = "complete"
-    _save_session(session)
-    log.info("Menu workflow complete.")
-
-
-# ── State handlers ────────────────────────────────────────────────────────────
+# ── handle_start ──────────────────────────────────────────────────────────────
 
 def handle_start(config: dict) -> str:
-    """idle → awaiting_meal_logging (local) or awaiting_schedule (local)."""
+    """idle → active. Calls MB bridge for last week's meals, seeds conversation history."""
     result = call_menubuilder_tool("start_menu_workflow")
     if "error" in result:
         return "Sorry, couldn't start the menu workflow. Check the logs."
 
     meals = result.get("last_week_meals", [])
-    missing = [m for m in meals if not m.get("sms_feedback")]
+
+    # Normalize week_start to Monday — MCP may return today (Sunday) on trigger day
+    raw_week_start = result.get("week_start", "")
+    try:
+        ws = date.fromisoformat(raw_week_start)
+        if ws.weekday() != 0:  # 0 = Monday
+            ws = ws + timedelta(days=(7 - ws.weekday()) % 7)
+        week_start_str = ws.isoformat()
+    except (ValueError, TypeError):
+        week_start_str = _get_week_start().isoformat()
+
+    # Partition meals missing feedback into first-cooks (prompt) vs known (skip silently)
+    metadata = _load_metadata()
+    first_cook_missing = []
+    for m in meals:
+        if m.get("sms_feedback"):
+            continue
+        key = _find_recipe_key(m["name"], metadata)
+        times_cooked = metadata[key].get("times_cooked", 0) if key else 0
+        if times_cooked == 0:
+            first_cook_missing.append(m)
+        # Known meals with no feedback are silently skipped — no prompt needed
 
     session = _load_session()
     session["last_week_meals"] = meals
-    session["week_start"] = result.get("week_start") or _get_week_start().isoformat()
+    session["week_start"] = week_start_str
+    session["schedule_notes"] = []
+    session["quick_days"] = []
+    session["selected_meals"] = {}
 
-    if not missing:
-        # All feedback already captured — skip straight to schedule
+    if not first_cook_missing:
         session["state"] = "awaiting_schedule"
-        _save_session(session)
-        return "Let's make this week's menu.\n\nAny schedule changes this week?"
+        reply = "Let's make this week's menu.\n\nAny schedule changes this week?"
+    else:
+        session["state"] = "awaiting_meal_logging"
+        session["feedback_queue"] = [m["name"] for m in first_cook_missing]
+        first = first_cook_missing[0]["name"]
+        reply = f"Let's make this week's menu.\n\nHow did {first} go?"
 
-    session["state"] = "awaiting_meal_logging"
-    session["feedback_queue"] = [m["name"] for m in missing]
+    # Seed conversation history with opening exchange so Claude has context
+    # on the first reply. Uses a placeholder user turn so history starts correctly.
+    session["conversation"] = [
+        {"role": "user", "content": "[Menu build started]"},
+        {"role": "assistant", "content": reply},
+    ]
+
     _save_session(session)
-
-    first = missing[0]["name"]
-    return f"Let's make this week's menu.\n\nHow did {first} go?"
+    return reply
 
 
-def _handle_meal_logging(text: str, session: dict, config: dict) -> str:
-    meals = session.get("last_week_meals", [])
-    queue = session.get("feedback_queue", [])
-
-    # Record reply against the current (first in queue) meal
-    if queue:
-        current_name = queue[0]
-        for meal in meals:
-            if meal["name"] == current_name:
-                meal["sms_feedback"] = text.strip()
-                break
-        queue = queue[1:]
-
-    session["last_week_meals"] = meals
-    session["feedback_queue"] = queue
-    _save_session(session)
-
-    if queue:
-        return f"How did {queue[0]} go?"
-
-    # All done — write metadata updates, clear feedback file, advance to schedule
-    _update_metadata_for_cooked_meals(meals)
-    if not DRY_RUN:
-        FEEDBACK_CURRENT_FILE.write_text(json.dumps({"entries": []}, indent=2))
-
-    session["state"] = "awaiting_schedule"
-    _save_session(session)
-    return "Any schedule changes this week?"
-
-
-def _handle_schedule(text: str, session: dict, config: dict) -> str:
-    lowered = text.lower()
-    notes = session.get("schedule_notes", [])
-
-    if "no changes" not in lowered and "no change" not in lowered:
-        notes.append(text)
-
-    session["schedule_notes"] = notes
-    session["state"] = "awaiting_cuisine"
-    _save_session(session)
-    return "What are you feeling this week? Mexican / Italian / Asian / Indian, or 'what we’ve got'?"
-
-
-def _handle_cuisine(text: str, session: dict, config: dict) -> str:
-    session["cuisine_direction"] = text.strip()
-
-    # Parse quick days from schedule notes
-    quick_days = []
-    for note in session.get("schedule_notes", []):
-        note_lower = note.lower()
-        quick_signals = ("game", "practice", "busy", "quick", "early", "tournament")
-        if any(s in note_lower for s in quick_signals):
-            for day_name, abbrev in DAY_NAME_MAP.items():
-                if day_name in note_lower and abbrev not in quick_days:
-                    quick_days.append(abbrev)
-
-    session["quick_days"] = quick_days
-
-    candidates = _run_suggest_meals(quick_days)
-
-    # Fall back to metadata if subprocess failed
-    if not candidates:
-        metadata = _load_metadata()
-        for name, meta in metadata.items():
-            if meta.get("status") == "active":
-                candidates.append({
-                    "name": name,
-                    "cuisine": meta.get("cuisine", ""),
-                    "health": meta.get("health", "Moderate"),
-                    "minutes": 30,
-                    "time_str": meta.get("time", "30 min"),
-                    "is_quick": True,
-                    "meal_type": meta.get("meal_type", "Weeknight"),
-                })
-
-    metadata = _load_metadata()
-    selected = _select_meals(candidates, quick_days, session["cuisine_direction"], metadata)
-
-    session["selected_meals"] = selected
-    session["state"] = "awaiting_meal_approval"
-    _save_session(session)
-
-    # Hand off to bridge: write selected meals into MenuBuilder's activity file
-    call_menubuilder_tool(
-        "advance_to_meal_approval",
-        selected_meals=selected,
-        quick_days=quick_days,
-        schedule_notes=session.get("schedule_notes", []),
-        cuisine_direction=session.get("cuisine_direction", ""),
-    )
-
-    week_start = date.fromisoformat(session["week_start"])
-    return _format_numbered_list(selected, week_start, quick_days)
-
-
-def _handle_meal_approval(text: str, session: dict, config: dict) -> str:
-    lowered = text.lower().strip()
-    approval = ("looks good", "good", "ok", "okay", "approved", "go ahead", "perfect",
-                "great", "sounds good", "yes", "yep", "yeah")
-
-    if any(lowered == p or lowered.startswith(p + " ") for p in approval):
-        selected = session.get("selected_meals", {})
-        week_start = date.fromisoformat(session["week_start"])
-        day_to_date = _day_date_map(week_start)
-
-        meals_json = []
-        for day in DAYS_ORDER:
-            if day in selected:
-                dt = day_to_date.get(day)
-                date_str = dt.strftime("%-m/%-d") if dt else ""
-                meals_json.append({"day": f"{day} {date_str}", "recipe": selected[day]})
-
-        cmd = [
-            sys.executable, str(MENUBUILDER_DIR / "send_menu_partner.py"),
-            "--meals", json.dumps(meals_json),
-        ]
-        if DRY_RUN:
-            log.info(f"[DRY_RUN] Would run send_menu_partner.py with {len(meals_json)} meals")
-        else:
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                if result.returncode != 0:
-                    log.error(f"send_menu_partner.py: {result.stderr.strip()}")
-            except Exception as e:
-                log.error(f"Could not run send_menu_partner.py: {e}")
-
-        session["state"] = "awaiting_ashley_signoff"
-        _save_session(session)
-        return "Sent to Ashley."
-
-    # Try structured swap first ("swap 3 to X", "change tuesday to X")
-    selected = session.get("selected_meals", {})
-    week_start = date.fromisoformat(session["week_start"])
-    new_selected = _parse_swap(text, selected, week_start)
-
-    if new_selected:
-        session["selected_meals"] = new_selected
-        _save_session(session)
-        quick_days = session.get("quick_days", [])
-        return _format_numbered_list(new_selected, week_start, quick_days)
-
-    # Fall back to Claude for natural language ("we've had X too much", "just had Y", etc.)
-    metadata = _load_metadata()
-    new_selected = _claude_swap(text, selected, session.get("cuisine_direction"), metadata)
-
-    if new_selected:
-        session["selected_meals"] = new_selected
-        _save_session(session)
-        quick_days = session.get("quick_days", [])
-        return _format_numbered_list(new_selected, week_start, quick_days)
-
-    # Can't parse — show current list with hints
-    quick_days = session.get("quick_days", [])
-    current_list = _format_numbered_list(selected, week_start, quick_days)
-    return (
-        "Say 'looks good' to approve, or just tell me what to change — e.g. 'swap 3 to pasta', "
-        "'change tuesday to tacos', or 'we've had X too much'.\n\n"
-        + current_list
-    )
-
+# ── handle_ashley_reply ───────────────────────────────────────────────────────
 
 def handle_ashley_reply(text: str, session: dict, config: dict):
     """
@@ -1011,21 +435,14 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
             _send_outbox(admin_handle, f"Ashley replied but something went wrong. Handle manually: '{text}'")
 
 
+# ── _handle_idea_content ──────────────────────────────────────────────────────
+
 def _handle_idea_content(text: str, session: dict, config: dict) -> str:
     """awaiting_idea_content — admin pasted recipe text for an idea that couldn't be fetched."""
     pending = session.get("pending_idea", "")
     if pending:
-        metadata = _load_metadata()
-        key = _find_recipe_key(pending, metadata)
-        if key:
-            filename = re.sub(r"[^\w\s-]", "", pending).strip().replace(" ", "_") + ".md"
-            md_path = RECIPES_DIR / filename
-            if not DRY_RUN:
-                md_path.write_text(f"# {pending}\n\n{text}")
-                metadata[key]["status"] = "active"
-                metadata[key]["filename"] = filename
-                _save_metadata(metadata)
-            log.info(f"Activated idea '{pending}' from pasted content.")
+        call_menubuilder_tool("activate_idea_recipe", name=pending, content=text)
+        log.info(f"Activated idea '{pending}' via MenuBuilder.")
 
     remaining = session.get("remaining_ideas", [])
     if remaining:
@@ -1041,80 +458,399 @@ def _handle_idea_content(text: str, session: dict, config: dict) -> str:
     return "Thanks! Finishing up the plan..."
 
 
-# ── Main dispatch ─────────────────────────────────────────────────────────────
+# ── Agent tool definitions ────────────────────────────────────────────────────
 
-def dispatch(text: str, session: dict, config: dict) -> str:
-    """Route to correct handler based on current workflow state.
+def _build_menu_tools() -> list:
+    return [
+        {
+            "name": "log_meal_feedback",
+            "description": (
+                "Record David's feedback for a single meal from last week. "
+                "Call once per meal after he responds about how it went."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "meal_name": {
+                        "type": "string",
+                        "description": "Name of the meal from last week's plan",
+                    },
+                    "feedback": {
+                        "type": "string",
+                        "description": "David's feedback, e.g. 'loved it', 'kids didn't eat it', 'make again soon'",
+                    },
+                },
+                "required": ["meal_name", "feedback"],
+            },
+        },
+        {
+            "name": "record_schedule_note",
+            "description": (
+                "Save a schedule constraint for this week. "
+                "Call whenever David mentions a busy night, game, practice, or other constraint."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "note": {
+                        "type": "string",
+                        "description": "The schedule note, e.g. 'soccer game Tuesday', 'busy Wednesday evening'",
+                    },
+                },
+                "required": ["note"],
+            },
+        },
+        {
+            "name": "generate_meal_plan",
+            "description": (
+                "Generate this week's meal suggestions based on accumulated schedule notes "
+                "and the cuisine direction David gives. "
+                "Call after asking about schedule and getting a cuisine direction. "
+                "Returns the proposed meal list to show David."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cuisine_direction": {
+                        "type": "string",
+                        "description": "Cuisine preference, e.g. 'Mexican', 'Asian', 'Italian', \"what we've got\"",
+                    },
+                },
+                "required": ["cuisine_direction"],
+            },
+        },
+        {
+            "name": "swap_meal",
+            "description": (
+                "Swap the meal for a specific day in the current plan. "
+                "Call once per day when David asks to change something. "
+                "Pass the day abbreviation and his reason — the system handles finding a replacement."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "day": {
+                        "type": "string",
+                        "description": "Three-letter day abbreviation to swap: Mon, Tue, Wed, Thu, Fri, Sat, or Sun",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Why this day is being swapped. Be specific — the system uses this to pick a replacement. "
+                            "Examples: 'prefer ideas', 'swap to Indian', 'too much chicken this week', "
+                            "'try a new recipe we haven't made before'. "
+                            "If David asks to look at new ideas, pass 'prefer ideas'."
+                        ),
+                    },
+                },
+                "required": ["day", "reason"],
+            },
+        },
+        {
+            "name": "approve_menu",
+            "description": (
+                "Approve the current meal plan and send it to Ashley for sign-off. "
+                "Call when David says the plan looks good, or approves it."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    ]
 
-    Local phase (awaiting_meal_logging / awaiting_schedule / awaiting_cuisine):
-      reads from local menu_session.json and calls the standalone handlers.
-    Bridge phase (awaiting_meal_approval onward):
-      reads state from MenuBuilder via MCP bridge.
+
+# ── Agent tool execution ──────────────────────────────────────────────────────
+
+def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: dict) -> str:
+    if tool_name == "log_meal_feedback":
+        meal_name = tool_input.get("meal_name", "")
+        feedback = tool_input.get("feedback", "")
+        meals = session.get("last_week_meals", [])
+        queue = session.get("feedback_queue", [])
+
+        # Record feedback on the matching meal locally (for conversation context)
+        for meal in meals:
+            name_lower = meal["name"].lower()
+            input_lower = meal_name.lower()
+            if name_lower == input_lower or input_lower in name_lower or name_lower in input_lower:
+                if not meal.get("sms_feedback"):
+                    meal["sms_feedback"] = feedback
+                break
+
+        # Forward each individual feedback to MenuBuilder as it arrives
+        call_menubuilder_tool("log_meal_feedback", meal_name=meal_name, feedback=feedback)
+
+        # Remove from queue
+        queue = [
+            m for m in queue
+            if m.lower() != meal_name.lower() and meal_name.lower() not in m.lower()
+        ]
+        session["last_week_meals"] = meals
+        session["feedback_queue"] = queue
+
+        # When all feedback is collected, signal done and handle first-cook detection
+        if not queue:
+            result = call_menubuilder_tool("log_meal_feedback", feedback="done")
+            if not DRY_RUN:
+                FEEDBACK_CURRENT_FILE.write_text(json.dumps({"entries": []}, indent=2))
+            first_cooks = result.get("first_cook_meals", [])
+            if first_cooks:
+                session["first_cook_queue"] = first_cooks
+                session["state"] = "awaiting_first_cook_feedback"
+            else:
+                session["state"] = "awaiting_schedule"
+
+        _save_session(session)
+        log.info(f"Logged feedback for '{meal_name}': {feedback}")
+        remaining = len(queue)
+        if remaining:
+            return f"Feedback recorded for {meal_name}. {remaining} meal(s) still need feedback."
+        return f"Feedback recorded for {meal_name}. All feedback collected."
+
+    if tool_name == "record_schedule_note":
+        note = tool_input.get("note", "")
+        notes = session.get("schedule_notes", [])
+        notes.append(note)
+        session["schedule_notes"] = notes
+        _save_session(session)
+        log.info(f"Schedule note recorded: {note}")
+        return f"Schedule note saved: {note}"
+
+    if tool_name == "generate_meal_plan":
+        cuisine_direction = tool_input.get("cuisine_direction", "")
+        session["cuisine_direction"] = cuisine_direction
+
+        # Derive quick days from all accumulated schedule notes
+        quick_days = []
+        quick_signals = ("game", "practice", "busy", "quick", "early", "tournament")
+        for note in session.get("schedule_notes", []):
+            note_lower = note.lower()
+            if any(s in note_lower for s in quick_signals):
+                for day_name, abbrev in DAY_NAME_MAP.items():
+                    if day_name in note_lower and abbrev not in quick_days:
+                        quick_days.append(abbrev)
+        session["quick_days"] = quick_days
+
+        candidates = _run_suggest_meals(quick_days)
+
+        # Fall back to metadata if subprocess failed
+        if not candidates:
+            metadata = _load_metadata()
+            for name, meta in metadata.items():
+                if meta.get("status") == "active":
+                    candidates.append({
+                        "name": name,
+                        "cuisine": meta.get("cuisine", ""),
+                        "health": meta.get("health", "Moderate"),
+                        "minutes": 30,
+                        "time_str": meta.get("time", "30 min"),
+                        "is_quick": True,
+                        "meal_type": meta.get("meal_type", "Weeknight"),
+                    })
+
+        metadata = _load_metadata()
+        selected = _select_meals(candidates, quick_days, cuisine_direction, metadata)
+        session["selected_meals"] = selected
+        session["state"] = "awaiting_meal_approval"
+
+        # Sync selected meals into MenuBuilder's activity file
+        call_menubuilder_tool(
+            "advance_to_meal_approval",
+            selected_meals=selected,
+            quick_days=quick_days,
+            schedule_notes=session.get("schedule_notes", []),
+            cuisine_direction=cuisine_direction,
+        )
+
+        _save_session(session)
+        week_start = date.fromisoformat(session["week_start"])
+        return _format_numbered_list(selected, week_start, quick_days)
+
+    if tool_name == "swap_meal":
+        day = tool_input.get("day", "")
+        reason = tool_input.get("reason", "")
+        result = call_menubuilder_tool(
+            "swap_meal",
+            day=day,
+            reason=reason,
+            cuisine_direction=session.get("cuisine_direction", ""),
+        )
+        new_state = result.get("state", session.get("state"))
+        _sync_session_state(new_state)
+        session["state"] = new_state
+        updated = result.get("selected_meals")
+        if updated:
+            session["selected_meals"] = updated
+        _save_session(session)
+        week_start = date.fromisoformat(session["week_start"])
+        plan = _format_numbered_list(session.get("selected_meals", {}), week_start, session.get("quick_days", []))
+        note = result.get("note", "")
+        return f"{note}\n\n{plan}" if note else plan
+
+    if tool_name == "approve_menu":
+        result = call_menubuilder_tool("approve_menu")
+        if "error" in result:
+            log.error(f"approve_menu MCP error: {result['error']}")
+            return "Something went wrong sending the menu to Ashley — check the logs."
+        # Generate shopping list now that meals are locked
+        sl_result = call_menubuilder_tool(
+            "generate_shopping_list",
+            meals=session.get("selected_meals", {}),
+            week_start=session.get("week_start", ""),
+        )
+        if "error" in sl_result:
+            log.warning(f"generate_shopping_list failed: {sl_result['error']}")
+        session["state"] = "awaiting_ashley_signoff"
+        _save_session(session)
+        return "Menu sent to Ashley."
+
+    return f"Unknown tool: {tool_name}"
+
+
+# ── Agent system prompt ───────────────────────────────────────────────────────
+
+def _build_menu_system_prompt(session: dict) -> str:
+    """Build a context-aware system prompt for the menu agent turn."""
+    meals = session.get("last_week_meals", [])
+    queue = session.get("feedback_queue", [])
+    schedule_notes = session.get("schedule_notes", [])
+    selected = session.get("selected_meals", {})
+    week_start_str = session.get("week_start", date.today().isoformat())
+
+    lines = ["\n\n## Menu Workflow Active\n"]
+
+    if meals:
+        lines.append("**Last week's meals:**")
+        for m in meals:
+            fb = f" — {m['sms_feedback']}" if m.get("sms_feedback") else " — no feedback yet"
+            lines.append(f"- {m['day']}: {m['name']}{fb}")
+        lines.append("")
+
+    if queue:
+        lines.append(f"**Feedback still needed from David:** {', '.join(queue)}\n")
+    else:
+        lines.append("**All meal feedback collected.**\n")
+
+    if schedule_notes:
+        lines.append(f"**Schedule notes collected:** {'; '.join(schedule_notes)}\n")
+
+    if selected:
+        try:
+            ws = date.fromisoformat(week_start_str)
+        except Exception:
+            ws = date.today()
+        lines.append("**Current meal selection:**")
+        lines.append(_format_numbered_list(selected, ws))
+        lines.append("")
+
+    lines.append(
+        "**Your job:** Continue the menu build conversation naturally — one question at a time.\n"
+        "1. Collect any remaining meal feedback (log_meal_feedback for each meal, one at a time).\n"
+        "2. Ask about schedule changes this week (record_schedule_note for any constraints).\n"
+        "3. Ask for cuisine direction, then call generate_meal_plan.\n"
+        "4. Show the list. Refine with swap_meal if David requests changes.\n"
+        "5. Call approve_menu when David is happy with the plan.\n"
+        "\nThis is SMS — keep replies short. One question per message.\n"
+        "David may step away and return hours later. If there's conversation history, "
+        "pick up naturally where you left off without asking him to re-explain anything."
+    )
+
+    return _MENU_SYSTEM + "\n".join(lines)
+
+
+# ── Main agent entry point ────────────────────────────────────────────────────
+
+def menu_agent_reply(text: str, session: dict, config: dict) -> str:
     """
-    # Hold — leave state as-is, user picks up on Mac
+    Route an inbound message from the menu admin through Claude agent tool-use.
+    Replaces the old dispatch() state machine.
+    Conversation history is accumulated in session["conversation"] and persisted
+    to menu_session.json so context survives across SMS gaps.
+    """
+    import anthropic as _anthropic
+
+    state = session.get("state", "idle")
+
+    # Hold/pause — acknowledge and exit without advancing state
     if any(p in text.lower() for p in ("hold", "pause", "not now", "later", "stop for now")):
-        return "Got it — pick it up on your Mac whenever you're ready."
+        return "Got it — pick it up whenever you're ready."
 
-    # --- Local phase ---
-    local_state = session.get("state", "idle")
+    # Paste-based idea activation — doesn't fit agent model
+    if state == "awaiting_idea_content":
+        return _handle_idea_content(text, session, config)
 
-    if local_state == "awaiting_meal_logging":
-        return _handle_meal_logging(text, session, config)
-
-    if local_state == "awaiting_schedule":
-        return _handle_schedule(text, session, config)
-
-    if local_state == "awaiting_cuisine":
-        return _handle_cuisine(text, session, config)
-
-    # --- Bridge phase ---
-    state_result = call_menubuilder_tool("get_workflow_state")
-    state = state_result.get("state", "idle")
-
-    if state in ("idle", "complete", None):
-        return ""
-
-    if state == "awaiting_meal_approval":
-        lowered = text.lower().strip()
-        approval = ("looks good", "good", "ok", "okay", "approved", "go ahead", "perfect",
-                    "great", "sounds good", "yes", "yep", "yeah")
-        if any(lowered == p or lowered.startswith(p + " ") for p in approval):
-            result = call_menubuilder_tool("approve_menu")
-            _sync_session_state(result.get("state", "awaiting_ashley_signoff"))
-            return "Sent to Ashley."
-        else:
-            result = call_menubuilder_tool("swap_meal", reason=text)
-            _sync_session_state(result.get("state", state))
-            selected = result.get("selected_meals", {})
-            week_start = date.fromisoformat(result.get("week_start", date.today().isoformat()))
-            if selected:
-                return _format_numbered_list(selected, week_start)
-            return (
-                "Say 'looks good' to approve, or tell me what to change — "
-                "e.g. 'swap Wed to pasta' or 'change tuesday to tacos'.\n\n"
-                + _format_numbered_list(state_result.get("selected_meals", {}), date.today())
-            )
-
+    # Waiting on Ashley — David just gets a status update
     if state == "awaiting_ashley_signoff":
-        # Ashley's reply is handled separately via handle_ashley_reply() in server.py
-        # David texting during this state gets a status update
-        return "Waiting on Ashley's OK. I'll let you know when she replies."
+        return "Still waiting on Ashley's OK — I'll let you know when she replies."
 
-    if state == "awaiting_idea_activation":
-        pending = state_result.get("pending_idea", "")
-        result = call_menubuilder_tool("activate_idea_recipe", name=pending, content=text)
-        _sync_session_state(result.get("state", state))
-        if result.get("remaining_pending", 0) == 0:
-            call_menubuilder_tool("finalize_plan")
-            _sync_session_state("complete")
-            return "Thanks! Finishing up the plan..."
-        next_idea = result.get("next_pending", "")
-        return f"Got it! Now paste the content for '{next_idea}'."
-
+    # Finalization pass-through
     if state == "awaiting_finalization":
         result = call_menubuilder_tool("finalize_plan")
         _sync_session_state("complete")
+        session["state"] = "complete"
+        _save_session(session)
         return "Plan ready!"
 
-    log.warning(f"Unknown menu workflow state: local={local_state} bridge={state}")
-    return ""
+    # Build conversation history for this turn
+    conversation = session.get("conversation", [])
+    now_str = datetime.now().strftime("%A, %B %-d at %-I:%M %p")
+    conversation.append({"role": "user", "content": f"[{now_str}] {text}"})
+
+    system = _build_menu_system_prompt(session)
+    tools = _build_menu_tools()
+
+    try:
+        client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    except Exception as e:
+        log.error(f"Could not create Anthropic client: {e}")
+        return "Sorry, I ran into an error — try again in a moment."
+
+    # Local copy of messages for this turn (may grow with tool_use/tool_result blocks)
+    messages = list(conversation)
+    final_reply = ""
+
+    try:
+        for _ in range(5):
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=500,
+                system=system,
+                tools=tools,
+                messages=messages,
+            )
+
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        result = _execute_menu_tool(block.name, block.input, session, config)
+                        log.info(f"Menu tool {block.name}({block.input}) -> {result[:120]}")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+                # Append tool use/result to local messages only (not persisted)
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                final_reply = next(
+                    (b.text for b in response.content if hasattr(b, "text")),
+                    "Sorry, something went wrong."
+                ).strip()
+                break
+
+    except Exception as e:
+        log.error(f"Menu agent error: {e}")
+        final_reply = "Sorry, I ran into a snag — try again in a moment."
+
+    if final_reply:
+        conversation.append({"role": "assistant", "content": final_reply})
+
+    # Persist only simple text turns (cap at 40 to avoid bloat)
+    session["conversation"] = conversation[-40:]
+    _save_session(session)
+
+    return final_reply
