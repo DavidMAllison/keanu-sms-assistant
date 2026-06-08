@@ -579,8 +579,9 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
                     meal["sms_feedback"] = feedback
                 break
 
-        # Forward each individual feedback to MenuBuilder as it arrives
-        call_menubuilder_tool("log_meal_feedback", meal_name=meal_name, feedback=feedback)
+        # Forward each individual feedback to MenuBuilder as it arrives.
+        # MCP matches by keyword — include meal name so it lands on the right meal.
+        call_menubuilder_tool("log_meal_feedback", feedback=f"{meal_name}: {feedback}")
 
         # Remove from queue
         queue = [
