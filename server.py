@@ -910,9 +910,9 @@ def main():
                         session = json.loads(MENU_SESSION_FILE.read_text())
                         wf_state = session.get("state", "idle")
                         if wf_state not in ("idle", "complete", None):
-                            if "cancel menu" in text.lower():
+                            if text.strip().lower() == "recycle koala":
                                 MENU_SESSION_FILE.write_text(json.dumps({"state": "idle"}))
-                                send_imessage(handle, "Menu session cancelled.")
+                                send_imessage(handle, "Menu reset — you're back to normal.")
                             else:
                                 reply = menu_workflow.menu_agent_reply(text, session, config)
                                 if reply:
