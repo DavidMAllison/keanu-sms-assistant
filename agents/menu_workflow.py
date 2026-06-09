@@ -423,9 +423,24 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
         if admin_handle:
             _send_outbox(admin_handle, "Plan written, apps launched.")
     elif new_state == "awaiting_idea_activation":
-        pending_ideas = result.get("pending_ideas", [])
+        pending_ideas = result.get("pending_ideas", [])  # list of {"name": str, "source_url": str}
         if admin_handle and pending_ideas:
-            _send_outbox(admin_handle, f"Couldn't fetch '{pending_ideas[0]}' — paste the recipe content and I'll activate it.")
+            first = pending_ideas[0]
+            name = first["name"]
+            has_url = bool(first.get("source_url", ""))
+
+            session = _load_session()
+            session["pending_idea"] = name
+            session["remaining_ideas"] = [p["name"] for p in pending_ideas[1:]]
+
+            if has_url:
+                session["state"] = "awaiting_idea_content"
+                _save_session(session)
+                _send_outbox(admin_handle, f"Couldn't fetch '{name}' — paste the recipe content and I'll activate it.")
+            else:
+                session["state"] = "awaiting_idea_url"
+                _save_session(session)
+                _send_outbox(admin_handle, f"I don't have a source URL for '{name}'. What's the URL?")
     elif new_state == "awaiting_ashley_signoff":
         # Ashley requested a change — MenuBuilder re-sent the updated menu
         if admin_handle:
@@ -456,6 +471,34 @@ def _handle_idea_content(text: str, session: dict, config: dict) -> str:
     _save_session(session)
     handle_finalize(session, config)
     return "Thanks! Finishing up the plan..."
+
+
+# ── _handle_idea_url ─────────────────────────────────────────────────────────
+
+def _handle_idea_url(text: str, session: dict, config: dict) -> str:
+    """awaiting_idea_url — admin provided a URL for an idea that had none."""
+    pending = session.get("pending_idea", "")
+
+    result = call_menubuilder_tool("activate_idea_recipe", name=pending, source_url=text.strip())
+
+    if result.get("auto_activated"):
+        remaining = session.get("remaining_ideas", [])
+        if remaining:
+            session["pending_idea"] = remaining[0]
+            session["remaining_ideas"] = remaining[1:]
+            session["state"] = "awaiting_idea_content"
+            _save_session(session)
+            return f"Got it! Now paste the content for '{remaining[0]}'."
+        session.pop("pending_idea", None)
+        session.pop("remaining_ideas", None)
+        _save_session(session)
+        handle_finalize(session, config)
+        return "Thanks! Finishing up the plan..."
+    else:
+        # Fetch failed — fall back to paste
+        session["state"] = "awaiting_idea_content"
+        _save_session(session)
+        return f"Couldn't fetch that URL. Paste the recipe content for '{pending}'."
 
 
 # ── Agent tool definitions ────────────────────────────────────────────────────
@@ -781,6 +824,9 @@ def menu_agent_reply(text: str, session: dict, config: dict) -> str:
     # Paste-based idea activation — doesn't fit agent model
     if state == "awaiting_idea_content":
         return _handle_idea_content(text, session, config)
+
+    if state == "awaiting_idea_url":
+        return _handle_idea_url(text, session, config)
 
     # Waiting on Ashley — David just gets a status update
     if state == "awaiting_ashley_signoff":
