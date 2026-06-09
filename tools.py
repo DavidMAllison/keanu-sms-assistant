@@ -1111,7 +1111,7 @@ def _tool_swap_meal(day: str, outgoing: str, incoming: str,
 
 
 def _tool_get_prep_guide(mode: str = "auto") -> str:
-    result = _call_menubuilder_tool("get_prep_guide", {"mode": mode})
+    result = _call_menubuilder_tool("get_prep_guide", mode=mode)
     if "error" in result:
         log.error(f"get_prep_guide bridge error: {result['error']}")
         return "Sorry, couldn't fetch the prep guide right now."
