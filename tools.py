@@ -383,6 +383,30 @@ _DEFS = {
             "required": [],
         },
     },
+    "set_lunch_pick": {
+        "name": "set_lunch_pick",
+        "description": "Save Ashley's lunch pick for the week. Called when she replies to the Saturday lunch suggestion text with a choice.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recipe_name": {"type": "string", "description": "The recipe name she selected"},
+            },
+            "required": ["recipe_name"],
+        },
+    },
+    "log_lunch_feedback": {
+        "name": "log_lunch_feedback",
+        "description": "Log Ashley's feedback on last week's lunch. Call when she rates or comments on her lunch in reply to the weekly check-in.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recipe":    {"type": "string", "description": "Recipe name"},
+                "sentiment": {"type": "string", "enum": ["liked", "ok", "disliked"]},
+                "note":      {"type": "string", "description": "Optional comment"},
+            },
+            "required": ["recipe", "sentiment"],
+        },
+    },
     "swap_meal": {
         "name": "swap_meal",
         "description": (
@@ -420,7 +444,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
         return [_DEFS["get_meal_plan"], _DEFS["get_schedule"], _DEFS["check_friend_dinner"]]
     names = ["get_meal_plan", "get_recipe", "get_schedule", "add_schedule_event",
              "log_feedback", "log_preference", "log_capability_gap", "relay_message",
-             "get_prep_guide", "check_inventory"]
+             "get_prep_guide", "check_inventory", "set_lunch_pick", "log_lunch_feedback"]
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal"]
     if is_admin:
@@ -769,7 +793,7 @@ def _tool_update_meal_plan(instruction: str) -> str:
 
 
 def _tool_log_feedback(recipe: str, feedback: str, sentiment: str, handle: str) -> str:
-    from datetime import datetime
+    from datetime import datetime, timedelta
     queue_file = COOKING_BASE / "feedback_queue.json"
     handle_map = _load_handle_to_name()
     entry = {
@@ -782,6 +806,15 @@ def _tool_log_feedback(recipe: str, feedback: str, sentiment: str, handle: str) 
     }
     try:
         existing = json.loads(queue_file.read_text()) if queue_file.exists() else []
+        cutoff = datetime.now() - timedelta(minutes=30)
+        for e in existing:
+            if e.get("recipe") == recipe and e.get("handle") == handle:
+                try:
+                    if datetime.fromisoformat(e["timestamp"]) >= cutoff:
+                        log.info(f"Duplicate feedback suppressed: {recipe} from {handle}")
+                        return "Feedback logged."
+                except (KeyError, ValueError):
+                    pass
         existing.append(entry)
         queue_file.write_text(json.dumps(existing, indent=2))
         return "Feedback logged."
@@ -1118,6 +1151,23 @@ def _tool_get_prep_guide(mode: str = "auto") -> str:
     return result.get("prep_guide", "No prep guide available for this week.")
 
 
+def _tool_set_lunch_pick(recipe_name: str) -> str:
+    result = _call_menubuilder_tool("set_lunch_pick", recipe_name=recipe_name)
+    if "error" in result:
+        log.error(f"set_lunch_pick bridge error: {result['error']}")
+        return "something went wrong on my end"
+    return result.get("message", f"Lunch pick saved: {recipe_name}")
+
+
+def _tool_log_lunch_feedback(recipe: str, sentiment: str, note: str = "") -> str:
+    result = _call_menubuilder_tool("log_lunch_feedback", recipe=recipe, sentiment=sentiment, note=note)
+    if "error" in result:
+        log.error(f"log_lunch_feedback bridge error: {result['error']}")
+        return "something went wrong on my end"
+    times = result.get("times_eaten_lunch", "?")
+    return f"Logged lunch feedback for {recipe} ({sentiment}). Times eaten: {times}"
+
+
 def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
     try:
         if name == "get_meal_plan":
@@ -1153,6 +1203,10 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_get_prep_guide(inputs.get("mode", "auto"))
         if name == "check_inventory":
             return _tool_check_inventory(inputs["query"])
+        if name == "set_lunch_pick":
+            return _tool_set_lunch_pick(inputs["recipe_name"])
+        if name == "log_lunch_feedback":
+            return _tool_log_lunch_feedback(inputs["recipe"], inputs["sentiment"], inputs.get("note", ""))
         return f"Unknown tool: {name}"
     except Exception as e:
         log.error(f"Tool error ({name}): {e}")
