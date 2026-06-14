@@ -489,20 +489,20 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
         lines = pf.read_text().splitlines()
 
         def _extract_url_and_name(i: int):
+            meal_name = lines[i].strip().split("[")[0].split("|")[0].strip()
+            meal_name = re.sub(r"^[A-Za-z]{3}\s+\d+/\d+\s+", "", meal_name).strip()
             for j in range(i + 1, min(i + 3, len(lines))):
                 stripped = lines[j].strip()
                 if stripped.startswith("http"):
-                    meal_name = lines[i].strip().split("[")[0].split("|")[0].strip()
-                    meal_name = re.sub(r"^[A-Za-z]{3}\s+\d+/\d+\s+", "", meal_name).strip()
                     return meal_name, stripped
-            return None
+            return meal_name, None  # meal found but no URL line
 
         if day_prefix:
             # Match the line that starts with the day abbreviation
             for i, line in enumerate(lines):
                 if line.strip().startswith(day_prefix):
                     result = _extract_url_and_name(i)
-                    if result:
+                    if result[0]:
                         return result
         else:
             keywords = [w for w in name_lower.split() if len(w) > 3]
@@ -511,7 +511,7 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
                 if not keywords or sum(1 for k in keywords if k in line_lower) < max(1, len(keywords) // 2):
                     continue
                 result = _extract_url_and_name(i)
-                if result:
+                if result[0]:
                     return result
                 break
         break  # Only check the most recent plan that doesn't start after today
@@ -564,6 +564,16 @@ def _tool_get_recipe(name: str, handle: str = "") -> str:
     plan_result = _find_in_meal_plan(name)
     if plan_result:
         meal_name, url = plan_result
+        if not url:
+            # Meal is on the plan but has no URL — ask MenuBuilder
+            try:
+                from agents.menu_workflow import call_menubuilder_tool
+                mb_result = call_menubuilder_tool("get_recipe_url", name=meal_name)
+                url = mb_result.get("url", "")
+            except Exception:
+                pass
+            if not url:
+                return f"I have {meal_name} on the plan this week but don't have the recipe link yet."
         if "dropbox.com" in url:
             # Try to serve from local recipe file via existing machinery
             matches = find_all_recipe_matches(name)
