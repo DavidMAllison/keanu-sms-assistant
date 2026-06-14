@@ -29,6 +29,7 @@ DRY_RUN = False
 MENU_SESSION_FILE = Path("/Users/Shared/cooking/menu_session.json")
 OUTBOX_FILE = Path("/Users/Shared/sms-assistant/.outbox.json")
 MENUBUILDER_DIR = Path("/Users/davidallison/projects/personal/MenuBuilder")
+MENU_PENDING_FILE = Path("/Users/Shared/sms-assistant/menu_feedback_pending.json")
 
 DAYS_ORDER = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
@@ -85,6 +86,30 @@ def _send_outbox(handle: str, text: str):
     outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
     outbox.append({"handle": handle, "text": text})
     OUTBOX_FILE.write_text(json.dumps(outbox))
+
+
+def _get_partner_handle() -> str:
+    config_path = MENUBUILDER_DIR / "config.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text()).get("partner_handle", "")
+        except Exception:
+            pass
+    return ""
+
+
+def _send_to_ashley(text: str):
+    """Send a message to Ashley via outbox and recreate PENDING_FILE so her reply is routed back."""
+    partner = _get_partner_handle()
+    if not partner:
+        log.error("No partner_handle in MenuBuilder config — cannot send to Ashley.")
+        return
+    _send_outbox(partner, text)
+    if not DRY_RUN:
+        MENU_PENDING_FILE.write_text(json.dumps({
+            "sent_at": datetime.now().isoformat(),
+            "partner_handle": partner,
+        }))
 
 
 def _format_meal_list(meals: list) -> str:
@@ -415,7 +440,48 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
     Delegates to MenuBuilder via bridge.
     """
     admin_handle = config["security"].get("menu_admin")
+
+    # If we're mid URL-swap resolution, handle that first
+    if session.get("pending_url_swap"):
+        _handle_pending_url_swap(text, session, config)
+        return
+
     result = call_menubuilder_tool("handle_ashley_reply", reply=text)
+
+    # MenuBuilder detected a URL in Ashley's message — resolve it
+    if result.get("has_url"):
+        url = result["url"]
+        day = result.get("extracted_day", "")
+        url_result = call_menubuilder_tool("process_recipe_url", url=url, day=day)
+        status = url_result.get("status")
+
+        if status == "similar_exists":
+            existing = url_result["recipe"]
+            score = url_result.get("match_score", 0)
+            session = _load_session()
+            session["pending_url_swap"] = {"url": url, "day": day, "existing_recipe": existing}
+            _save_session(session)
+            _send_to_ashley(
+                f"I already have something similar: \"{existing}\" ({score:.0%} match). "
+                f"Use that one, or add this new recipe?"
+            )
+            if admin_handle:
+                _send_outbox(admin_handle, f"Ashley sent a URL for {day} — similar recipe exists. Waiting on her choice.")
+        elif status == "added":
+            new_recipe = url_result["recipe"]
+            if day and url_result.get("swapped_day"):
+                _send_to_ashley(f"Got it — swapped {day} to {new_recipe}.")
+            elif day:
+                call_menubuilder_tool("swap_meal", day=day, reason="Ashley request", replacement=new_recipe)
+                _send_to_ashley(f"Got it — swapped {day} to {new_recipe}.")
+            if admin_handle:
+                _send_outbox(admin_handle, f"Ashley's URL added as '{new_recipe}' and scheduled for {day}.")
+        else:
+            _send_to_ashley("Couldn't fetch that recipe. Can you paste the name?")
+            if admin_handle:
+                _send_outbox(admin_handle, f"Ashley sent an unfetchable URL: {url}")
+        return
+
     new_state = result.get("state", "")
     _sync_session_state(new_state)
 
@@ -448,6 +514,37 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
     else:
         if admin_handle:
             _send_outbox(admin_handle, f"Ashley replied but something went wrong. Handle manually: '{text}'")
+
+
+# ── _handle_pending_url_swap ──────────────────────────────────────────────────
+
+def _handle_pending_url_swap(text: str, session: dict, config: dict):
+    """
+    Ashley replied to the 'similar recipe exists' question.
+    Pending context is in session["pending_url_swap"].
+    """
+    admin_handle = config["security"].get("menu_admin")
+    pending = session.get("pending_url_swap", {})
+    url = pending.get("url", "")
+    day = pending.get("day", "")
+    existing = pending.get("existing_recipe", "")
+
+    lower = text.lower()
+    if any(w in lower for w in ("new", "add", "different", "that one", "yes", "yeah", "yep")):
+        result = call_menubuilder_tool("process_recipe_url", url=url, day=day, force_add=True)
+        new_recipe = result.get("recipe", url)
+        _send_to_ashley(f"Added and swapped {day} to {new_recipe}.")
+        if admin_handle:
+            _send_outbox(admin_handle, f"Ashley chose to add new recipe '{new_recipe}' for {day}.")
+    else:
+        call_menubuilder_tool("swap_meal", day=day, reason="Ashley request", replacement=existing)
+        _send_to_ashley(f"Got it — using {existing} for {day}.")
+        if admin_handle:
+            _send_outbox(admin_handle, f"Ashley chose existing recipe '{existing}' for {day}.")
+
+    session.pop("pending_url_swap", None)
+    _save_session(session)
+    call_menubuilder_tool("approve_menu")
 
 
 # ── _handle_idea_content ──────────────────────────────────────────────────────

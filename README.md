@@ -18,6 +18,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Image vision** — reads images sent via iMessage (HEIC auto-converted to JPEG)
 - **Sunday menu trigger** — launchd job fires at 9 AM Sunday to kick off the weekly menu workflow automatically
 - **Ashley's weekly lunch** — Saturday 10 AM launchd job sends Ashley 3 lunch suggestions; she replies to pick one; 6 PM nudge if no pick by then; Keanu handles pick and feedback via `set_lunch_pick` and `log_lunch_feedback` (bridge to MenuBuilder)
+- **URL-based meal swaps** — Ashley (or David) can send a recipe URL during menu signoff to add a new recipe and schedule it for a specific day; Keanu checks for similar existing recipes and asks which to use if a close match is found
 
 ## How it works
 
