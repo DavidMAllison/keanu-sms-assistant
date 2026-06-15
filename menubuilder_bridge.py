@@ -16,22 +16,30 @@ _MB_SERVER_PATH = "/Users/davidallison/projects/personal/MenuBuilder/mcp/menu_se
 _MB_PROJECT_PATH = "/Users/davidallison/projects/personal/MenuBuilder"
 
 
-def call_menubuilder_tool(tool_name: str, **kwargs) -> dict:
-    """Call a MenuBuilder MCP tool via subprocess bridge (handles Python 3.9/3.12 gap)."""
-    script = f"""
+_BRIDGE_SCRIPT = f"""
 import sys, json
 sys.path.insert(0, {repr(_MB_PROJECT_PATH)})
 import importlib.util
 spec = importlib.util.spec_from_file_location('menu_server', {repr(_MB_SERVER_PATH)})
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-result = getattr(mod, {repr(tool_name)})(**{repr(kwargs)})
+payload = json.loads(sys.stdin.read())
+result = getattr(mod, payload['tool'])(**payload['kwargs'])
 print(json.dumps(result))
 """
+
+
+def call_menubuilder_tool(tool_name: str, **kwargs) -> dict:
+    """Call a MenuBuilder MCP tool via subprocess bridge (handles Python 3.9/3.12 gap).
+
+    Passes tool name and kwargs via stdin to avoid ARG_MAX limits for large payloads
+    such as base64-encoded images.
+    """
     try:
         r = subprocess.run(
-            [_MB_VENV_PYTHON, "-c", script],
-            capture_output=True, text=True, timeout=30,
+            [_MB_VENV_PYTHON, "-c", _BRIDGE_SCRIPT],
+            input=json.dumps({"tool": tool_name, "kwargs": kwargs}),
+            capture_output=True, text=True, timeout=60,
         )
         if r.returncode != 0:
             log.error(f"MenuBuilder tool {tool_name} failed: {r.stderr.strip()}")

@@ -30,11 +30,17 @@ def call_receipt_parser(image_path: str) -> dict:
     try:
         r = subprocess.run(
             [_GA_PYTHON, _GA_PARSER_PATH, image_path],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=120,
         )
         if r.returncode != 0:
-            log.error(f"GroceryAgent receipt_parser failed: {r.stderr.strip()}")
-            return {"error": r.stderr.strip() or f"receipt_parser exited {r.returncode}"}
+            stdout_err = r.stdout.strip()
+            stderr_err = r.stderr.strip()
+            log.error(f"GroceryAgent receipt_parser failed (stdout={stdout_err!r}, stderr={stderr_err!r})")
+            try:
+                parsed = json.loads(stdout_err)
+                return parsed if "error" in parsed else {"error": f"receipt_parser exited {r.returncode}"}
+            except (json.JSONDecodeError, ValueError):
+                return {"error": stderr_err or stdout_err or f"receipt_parser exited {r.returncode}"}
         raw = r.stdout.strip()
         if not raw:
             log.error("GroceryAgent receipt_parser returned empty output")
