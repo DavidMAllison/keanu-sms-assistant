@@ -1,5 +1,6 @@
 """Tool definitions and implementations for Keanu."""
 
+import base64
 import json
 import logging
 import subprocess
@@ -119,6 +120,8 @@ def drain_outbox():
 
 
 # ── Tool definitions (sent to Claude API) ─────────────────────────────────────
+
+_pending_image_recipe: dict = {}  # handle -> {"image_path": str, "mime": str, "caption": str}
 
 _DEFS = {
     "get_meal_plan": {
@@ -407,6 +410,15 @@ _DEFS = {
             "required": ["recipe", "sentiment"],
         },
     },
+    "get_lunch_pick": {
+        "name": "get_lunch_pick",
+        "description": "Look up Ashley's lunch pick for this week. Returns the recipe name, URL, and status ('picked' or 'none'). Use when anyone asks what Ashley is having for lunch this week.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     "swap_meal": {
         "name": "swap_meal",
         "description": (
@@ -436,6 +448,40 @@ _DEFS = {
             "required": ["day", "outgoing", "incoming"],
         },
     },
+    "process_recipe_url": {
+        "name": "process_recipe_url",
+        "description": (
+            "Add a recipe URL to the collection. Checks for similar existing recipes first. "
+            "If similar_exists was already returned and the user confirms they want the new "
+            "variety, call again with force_add=true."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url":       {"type": "string", "description": "Recipe URL"},
+                "force_add": {"type": "boolean", "description": "Skip similarity check and add anyway"},
+            },
+            "required": ["url"],
+        },
+    },
+    "process_recipe_image": {
+        "name": "process_recipe_image",
+        "description": (
+            "Add a recipe from a pending image to the collection. Only call this when a "
+            "pending_image_recipe exists for the user and they confirmed adding the new recipe. "
+            "Re-read the image from pending_image_recipe['image_path'] and encode as base64."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_b64":   {"type": "string", "description": "Base64-encoded image bytes"},
+                "mime_type":   {"type": "string", "description": "MIME type (default: image/jpeg)"},
+                "source_note": {"type": "string", "description": "Source attribution (e.g. 'Julia Child')"},
+                "force_add":   {"type": "boolean", "description": "Skip similarity check and add anyway"},
+            },
+            "required": ["image_b64"],
+        },
+    },
 }
 
 
@@ -444,9 +490,10 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
         return [_DEFS["get_meal_plan"], _DEFS["get_schedule"], _DEFS["check_friend_dinner"]]
     names = ["get_meal_plan", "get_recipe", "get_schedule", "add_schedule_event",
              "log_feedback", "log_preference", "log_capability_gap", "relay_message",
-             "get_prep_guide", "check_inventory", "set_lunch_pick", "log_lunch_feedback"]
+             "get_prep_guide", "check_inventory", "get_lunch_pick", "set_lunch_pick", "log_lunch_feedback"]
     if is_idea_submitter:
-        names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal"]
+        names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal",
+                  "process_recipe_url", "process_recipe_image"]
     if is_admin:
         names += ["update_meal_plan", "update_inventory"]
     return [_DEFS[n] for n in names]
@@ -794,6 +841,16 @@ def _tool_check_recipe_similarity(content: str) -> str:
 
 
 def _tool_save_recipe_idea(content: str) -> str:
+    import re
+    if re.match(r'https?://', content.strip()):
+        result = _call_menubuilder_tool("process_recipe_url", url=content.strip())
+        status = result.get("status")
+        if status == "added":
+            return f"Added '{result['recipe']}' to the collection. It's ready to use."
+        elif status == "similar_exists":
+            return f"Already have something similar: \"{result['recipe']}\" ({result.get('match_score', 0):.0%} match). Use that one, or confirm to add this new variety?"
+        else:
+            return "Couldn't fetch that recipe. Can you paste the content?"
     return "Saved to the ideas list." if _save_idea(content) else "Couldn't save that one."
 
 
@@ -1161,6 +1218,18 @@ def _tool_get_prep_guide(mode: str = "auto") -> str:
     return result.get("prep_guide", "No prep guide available for this week.")
 
 
+def _tool_get_lunch_pick() -> str:
+    result = _call_menubuilder_tool("get_lunch_pick")
+    if "error" in result:
+        log.error(f"get_lunch_pick bridge error: {result['error']}")
+        return "something went wrong on my end"
+    if result.get("status") == "none":
+        return "Ashley hasn't picked a lunch recipe for this week yet."
+    name = result.get("name", "unknown")
+    url = result.get("url", "")
+    return f"Ashley's lunch this week: {name}" + (f" — {url}" if url else "")
+
+
 def _tool_set_lunch_pick(recipe_name: str) -> str:
     result = _call_menubuilder_tool("set_lunch_pick", recipe_name=recipe_name)
     if "error" in result:
@@ -1213,10 +1282,40 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_get_prep_guide(inputs.get("mode", "auto"))
         if name == "check_inventory":
             return _tool_check_inventory(inputs["query"])
+        if name == "get_lunch_pick":
+            return _tool_get_lunch_pick()
         if name == "set_lunch_pick":
             return _tool_set_lunch_pick(inputs["recipe_name"])
         if name == "log_lunch_feedback":
             return _tool_log_lunch_feedback(inputs["recipe"], inputs["sentiment"], inputs.get("note", ""))
+        if name == "process_recipe_url":
+            result = _call_menubuilder_tool("process_recipe_url",
+                                            url=inputs["url"],
+                                            force_add=inputs.get("force_add", False))
+            status = result.get("status")
+            if status == "added":
+                return f"Added '{result['recipe']}' to the collection. It's ready to use."
+            elif status == "similar_exists":
+                return (f"Similar recipe already exists: \"{result['recipe']}\" "
+                        f"({result.get('match_score', 0):.0%} match). "
+                        "Confirm to add the new variety anyway.")
+            return f"Couldn't fetch that recipe: {result.get('error', 'unknown error')}"
+        if name == "process_recipe_image":
+            pending = _pending_image_recipe.get(handle, {})
+            image_b64 = inputs.get("image_b64", "")
+            if not image_b64 and pending.get("image_path"):
+                image_b64 = base64.standard_b64encode(
+                    Path(pending["image_path"]).read_bytes()
+                ).decode("utf-8")
+            result = _call_menubuilder_tool("process_recipe_image",
+                                            image_b64=image_b64,
+                                            mime_type=inputs.get("mime_type", pending.get("mime", "image/jpeg")),
+                                            source_note=inputs.get("source_note", pending.get("caption", "")),
+                                            force_add=inputs.get("force_add", False))
+            if result.get("status") == "added":
+                _pending_image_recipe.pop(handle, None)
+                return f"Added '{result['recipe']}' ({result.get('health', '')}) to the collection."
+            return f"Couldn't add it: {result.get('error', 'unknown')}"
         return f"Unknown tool: {name}"
     except Exception as e:
         log.error(f"Tool error ({name}): {e}")

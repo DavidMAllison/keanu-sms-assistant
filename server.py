@@ -26,7 +26,8 @@ from dotenv import load_dotenv
 from agent import get_reply
 from agents import menu_workflow
 from groceryagent_bridge import call_receipt_parser
-from tools import send_imessage, send_imessage_group, drain_outbox
+from menubuilder_bridge import call_menubuilder_tool as _call_menubuilder_tool
+from tools import send_imessage, send_imessage_group, drain_outbox, _pending_image_recipe
 from agents.menu_agent import save_recipe_idea as _save_recipe_idea_fn, IDEAS_DIR as _RECIPE_IDEAS_DIR
 
 load_dotenv()
@@ -256,35 +257,33 @@ def _is_recipe_idea_caption(text: str) -> bool:
     return any(kw in lowered for kw in _RECIPE_IDEA_CAPTION_KEYWORDS)
 
 
-def _run_recipe_idea_from_image(image_path: str, mime_type: str, handle: str) -> str:
-    """Copy the raw image file into the recipe ideas inbox for MenuBuilder to process.
-
-    Does not extract the recipe name — MenuBuilder reads images directly.
-    Cleans up the temp file in all cases via finally.
-    """
-    _MIME_TO_EXT = {
-        "image/jpeg": ".jpg",
-        "image/png":  ".png",
-        "image/gif":  ".gif",
-        "image/webp": ".webp",
-    }
+def _run_recipe_idea_from_image(image_path: str, mime_type: str, handle: str,
+                                caption: str = "") -> Optional[str]:
     try:
-        _RECIPE_IDEAS_DIR.mkdir(exist_ok=True)
-        ext = _MIME_TO_EXT.get(mime_type, ".jpg")
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        dest = _RECIPE_IDEAS_DIR / f"{timestamp}_recipe{ext}"
-        shutil.copy2(image_path, dest)
-        log.info(f"Saved recipe idea image from {handle} to {dest}")
-        return "Saved the recipe photo to ideas — just ask me to review your ideas when you're ready!"
+        image_b64 = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
     except Exception as e:
-        log.error(f"Recipe idea image save error for {handle}: {e}", exc_info=True)
-        return "Something went wrong on my end — try sending it again?"
-    finally:
-        try:
-            Path(image_path).unlink(missing_ok=True)
-            log.info(f"Cleaned up temp recipe idea image: {image_path}")
-        except Exception as e:
-            log.warning(f"Could not delete temp recipe idea file {image_path}: {e}")
+        return f"Couldn't read that image — try sending it again. ({e})"
+
+    result = _call_menubuilder_tool("process_recipe_image", image_b64=image_b64,
+                                    mime_type=mime_type, source_note=caption)
+    status = result.get("status")
+
+    if status == "added":
+        Path(image_path).unlink(missing_ok=True)
+        recipe = result["recipe"]
+        health = result.get("health", "")
+        return f"Added '{recipe}' to the collection ({health}). It's in rotation."
+
+    if status == "similar_exists":
+        _pending_image_recipe[handle] = {"image_path": image_path, "mime": mime_type,
+                                         "caption": caption}
+        existing = result["recipe"]
+        score = result.get("match_score", 0)
+        return (f"I already have something similar: \"{existing}\" ({score:.0%} match). "
+                f"Want to use that one, or add this as a new recipe?")
+
+    Path(image_path).unlink(missing_ok=True)
+    return "Couldn't read that recipe — try a clearer photo."
 
 
 def _vision_is_receipt(image_path: str, mime_type: str) -> bool:
@@ -347,7 +346,7 @@ def route_image_message(attachments: list, text: str, handle: str,
             log.info(f"Path 0: recipe idea caption from non-submitter {handle}, falling through")
         else:
             log.info(f"Path 0: recipe idea caption from {handle}, extracting recipe name via Vision")
-            reply = _run_recipe_idea_from_image(image_path, mime_type, handle)
+            reply = _run_recipe_idea_from_image(image_path, mime_type, handle, caption=text)
             send_imessage(handle, reply)
             return None
 
