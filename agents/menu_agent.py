@@ -265,7 +265,7 @@ def find_recipe_for_message(message: str) -> Optional[str]:
 RECIPE_CHUNK_CHARS = 800
 
 
-def find_all_recipe_matches(message: str) -> list[dict]:
+def find_all_recipe_matches(message: str, effort: Optional[str] = None) -> list[dict]:
     """Return list of {name, filename} for all recipes matching message keywords."""
     msg_lower = message.lower()
     if not METADATA_FILE.exists():
@@ -279,6 +279,8 @@ def find_all_recipe_matches(message: str) -> list[dict]:
                 continue
             filename = meta.get("filename", "")
             if not filename or not (RECIPES_DIR / filename).exists():
+                continue
+            if effort and meta.get("weeknight_effort") != effort:
                 continue
             name_lower = name.lower()
             # Exact match wins immediately
