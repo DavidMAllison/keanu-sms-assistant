@@ -135,12 +135,20 @@ _DEFS = {
             "Look up or find a recipe. Use for both lookup ('show me the lamb barbacoa') and "
             "discovery ('find a carnitas recipe', 'suggest something with chicken'). "
             "Searches the local collection first; searches online sources for discovery requests "
-            "or when nothing is found locally. Returns recipe text or a link."
+            "or when nothing is found locally. Returns recipe text or a link. "
+            "Pass effort='low', 'medium', or 'high' when the user wants easy/low-effort or "
+            "complex recipes (e.g. 'something easy', 'low effort', 'nothing complicated', "
+            "'fast weeknight', or conversely 'I want a project recipe')."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Recipe name or search query"},
+                "name":   {"type": "string", "description": "Recipe name or search query"},
+                "effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Filter by weeknight effort level",
+                },
             },
             "required": ["name"],
         },
@@ -606,7 +614,7 @@ def _find_in_condiments(name: str) -> Optional[str]:
     return "\n".join(lines)
 
 
-def _tool_get_recipe(name: str, handle: str = "") -> str:
+def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) -> str:
     # First: check the meal plan for a URL
     plan_result = _find_in_meal_plan(name)
     if plan_result:
@@ -665,7 +673,7 @@ def _tool_get_recipe(name: str, handle: str = "") -> str:
         return condiment
 
     # Try direct file-based match first (no status filter — searches all recipes by file existence)
-    direct_matches = find_all_recipe_matches(name)
+    direct_matches = find_all_recipe_matches(name, effort=effort)
     if direct_matches:
         # Score by number of query words found in recipe name; surface top scorer unambiguously
         query_words = [w for w in name.lower().split() if len(w) > 2]
@@ -1252,7 +1260,7 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
         if name == "get_meal_plan":
             return _tool_get_meal_plan()
         if name == "get_recipe":
-            return _tool_get_recipe(inputs["name"], handle)
+            return _tool_get_recipe(inputs["name"], handle, effort=inputs.get("effort"))
         if name == "get_schedule":
             return _tool_get_schedule(inputs["person"], inputs.get("event_type", "any"))
         if name == "add_schedule_event":
