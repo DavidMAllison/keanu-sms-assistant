@@ -265,7 +265,8 @@ def _run_recipe_idea_from_image(image_path: str, mime_type: str, handle: str,
         return f"Couldn't read that image — try sending it again. ({e})"
 
     result = _call_menubuilder_tool("process_recipe_image", image_b64=image_b64,
-                                    mime_type=mime_type, source_note=caption)
+                                    mime_type=mime_type,
+                                    source_note=caption.replace('￼', '').strip())
     status = result.get("status")
 
     if status == "added":
