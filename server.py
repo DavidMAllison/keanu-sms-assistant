@@ -267,6 +267,7 @@ def _run_recipe_idea_from_image(image_path: str, mime_type: str, handle: str,
     result = _call_menubuilder_tool("process_recipe_image", image_b64=image_b64,
                                     mime_type=mime_type,
                                     source_note=caption.replace('￼', '').strip())
+    log.info(f"process_recipe_image result for {handle}: {result}")
     status = result.get("status")
 
     if status == "added":
