@@ -81,31 +81,15 @@ def load_context() -> str:
 
 
 def _load_current_meal_plan(today: date) -> Optional[str]:
-    """Load the active meal plan, plus the next upcoming plan if one exists."""
-    if not WEEKLYPLAN_DIR.exists():
-        return None
-
-    dated = []
-    for f in WEEKLYPLAN_DIR.glob("mealplan_*.txt"):
-        try:
-            file_date = date.fromisoformat(f.stem.replace("mealplan_", ""))
-            dated.append((file_date, f))
-        except ValueError:
-            continue
-    dated.sort(key=lambda x: x[0])
-
-    def read_plan(f):
-        return f.read_text()
-
-    current = next((f for d, f in reversed(dated) if d <= today), None)
-    upcoming = next((f for d, f in dated if d > today), None)
-
-    parts = []
-    if current:
-        parts.append(read_plan(current))
-    if upcoming:
-        parts.append(f"--- NEXT WEEK ---\n{read_plan(upcoming)}")
-    return "\n\n".join(parts) if parts else None
+    """Load the active meal plan via MenuBuilder MCP tool."""
+    try:
+        from menubuilder_bridge import call_menubuilder_tool
+        result = call_menubuilder_tool("get_current_plan", {})
+        if result.get("found"):
+            return result["formatted_text"]
+    except Exception:
+        pass
+    return None
 
 
 def _load_recipe_metadata_summary() -> Optional[str]:
@@ -450,21 +434,6 @@ def update_meal_plan(message: str) -> Optional[str]:
                 target_date = today + timedelta(days=days_ahead)
                 break
 
-    # Find current meal plan file
-    plan_files = sorted(WEEKLYPLAN_DIR.glob("mealplan_*.txt"), reverse=True)
-    plan_file = None
-    for f in plan_files:
-        try:
-            file_date = date.fromisoformat(f.stem.replace("mealplan_", ""))
-            if file_date <= today:
-                plan_file = f
-                break
-        except ValueError:
-            continue
-
-    if not plan_file:
-        return None
-
     # Extract new recipe name — text after "to", "for", "with"
     match = re.search(
         r"(?:change|swap|switch)\s+\w+\s+(?:to|for|with)\s+(.+)",
@@ -480,20 +449,16 @@ def update_meal_plan(message: str) -> Optional[str]:
 
     new_recipe = match.group(1).strip().rstrip(".")
 
-    # Update the matching line in the plan file
-    day_str = target_date.strftime("%-m/%-d")
-    lines = plan_file.read_text().splitlines()
-    updated = False
-    for i, line in enumerate(lines):
-        if day_str in line and "[" in line:
-            prefix = line.split(day_str)[0] + day_str
-            lines[i] = f"{prefix}  {new_recipe}"
-            updated = True
-            break
-
-    if updated:
-        plan_file.write_text("\n".join(lines))
-        return new_recipe
+    # Route through MCP — keeps write path in MenuBuilder, not here
+    try:
+        from menubuilder_bridge import call_menubuilder_tool
+        _WEEKDAY_TO_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        day_abbrev = _WEEKDAY_TO_ABBREV[target_date.weekday()]
+        result = call_menubuilder_tool("update_plan_meal", {"day": day_abbrev, "title": new_recipe})
+        if result.get("success"):
+            return new_recipe
+    except Exception:
+        pass
     return None
 
 
