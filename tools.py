@@ -514,7 +514,7 @@ def _tool_get_meal_plan() -> str:
 
 
 def _find_in_meal_plan(name: str) -> Optional[tuple]:
-    """Search the current week's meal plan for a meal matching name. Returns (meal_name, url) or None."""
+    """Search the current week's meal plan for a meal. Returns (meal_name, url) or None."""
     today = date.today()
     _DAY_ABBREVS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     _DAY_NAMES = {
@@ -522,9 +522,8 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
         "thursday": "Thu", "friday": "Fri", "saturday": "Sat", "sunday": "Sun",
     }
 
-    # Resolve temporal/day keywords to the 3-letter abbreviation used in meal plan lines
     name_lower = name.lower().strip()
-    day_prefix = None  # e.g. "Mon" — search by line prefix instead of keywords
+    day_prefix = None
     if any(w in name_lower for w in ("tonight", "today", "dinner")):
         day_prefix = _DAY_ABBREVS[today.weekday()]
     else:
@@ -533,43 +532,21 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
                 day_prefix = abbrev
                 break
 
-    plan_files = sorted(WEEKLYPLAN_DIR.glob("mealplan_*.txt"), reverse=True)
-    for pf in plan_files:
-        try:
-            week_start = date.fromisoformat(pf.stem.replace("mealplan_", ""))
-        except ValueError:
-            continue
-        if week_start > today:
-            continue
-        lines = pf.read_text().splitlines()
-
-        def _extract_url_and_name(i: int):
-            meal_name = lines[i].strip().split("[")[0].split("|")[0].strip()
-            meal_name = re.sub(r"^[A-Za-z]{3}\s+\d+/\d+\s+", "", meal_name).strip()
-            for j in range(i + 1, min(i + 3, len(lines))):
-                stripped = lines[j].strip()
-                if stripped.startswith("http"):
-                    return meal_name, stripped
-            return meal_name, None  # meal found but no URL line
-
-        if day_prefix:
-            # Match the line that starts with the day abbreviation
-            for i, line in enumerate(lines):
-                if line.strip().startswith(day_prefix):
-                    result = _extract_url_and_name(i)
-                    if result[0]:
-                        return result
-        else:
-            keywords = [w for w in name_lower.split() if len(w) > 3]
-            for i, line in enumerate(lines):
-                line_lower = line.lower()
-                if not keywords or sum(1 for k in keywords if k in line_lower) < max(1, len(keywords) // 2):
-                    continue
-                result = _extract_url_and_name(i)
-                if result[0]:
-                    return result
-                break
-        break  # Only check the most recent plan that doesn't start after today
+    try:
+        result = _call_menubuilder_tool("get_current_plan", {})
+        if not result.get("found"):
+            return None
+        for m in result.get("meals", []):
+            if day_prefix:
+                if m.get("day") == day_prefix:
+                    return m.get("title", ""), m.get("url") or None
+            else:
+                keywords = [w for w in name_lower.split() if len(w) > 3]
+                title_lower = m.get("title", "").lower()
+                if not keywords or sum(1 for k in keywords if k in title_lower) >= max(1, len(keywords) // 2):
+                    return m.get("title", ""), m.get("url") or None
+    except Exception:
+        pass
     return None
 
 
