@@ -84,7 +84,7 @@ def _load_current_meal_plan(today: date) -> Optional[str]:
     """Load the active meal plan via MenuBuilder MCP tool."""
     try:
         from menubuilder_bridge import call_menubuilder_tool
-        result = call_menubuilder_tool("get_current_plan", {})
+        result = call_menubuilder_tool("get_current_plan")
         if result.get("found"):
             return result["formatted_text"]
     except Exception:
@@ -454,7 +454,7 @@ def update_meal_plan(message: str) -> Optional[str]:
         from menubuilder_bridge import call_menubuilder_tool
         _WEEKDAY_TO_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         day_abbrev = _WEEKDAY_TO_ABBREV[target_date.weekday()]
-        result = call_menubuilder_tool("update_plan_meal", {"day": day_abbrev, "title": new_recipe})
+        result = call_menubuilder_tool("update_plan_meal", day=day_abbrev, title=new_recipe)
         if result.get("success"):
             return new_recipe
     except Exception:

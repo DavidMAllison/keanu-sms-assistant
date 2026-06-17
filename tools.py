@@ -533,7 +533,7 @@ def _find_in_meal_plan(name: str) -> Optional[tuple]:
                 break
 
     try:
-        result = _call_menubuilder_tool("get_current_plan", {})
+        result = _call_menubuilder_tool("get_current_plan")
         if not result.get("found"):
             return None
         for m in result.get("meals", []):
