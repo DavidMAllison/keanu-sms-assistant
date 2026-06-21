@@ -1166,7 +1166,8 @@ def _tool_swap_meal(day: str, outgoing: str, incoming: str,
     elif is_url:
         kwargs["incoming_url"] = incoming
     else:
-        kwargs["incoming_name"] = incoming
+        matches = find_all_recipe_matches(incoming)
+        kwargs["incoming_name"] = matches[0]["name"] if len(matches) == 1 else incoming
 
     orig = os.environ.get("HOME")
     os.environ["HOME"] = _DAVID_HOME
