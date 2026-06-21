@@ -14,10 +14,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from agents.menu_agent import (
-    FEEDBACK_CURRENT_FILE,
-    METADATA_FILE,
-)
 
 log = logging.getLogger(__name__)
 
@@ -105,28 +101,6 @@ def _format_meal_list(meals: list) -> str:
     return "\n".join(lines)
 
 
-# ── Metadata helpers ──────────────────────────────────────────────────────────
-
-def _load_metadata() -> dict:
-    if not METADATA_FILE.exists():
-        return {}
-    try:
-        return json.loads(METADATA_FILE.read_text()).get("recipes", {})
-    except Exception:
-        return {}
-
-
-def _find_recipe_key(name: str, recipes: dict) -> Optional[str]:
-    """Return the best-matching key in recipes dict, or None."""
-    name_lower = name.lower()
-    for key in recipes:
-        if key.lower() == name_lower:
-            return key
-    for key in recipes:
-        words = [w for w in key.lower().split() if len(w) > 3]
-        if len(words) >= 2 and sum(1 for w in words if w in name_lower) >= 2:
-            return key
-    return None
 
 
 
@@ -190,14 +164,11 @@ def handle_start(config: dict) -> str:
         week_start_str = _get_week_start().isoformat()
 
     # Partition meals missing feedback into first-cooks (prompt) vs known (skip silently)
-    metadata = _load_metadata()
     first_cook_missing = []
     for m in meals:
         if m.get("sms_feedback"):
             continue
-        key = _find_recipe_key(m["name"], metadata)
-        times_cooked = metadata[key].get("times_cooked", 0) if key else 0
-        if times_cooked == 0:
+        if m.get("times_cooked", 0) == 0:
             first_cook_missing.append(m)
         # Known meals with no feedback are silently skipped — no prompt needed
 
@@ -540,8 +511,6 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         # When all feedback is collected, signal done and handle first-cook detection
         if not queue:
             result = call_menubuilder_tool("log_meal_feedback", feedback="done")
-            if not DRY_RUN:
-                FEEDBACK_CURRENT_FILE.write_text(json.dumps({"entries": []}, indent=2))
             first_cooks = result.get("first_cook_meals", [])
             if first_cooks:
                 session["first_cook_queue"] = first_cooks
