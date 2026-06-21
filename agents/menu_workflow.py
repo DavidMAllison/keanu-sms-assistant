@@ -10,9 +10,6 @@ tool use to drive the conversation naturally.
 import json
 import logging
 import os
-import re
-import subprocess
-import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -28,7 +25,6 @@ DRY_RUN = False
 
 MENU_SESSION_FILE = Path("/Users/Shared/cooking/menu_session.json")
 OUTBOX_FILE = Path("/Users/Shared/sms-assistant/.outbox.json")
-MENUBUILDER_DIR = Path("/Users/davidallison/projects/personal/MenuBuilder")
 MENU_PENDING_FILE = Path("/Users/Shared/sms-assistant/menu_feedback_pending.json")
 
 DAYS_ORDER = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -88,27 +84,16 @@ def _send_outbox(handle: str, text: str):
     OUTBOX_FILE.write_text(json.dumps(outbox))
 
 
-def _get_partner_handle() -> str:
-    config_path = MENUBUILDER_DIR / "config.json"
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text()).get("partner_handle", "")
-        except Exception:
-            pass
-    return ""
-
-
-def _send_to_ashley(text: str):
+def _send_to_ashley(text: str, handle: str):
     """Send a message to Ashley via outbox and recreate PENDING_FILE so her reply is routed back."""
-    partner = _get_partner_handle()
-    if not partner:
-        log.error("No partner_handle in MenuBuilder config — cannot send to Ashley.")
+    if not handle:
+        log.error("No partner_handle in settings — cannot send to Ashley.")
         return
-    _send_outbox(partner, text)
+    _send_outbox(handle, text)
     if not DRY_RUN:
         MENU_PENDING_FILE.write_text(json.dumps({
             "sent_at": datetime.now().isoformat(),
-            "partner_handle": partner,
+            "partner_handle": handle,
         }))
 
 
@@ -143,195 +128,6 @@ def _find_recipe_key(name: str, recipes: dict) -> Optional[str]:
             return key
     return None
 
-
-# ── Meal suggestion / selection ───────────────────────────────────────────────
-
-_CANDIDATE_RE = re.compile(
-    r"^\s+- (.+?)(?:\s+\[(?:GRILL|NEW|KID-FRIENDLY|ADULT:[^\]]+)\])*\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+)"
-)
-
-
-def _run_suggest_meals(quick_days: list) -> list:
-    """
-    Run suggest_meals.py and return parsed candidates.
-    Each candidate: {name, cuisine, health, minutes, is_quick, meal_type}
-    """
-    cmd = [sys.executable, str(MENUBUILDER_DIR / "suggest_meals.py")]
-    if quick_days:
-        cmd += ["--quick", ",".join(d.lower() for d in quick_days)]
-
-    if DRY_RUN:
-        log.info(f"[DRY_RUN] Would run: {' '.join(cmd)}")
-        return []
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            log.error(f"suggest_meals.py stderr: {result.stderr.strip()}")
-            return []
-        return _parse_suggest_output(result.stdout)
-    except Exception as e:
-        log.error(f"Could not run suggest_meals.py: {e}")
-        return []
-
-
-def _parse_suggest_output(output: str) -> list:
-    candidates = []
-    current_section = ""
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("=== "):
-            current_section = stripped.upper()
-            continue
-        m = _CANDIDATE_RE.match(line)
-        if not m:
-            continue
-        name_raw = m.group(1).strip()
-        name = re.sub(r'\s*\[(?:GRILL|NEW|KID-FRIENDLY|ADULT:[^\]]+)\]\s*', '', name_raw).strip()
-        cuisine = m.group(2).strip()
-        health = m.group(3).strip()
-        time_str = m.group(4).strip()
-
-        is_slow = "slow" in time_str.lower()
-        minutes = 0 if is_slow else 999
-        if not is_slow:
-            mins_m = re.search(r'(\d+)\s*min', time_str)
-            if mins_m:
-                minutes = int(mins_m.group(1))
-
-        is_quick = minutes <= 35 or is_slow
-        is_weekend = "WEEKEND" in current_section
-
-        candidates.append({
-            "name": name,
-            "cuisine": cuisine,
-            "health": health,
-            "minutes": minutes,
-            "time_str": time_str,
-            "is_quick": is_quick,
-            "meal_type": "Weekend" if is_weekend else "Weeknight",
-        })
-    return candidates
-
-
-_PROTEIN_KEYWORDS = [
-    ("salmon", "Fish"), ("fish", "Fish"), ("shrimp", "Shrimp"), ("cod", "Fish"),
-    ("tilapia", "Fish"), ("pork", "Pork"), ("lamb", "Lamb"), ("beef", "Beef"),
-    ("chicken", "Chicken"), ("turkey", "Turkey"), ("tofu", "Vegetarian"),
-    ("chickpea", "Vegetarian"), ("mushroom", "Vegetarian"), ("lentil", "Vegetarian"),
-    ("bean", "Vegetarian"), ("vegetarian", "Vegetarian"),
-    ("pasta", "Pasta"), ("spaghetti", "Pasta"), ("noodle", "Pasta"),
-]
-
-
-def _get_protein(name: str) -> str:
-    lower = name.lower()
-    for keyword, label in _PROTEIN_KEYWORDS:
-        if keyword in lower:
-            return label
-    return "Other"
-
-
-def _parse_minutes(time_str: str) -> int:
-    """Parse a time string like '30 min' or '1 hr 15 min' into total minutes. Returns 0 if unparseable."""
-    import re
-    if not time_str:
-        return 0
-    hours = sum(int(m) for m in re.findall(r'(\d+)\s*hr', time_str))
-    mins  = sum(int(m) for m in re.findall(r'(\d+)\s*min', time_str))
-    return hours * 60 + mins
-
-
-def _select_meals(candidates: list, quick_days: list, cuisine_direction: Optional[str], metadata: dict) -> dict:
-    """
-    Select up to 7 meals for Sun–Sat.
-    Returns {day: recipe_name}.
-    """
-    # Add idea recipes matching cuisine direction as extra candidates
-    extra = []
-    if cuisine_direction and cuisine_direction.lower() not in ("what we've got", ""):
-        c_lower = cuisine_direction.lower()
-        for name, meta in metadata.items():
-            idea_cuisine = meta.get("cuisine_type", meta.get("cuisine", ""))
-            if meta.get("status") == "idea" and idea_cuisine.lower() in c_lower:
-                idea_minutes = _parse_minutes(meta.get("time", ""))
-                extra.append({
-                    "name": name,
-                    "cuisine": idea_cuisine,
-                    "health": meta.get("health_classification", meta.get("health", "Moderate")),
-                    "minutes": idea_minutes if idea_minutes else 30,
-                    "time_str": meta.get("time", "30 min"),
-                    "is_quick": idea_minutes <= 35 if idea_minutes else True,
-                    "meal_type": meta.get("meal_type", "Weeknight"),
-                })
-
-    # Prefer cuisine direction at front of pool
-    pool = list(candidates) + extra
-    if cuisine_direction and cuisine_direction.lower() not in ("what we've got", ""):
-        c_lower = cuisine_direction.lower()
-        pool.sort(key=lambda c: 0 if c.get("cuisine", "").lower() in c_lower else 1)
-
-
-    # Deduplicate by name
-    seen = set()
-    unique_pool = []
-    for c in pool:
-        if c["name"] not in seen:
-            seen.add(c["name"])
-            unique_pool.append(c)
-    pool = unique_pool
-
-    selected = {}
-    used_proteins = set()
-    heart_healthy_count = 0
-    indulgent_count = 0
-    quick_set = {d.lower() for d in quick_days}
-
-    def pick_for(days_subset, require_quick=False, require_weekend=False):
-        nonlocal heart_healthy_count, indulgent_count
-        for day in days_subset:
-            if day in selected:
-                continue
-            is_quick_day = day.lower() in quick_set or day[:3].lower() in quick_set
-            for c in pool:
-                if c["name"] in selected.values():
-                    continue
-                if require_quick and not c["is_quick"]:
-                    continue
-                if require_weekend and c["meal_type"] != "Weekend":
-                    continue
-                # Cap indulgent meals at 1 per week
-                if c["health"] == "Indulgent" and indulgent_count >= 1:
-                    continue
-                # Soft protein dedup — only enforce if we have room to be picky
-                protein = _get_protein(c["name"])
-                if protein in used_proteins and len(pool) > len(days_subset) * 2:
-                    continue
-                selected[day] = c["name"]
-                used_proteins.add(protein)
-                if c["health"] == "Heart-Healthy":
-                    heart_healthy_count += 1
-                if c["health"] == "Indulgent":
-                    indulgent_count += 1
-                break
-
-    # 1. Weekend slots from weekend candidates
-    pick_for(["Sat", "Sun"], require_weekend=True)
-
-    # 2. Explicitly quick nights (user-specified)
-    quick_abbrevs = [a for a in DAYS_ORDER if a.lower() in quick_set or a[:3].lower() in quick_set]
-    pick_for(quick_abbrevs, require_quick=True)
-
-    # 3. Fill weeknights with quick meals, weekends with anything
-    weeknights = [d for d in DAYS_ORDER if d not in ("Sat", "Sun")]
-    weekends = [d for d in DAYS_ORDER if d in ("Sat", "Sun")]
-    pick_for(weeknights, require_quick=True)
-    pick_for(weekends)
-
-    # 4. Safety fallback — fill any still-empty slots with no constraints
-    pick_for(DAYS_ORDER)
-
-    return selected
 
 
 def _format_numbered_list(selected: dict, week_start: date, quick_days: Optional[list] = None) -> str:
@@ -440,6 +236,7 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
     Delegates to MenuBuilder via bridge.
     """
     admin_handle = config["security"].get("menu_admin")
+    partner_handle = config["security"].get("partner_handle", "")
 
     # If we're mid URL-swap resolution, handle that first
     if session.get("pending_url_swap"):
@@ -463,21 +260,22 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
             _save_session(session)
             _send_to_ashley(
                 f"I already have something similar: \"{existing}\" ({score:.0%} match). "
-                f"Use that one, or add this new recipe?"
+                f"Use that one, or add this new recipe?",
+                partner_handle,
             )
             if admin_handle:
                 _send_outbox(admin_handle, f"Ashley sent a URL for {day} — similar recipe exists. Waiting on her choice.")
         elif status == "added":
             new_recipe = url_result["recipe"]
             if day and url_result.get("swapped_day"):
-                _send_to_ashley(f"Got it — swapped {day} to {new_recipe}.")
+                _send_to_ashley(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             elif day:
                 call_menubuilder_tool("swap_meal", day=day, reason="Ashley request", replacement=new_recipe)
-                _send_to_ashley(f"Got it — swapped {day} to {new_recipe}.")
+                _send_to_ashley(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             if admin_handle:
                 _send_outbox(admin_handle, f"Ashley's URL added as '{new_recipe}' and scheduled for {day}.")
         else:
-            _send_to_ashley("Couldn't fetch that recipe. Can you paste the name?")
+            _send_to_ashley("Couldn't fetch that recipe. Can you paste the name?", partner_handle)
             if admin_handle:
                 _send_outbox(admin_handle, f"Ashley sent an unfetchable URL: {url}")
         return
@@ -524,6 +322,7 @@ def _handle_pending_url_swap(text: str, session: dict, config: dict):
     Pending context is in session["pending_url_swap"].
     """
     admin_handle = config["security"].get("menu_admin")
+    partner_handle = config["security"].get("partner_handle", "")
     pending = session.get("pending_url_swap", {})
     url = pending.get("url", "")
     day = pending.get("day", "")
@@ -533,12 +332,12 @@ def _handle_pending_url_swap(text: str, session: dict, config: dict):
     if any(w in lower for w in ("new", "add", "different", "that one", "yes", "yeah", "yep")):
         result = call_menubuilder_tool("process_recipe_url", url=url, day=day, force_add=True)
         new_recipe = result.get("recipe", url)
-        _send_to_ashley(f"Added and swapped {day} to {new_recipe}.")
+        _send_to_ashley(f"Added and swapped {day} to {new_recipe}.", partner_handle)
         if admin_handle:
             _send_outbox(admin_handle, f"Ashley chose to add new recipe '{new_recipe}' for {day}.")
     else:
         call_menubuilder_tool("swap_meal", day=day, reason="Ashley request", replacement=existing)
-        _send_to_ashley(f"Got it — using {existing} for {day}.")
+        _send_to_ashley(f"Got it — using {existing} for {day}.", partner_handle)
         if admin_handle:
             _send_outbox(admin_handle, f"Ashley chose existing recipe '{existing}' for {day}.")
 
@@ -682,6 +481,13 @@ def _build_menu_tools() -> list:
                             "If David asks to look at new ideas, pass 'prefer ideas'."
                         ),
                     },
+                    "replacement": {
+                        "type": "string",
+                        "description": (
+                            "Exact recipe name if David names a specific recipe. "
+                            "Leave empty to let the system auto-pick based on the reason."
+                        ),
+                    },
                 },
                 "required": ["day", "reason"],
             },
@@ -753,7 +559,8 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
     if tool_name == "record_schedule_note":
         note = tool_input.get("note", "")
         notes = session.get("schedule_notes", [])
-        notes.append(note)
+        if note not in notes:
+            notes.append(note)
         session["schedule_notes"] = notes
         _save_session(session)
         log.info(f"Schedule note recorded: {note}")
@@ -763,59 +570,37 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         cuisine_direction = tool_input.get("cuisine_direction", "")
         session["cuisine_direction"] = cuisine_direction
 
-        # Derive quick days from all accumulated schedule notes
-        quick_days = []
-        quick_signals = ("game", "practice", "busy", "quick", "early", "tournament")
-        for note in session.get("schedule_notes", []):
-            note_lower = note.lower()
-            if any(s in note_lower for s in quick_signals):
-                for day_name, abbrev in DAY_NAME_MAP.items():
-                    if day_name in note_lower and abbrev not in quick_days:
-                        quick_days.append(abbrev)
-        session["quick_days"] = quick_days
+        constraints = "; ".join(session.get("schedule_notes", []))
 
-        candidates = _run_suggest_meals(quick_days)
-
-        # Fall back to metadata if subprocess failed
-        if not candidates:
-            metadata = _load_metadata()
-            for name, meta in metadata.items():
-                if meta.get("status") == "active":
-                    candidates.append({
-                        "name": name,
-                        "cuisine": meta.get("cuisine", ""),
-                        "health": meta.get("health", "Moderate"),
-                        "minutes": 30,
-                        "time_str": meta.get("time", "30 min"),
-                        "is_quick": True,
-                        "meal_type": meta.get("meal_type", "Weeknight"),
-                    })
-
-        metadata = _load_metadata()
-        selected = _select_meals(candidates, quick_days, cuisine_direction, metadata)
-        session["selected_meals"] = selected
-        session["state"] = "awaiting_meal_approval"
-
-        # Sync selected meals into MenuBuilder's activity file
-        call_menubuilder_tool(
-            "advance_to_meal_approval",
-            selected_meals=selected,
-            quick_days=quick_days,
-            schedule_notes=session.get("schedule_notes", []),
+        result = call_menubuilder_tool(
+            "get_meal_suggestions",
             cuisine_direction=cuisine_direction,
+            constraints=constraints,
         )
 
+        if "error" in result:
+            return f"Couldn't generate a plan: {result['error']}"
+
+        selected = result.get("selected_meals", {})
+        quick_days = result.get("quick_days", [])
+        session["selected_meals"] = selected
+        session["quick_days"] = quick_days
+        session["state"] = "awaiting_meal_approval"
         _save_session(session)
-        week_start = date.fromisoformat(session["week_start"])
-        return _format_numbered_list(selected, week_start, quick_days)
+
+        # MCP already wrote to activity — no advance_to_meal_approval needed
+        ws = date.fromisoformat(session.get("week_start", date.today().isoformat()))
+        return _format_numbered_list(selected, ws)
 
     if tool_name == "swap_meal":
         day = tool_input.get("day", "")
         reason = tool_input.get("reason", "")
+        replacement = tool_input.get("replacement", "")
         result = call_menubuilder_tool(
             "swap_meal",
             day=day,
             reason=reason,
+            replacement=replacement,
             cuisine_direction=session.get("cuisine_direction", ""),
         )
         new_state = result.get("state", session.get("state"))
@@ -892,6 +677,7 @@ def _build_menu_system_prompt(session: dict) -> str:
         "2. Ask about schedule changes this week (record_schedule_note for any constraints).\n"
         "3. Ask for cuisine direction, then call generate_meal_plan.\n"
         "4. Show the list. Refine with swap_meal if David requests changes.\n"
+        "   IMPORTANT: if David says 'lock in', 'keep', 'yes', or 'looks good' for a specific day without naming a new recipe — just confirm it verbally. Do NOT call swap_meal.\n"
         "5. Call approve_menu when David is happy with the plan.\n"
         "\nThis is SMS — keep replies short. One question per message.\n"
         "David may step away and return hours later. If there's conversation history, "
@@ -962,6 +748,7 @@ def menu_agent_reply(text: str, session: dict, config: dict) -> str:
                 max_tokens=500,
                 system=system,
                 tools=tools,
+                tool_choice={"type": "auto", "disable_parallel_tool_use": True},
                 messages=messages,
             )
 
