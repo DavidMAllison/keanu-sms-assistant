@@ -490,6 +490,23 @@ _DEFS = {
             "required": ["image_b64"],
         },
     },
+    "set_recipe_image": {
+        "name": "set_recipe_image",
+        "description": (
+            "Update the image for an existing recipe using a user-submitted photo. "
+            "Call this when the user sends a photo captioned 'photo of [meal name]'. "
+            "Fuzzy-matches recipe_name and saves the photo to the collection."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recipe_name": {"type": "string", "description": "Recipe name from the caption"},
+                "image_b64":   {"type": "string", "description": "Base64-encoded image bytes"},
+                "mime_type":   {"type": "string", "description": "MIME type (default: image/jpeg)"},
+            },
+            "required": ["recipe_name", "image_b64"],
+        },
+    },
 }
 
 
@@ -501,7 +518,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
              "get_prep_guide", "check_inventory", "get_lunch_pick", "set_lunch_pick", "log_lunch_feedback"]
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal",
-                  "process_recipe_url", "process_recipe_image"]
+                  "process_recipe_url", "process_recipe_image", "set_recipe_image"]
     if is_admin:
         names += ["update_meal_plan", "update_inventory"]
     return [_DEFS[n] for n in names]
@@ -1302,6 +1319,25 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
                 _pending_image_recipe.pop(handle, None)
                 return f"Added '{result['recipe']}' ({result.get('health', '')}) to the collection."
             return f"Couldn't add it: {result.get('error', 'unknown')}"
+        elif name == "set_recipe_image":
+            pending = _pending_image_recipe.get(handle, {})
+            image_b64 = inputs.get("image_b64", "")
+            if not image_b64 and pending.get("image_path"):
+                image_b64 = base64.standard_b64encode(
+                    Path(pending["image_path"]).read_bytes()
+                ).decode("utf-8")
+            result = _call_menubuilder_tool("set_recipe_image",
+                                            recipe_name=inputs["recipe_name"],
+                                            image_b64=image_b64,
+                                            mime_type=inputs.get("mime_type", "image/jpeg"))
+            if result.get("status") == "updated":
+                return f"Got it — saved your photo as the image for {result['recipe']}."
+            elif result.get("status") == "ambiguous":
+                candidates = result.get("candidates", [])
+                return f"Not sure which recipe — did you mean: {', '.join(candidates)}? Try 'photo of [exact name]'."
+            elif result.get("status") == "not_found":
+                return f"Couldn't find a recipe called '{inputs['recipe_name']}'. Check the name and try again."
+            return f"Something went wrong: {result.get('error', 'unknown')}"
         return f"Unknown tool: {name}"
     except Exception as e:
         log.error(f"Tool error ({name}): {e}")
