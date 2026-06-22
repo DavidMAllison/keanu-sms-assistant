@@ -288,6 +288,30 @@ def _run_recipe_idea_from_image(image_path: str, mime_type: str, handle: str,
     return "Couldn't read that recipe — try a clearer photo."
 
 
+def _run_set_recipe_image(image_path: str, mime_type: str, handle: str,
+                          recipe_name: str) -> str:
+    try:
+        image_b64 = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
+    except Exception as e:
+        return f"Couldn't read that photo — try sending it again. ({e})"
+
+    result = _call_menubuilder_tool("set_recipe_image",
+                                    recipe_name=recipe_name,
+                                    image_b64=image_b64,
+                                    mime_type=mime_type)
+    Path(image_path).unlink(missing_ok=True)
+
+    if result.get("status") == "updated":
+        return f"Got it — saved your photo as the image for {result['recipe']}."
+    elif result.get("status") == "ambiguous":
+        candidates = result.get("candidates", [])
+        return f"Not sure which recipe — did you mean: {', '.join(candidates)}? Try 'photo of [exact name]'."
+    elif result.get("status") == "not_found":
+        return f"Couldn't find a recipe called '{recipe_name}'. Check the name and try again."
+    else:
+        return f"Something went wrong saving that photo: {result.get('error', 'unknown error')}"
+
+
 def _vision_is_receipt(image_path: str, mime_type: str) -> bool:
     """Ask Claude Haiku whether the image is a grocery receipt. Returns True/False."""
     try:
@@ -341,6 +365,15 @@ def route_image_message(attachments: list, text: str, handle: str,
 
     file_path, mime_type = prepared
     image_path = str(file_path)
+
+    # Path -1 — "photo of [X]" → update image on an existing recipe
+    _photo_match = re.match(r'photo\s+of\s+(.+)', text.strip(), re.IGNORECASE) if text else None
+    if _photo_match:
+        recipe_name = _photo_match.group(1).strip()
+        log.info(f"Path -1: recipe photo update for '{recipe_name}' from {handle}")
+        reply = _run_set_recipe_image(image_path, mime_type, handle, recipe_name)
+        send_imessage(handle, reply)
+        return None
 
     # Path 0 — caption indicates a recipe idea save request
     if _is_recipe_idea_caption(text):
