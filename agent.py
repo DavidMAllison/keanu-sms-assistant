@@ -120,6 +120,7 @@ def get_reply(handle: str, text: str, config: dict) -> str:
     messages = [m for m in history if isinstance(m.get("content"), str) and m["content"].strip()]
 
     try:
+        seen_tool_results: dict = {}
         for _ in range(MAX_TOOL_ROUNDS):
             response = _client.messages.create(
                 model=model,
@@ -135,6 +136,12 @@ def get_reply(handle: str, text: str, config: dict) -> str:
                     if block.type == "tool_use":
                         result = execute_tool(block.name, block.input, handle, config)
                         log.info(f"Tool {block.name} -> {result[:80]}")
+                        result_key = result[:80]
+                        if seen_tool_results.get(block.name) == result_key:
+                            log.warning(f"Stuck loop on {block.name} for {handle}, resetting context")
+                            _conversation_history[handle] = []
+                            return "My brain got a bit scrambled there — I've reset. What did you want to know?"
+                        seen_tool_results[block.name] = result_key
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
