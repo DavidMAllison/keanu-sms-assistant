@@ -99,11 +99,12 @@ def _load_recipe_metadata_summary() -> Optional[str]:
 
     try:
         data = json.loads(METADATA_FILE.read_text())
+        data = data.get("recipes", data)
         lines = []
         for name, meta in data.items():
             if isinstance(meta, dict) and meta.get("status") == "active":
-                cuisine = meta.get("cuisine_type", "")
-                timing = meta.get("meal_timing", "")
+                cuisine = meta.get("cuisine", "")
+                timing = meta.get("meal_type", "")
                 lines.append(f"- {name} ({cuisine}, {timing})")
         return "\n".join(lines) if lines else None
     except (json.JSONDecodeError, Exception):
@@ -415,10 +416,11 @@ def is_menu_change(message: str) -> bool:
     ))
 
 
-def update_meal_plan(message: str) -> Optional[str]:
+def update_meal_plan(message: str) -> Optional[dict]:
     """
-    Parse a menu change request and update the meal plan file.
-    Returns the new recipe name on success, None on failure.
+    Parse a menu change request and call the MenuBuilder MCP.
+    Returns the raw MCP result dict, or None if the message couldn't be parsed.
+    Callers must handle {"status": "needs_confirmation"} and {"success": True/False}.
     """
     today = date.today()
     lowered = message.lower()
@@ -454,12 +456,9 @@ def update_meal_plan(message: str) -> Optional[str]:
         from menubuilder_bridge import call_menubuilder_tool
         _WEEKDAY_TO_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         day_abbrev = _WEEKDAY_TO_ABBREV[target_date.weekday()]
-        result = call_menubuilder_tool("update_plan_meal", day=day_abbrev, title=new_recipe)
-        if result.get("success"):
-            return new_recipe
+        return call_menubuilder_tool("update_plan_meal", day=day_abbrev, title=new_recipe)
     except Exception:
-        pass
-    return None
+        return None
 
 
 # ── Family preferences ───────────────────────────────────────────────────────

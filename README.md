@@ -95,6 +95,10 @@ config/
 evals/
   dataset.json             # Eval test cases (fake handles only — no real numbers)
   runner.py                # Eval harness
+tests/
+  test_menu_workflow.py    # Unit tests for menu workflow routing and state (no API calls)
+  test_tools_update.py     # Unit tests for update_meal_plan confirmation flow
+  mb_fixtures.py           # Shared fixtures — placeholder handles only
 ```
 
 ## Data files (not in repo)

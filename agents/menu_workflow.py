@@ -10,6 +10,7 @@ tool use to drive the conversation naturally.
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,46 @@ DAY_NAME_MAP = {
 }
 
 _MENU_SYSTEM = (Path(__file__).parent.parent / "system_prompts/menu.txt").read_text()
+
+MONTH_MAP = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+    "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def _parse_week_start(for_week_str: str) -> str:
+    """Convert a human week string ('next week', 'July 6', etc.) to a Monday ISO date."""
+    if not for_week_str:
+        return ""
+    lower = for_week_str.lower().strip()
+    lower = re.sub(r'^(for|the week of)\s+', '', lower).strip()
+    if "next week" in lower:
+        return _get_week_start().isoformat()
+    m = re.search(r'\b([a-z]+)\s+(\d+)\b', lower)
+    if m:
+        month = MONTH_MAP.get(m.group(1))
+        if month:
+            try:
+                d = date(date.today().year, month, int(m.group(2)))
+                monday = d - timedelta(days=d.weekday())
+                return monday.isoformat()
+            except ValueError:
+                pass
+    return ""
+
+
+def _format_week_label(week_start_str: str) -> str:
+    """Return 'Jul 7–13' from a Monday ISO date string."""
+    try:
+        ws = date.fromisoformat(week_start_str)
+        end = ws + timedelta(days=6)
+        if ws.month == end.month:
+            return f"{ws.strftime('%b')} {ws.day}–{end.day}"
+        return f"{ws.strftime('%b %-d')}–{end.strftime('%b %-d')}"
+    except Exception:
+        return week_start_str
 
 
 # ── Session I/O ───────────────────────────────────────────────────────────────
@@ -80,17 +121,23 @@ def _send_outbox(handle: str, text: str):
     OUTBOX_FILE.write_text(json.dumps(outbox))
 
 
+def _recreate_pending_file(handle: str):
+    """Recreate PENDING_FILE so Ashley's next reply is routed back to signoff capture."""
+    if DRY_RUN or not handle:
+        return
+    MENU_PENDING_FILE.write_text(json.dumps({
+        "sent_at": datetime.now().isoformat(),
+        "partner_handle": handle,
+    }))
+
+
 def _send_to_ashley(text: str, handle: str):
     """Send a message to Ashley via outbox and recreate PENDING_FILE so her reply is routed back."""
     if not handle:
         log.error("No partner_handle in settings — cannot send to Ashley.")
         return
     _send_outbox(handle, text)
-    if not DRY_RUN:
-        MENU_PENDING_FILE.write_text(json.dumps({
-            "sent_at": datetime.now().isoformat(),
-            "partner_handle": handle,
-        }))
+    _recreate_pending_file(handle)
 
 
 def _format_meal_list(meals: list) -> str:
@@ -104,10 +151,17 @@ def _format_meal_list(meals: list) -> str:
 
 
 
+def _day_label(val) -> str:
+    """Normalize a selected_meals value (str or list) to a display string."""
+    if isinstance(val, list):
+        return " + ".join(str(v) for v in val if v)
+    return str(val)
+
+
 def _format_numbered_list(selected: dict, week_start: date, quick_days: Optional[list] = None) -> str:
     """Format selected meals as compact Sun-Sat list for SMS approval."""
     ordered = [(day, selected[day]) for day in DAYS_ORDER if day in selected]
-    lines = [f"{day}: {name}" for day, name in ordered]
+    lines = [f"{day}: {_day_label(name)}" for day, name in ordered]
     return "\n".join(lines)
 
 
@@ -145,9 +199,11 @@ def _get_week_start() -> date:
 
 # ── handle_start ──────────────────────────────────────────────────────────────
 
-def handle_start(config: dict) -> str:
-    """idle → active. Calls MB bridge for last week's meals, seeds conversation history."""
-    result = call_menubuilder_tool("start_menu_workflow")
+def handle_start(config: dict, for_week_str: str = "") -> str:
+    """idle → awaiting_week_confirmation. Calls MB bridge, shows which week is being planned."""
+    week_start_iso = _parse_week_start(for_week_str)
+    kwargs = {"week_start": week_start_iso} if week_start_iso else {}
+    result = call_menubuilder_tool("start_menu_workflow", **kwargs)
     if "error" in result:
         return "Sorry, couldn't start the menu workflow. Check the logs."
 
@@ -161,16 +217,15 @@ def handle_start(config: dict) -> str:
             ws = ws + timedelta(days=(7 - ws.weekday()) % 7)
         week_start_str = ws.isoformat()
     except (ValueError, TypeError):
-        week_start_str = _get_week_start().isoformat()
+        week_start_str = week_start_iso or _get_week_start().isoformat()
+
+    week_label = result.get("week_label") or _format_week_label(week_start_str)
 
     # Partition meals missing feedback into first-cooks (prompt) vs known (skip silently)
-    first_cook_missing = []
-    for m in meals:
-        if m.get("sms_feedback"):
-            continue
-        if m.get("times_cooked", 0) == 0:
-            first_cook_missing.append(m)
-        # Known meals with no feedback are silently skipped — no prompt needed
+    first_cook_missing = [
+        m for m in meals
+        if not m.get("sms_feedback") and m.get("times_cooked", 0) == 0
+    ]
 
     session = _load_session()
     session["last_week_meals"] = meals
@@ -178,18 +233,11 @@ def handle_start(config: dict) -> str:
     session["schedule_notes"] = []
     session["quick_days"] = []
     session["selected_meals"] = {}
+    session["state"] = "awaiting_week_confirmation"
+    session["feedback_queue"] = [m["name"] for m in first_cook_missing]
 
-    if not first_cook_missing:
-        session["state"] = "awaiting_schedule"
-        reply = "Let's make this week's menu.\n\nAny schedule changes this week?"
-    else:
-        session["state"] = "awaiting_meal_logging"
-        session["feedback_queue"] = [m["name"] for m in first_cook_missing]
-        first = first_cook_missing[0]["name"]
-        reply = f"Let's make this week's menu.\n\nHow did {first} go?"
+    reply = f"Let's plan the week of {week_label}.\n\nDoes that sound right? (Or say a different week to switch.)"
 
-    # Seed conversation history with opening exchange so Claude has context
-    # on the first reply. Uses a placeholder user turn so history starts correctly.
     session["conversation"] = [
         {"role": "user", "content": "[Menu build started]"},
         {"role": "assistant", "content": reply},
@@ -197,6 +245,111 @@ def handle_start(config: dict) -> str:
 
     _save_session(session)
     return reply
+
+
+# ── _handle_week_confirmation ─────────────────────────────────────────────────
+
+_CHANGE_WEEK_KEYWORDS = ("next week", "different", "change", "actually", "instead", "no,", "nope", "wrong")
+
+def _handle_week_confirmation(text: str, session: dict, config: dict) -> str:
+    """
+    awaiting_week_confirmation state handler.
+    Re-confirms if user specifies a different week; otherwise advances to first prompt.
+    Always re-calls handle_start on any week-change intent (per 'always confirm the dates').
+    """
+    lower = text.lower()
+    has_month = bool(re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+', lower))
+
+    if has_month or any(k in lower for k in _CHANGE_WEEK_KEYWORDS):
+        return handle_start(config, for_week_str=text)
+
+    # Confirmed — advance to first real prompt
+    queue = session.get("feedback_queue", [])
+    if queue:
+        session["state"] = "awaiting_meal_logging"
+        reply = f"How did {queue[0]} go?"
+    else:
+        session["state"] = "awaiting_schedule"
+        reply = "Any schedule changes this week?"
+
+    now_str = datetime.now().strftime("%A, %B %-d at %-I:%M %p")
+    conversation = session.get("conversation", [])
+    conversation.append({"role": "user", "content": f"[{now_str}] {text}"})
+    conversation.append({"role": "assistant", "content": reply})
+    session["conversation"] = conversation
+    _save_session(session)
+    return reply
+
+
+# ── _handle_needs_confirmation ────────────────────────────────────────────────
+
+def _handle_needs_confirmation(
+    result: dict,
+    tool_name: str,
+    args: dict,
+    session: dict,
+) -> Optional[str]:
+    """
+    Check a MenuBuilder MCP result for needs_confirmation.
+    If present: saves pending operation to session and returns the message to send.
+    Returns None if no confirmation is needed (caller continues normally).
+    """
+    if result.get("status") != "needs_confirmation":
+        return None
+    session["pending_confirmation"] = {"tool": tool_name, "args": args}
+    session["pending_suggested"] = result["suggested"]
+    session["pre_confirmation_state"] = session.get("state")
+    session["state"] = "awaiting_recipe_confirmation"
+    _save_session(session)
+    return result.get("message", f"Did you mean '{result['suggested']}'?")
+
+
+# ── _handle_recipe_confirmation ───────────────────────────────────────────────
+
+_CONFIRM_WORDS = ("yes", "yeah", "yep", "yup", "that's it", "correct", "ok", "okay")
+
+def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
+    """
+    awaiting_recipe_confirmation state handler.
+    'yes' → re-calls original tool with suggested name.
+    Anything else → restores previous state and asks for re-entry.
+    """
+    lower = text.lower().strip()
+    pending = session.get("pending_confirmation", {})
+    suggested = session.get("pending_suggested", "")
+    prev_state = session.get("pre_confirmation_state", "awaiting_meal_approval")
+
+    def _clear_pending():
+        session.pop("pending_confirmation", None)
+        session.pop("pending_suggested", None)
+        session.pop("pre_confirmation_state", None)
+
+    if any(w in lower for w in _CONFIRM_WORDS):
+        tool_name = pending.get("tool", "swap_meal")
+        args = dict(pending.get("args", {}))
+        args["replacement"] = suggested
+        result = call_menubuilder_tool(tool_name, **args)
+        _clear_pending()
+
+        new_state = result.get("state", prev_state)
+        _sync_session_state(new_state)
+        session["state"] = new_state
+        updated = result.get("selected_meals")
+        if updated:
+            session["selected_meals"] = updated
+        _save_session(session)
+
+        week_start = date.fromisoformat(session.get("week_start", date.today().isoformat()))
+        plan = _format_numbered_list(
+            session.get("selected_meals", {}), week_start, session.get("quick_days", [])
+        )
+        note = result.get("note", "")
+        return f"{note}\n\n{plan}".strip() if note else plan
+    else:
+        session["state"] = prev_state
+        _clear_pending()
+        _save_session(session)
+        return "What's the recipe name?"
 
 
 # ── handle_ashley_reply ───────────────────────────────────────────────────────
@@ -252,7 +405,8 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
         return
 
     new_state = result.get("state", "")
-    _sync_session_state(new_state)
+    if new_state:
+        _sync_session_state(new_state)
 
     if new_state == "complete":
         if admin_handle:
@@ -277,9 +431,15 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
                 _save_session(session)
                 _send_outbox(admin_handle, f"I don't have a source URL for '{name}'. What's the URL?")
     elif new_state == "awaiting_ashley_signoff":
-        # Ashley requested a change — MenuBuilder re-sent the updated menu
-        if admin_handle:
-            _send_outbox(admin_handle, f"Ashley requested a change: '{text}'. Updated and re-sent.")
+        if result.get("parsed") is False:
+            # Unparseable reply — nothing was changed or re-sent
+            _recreate_pending_file(partner_handle)
+            if admin_handle:
+                _send_outbox(admin_handle, f"Couldn't parse Ashley's reply: '{text}'. Handle manually.")
+        else:
+            # Ashley requested a change — MenuBuilder re-sent the updated menu
+            if admin_handle:
+                _send_outbox(admin_handle, f"Ashley requested a change: '{text}'. Updated and re-sent.")
     else:
         if admin_handle:
             _send_outbox(admin_handle, f"Ashley replied but something went wrong. Handle manually: '{text}'")
@@ -453,9 +613,13 @@ def _build_menu_tools() -> list:
                         ),
                     },
                     "replacement": {
-                        "type": "string",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
                         "description": (
                             "Exact recipe name if David names a specific recipe. "
+                            "Pass a list of two names to assign two recipes to one night (e.g. tonight's double). "
                             "Leave empty to let the system auto-pick based on the reason."
                         ),
                     },
@@ -565,13 +729,21 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         day = tool_input.get("day", "")
         reason = tool_input.get("reason", "")
         replacement = tool_input.get("replacement", "")
+        cuisine_direction = session.get("cuisine_direction", "")
         result = call_menubuilder_tool(
             "swap_meal",
             day=day,
             reason=reason,
             replacement=replacement,
-            cuisine_direction=session.get("cuisine_direction", ""),
+            cuisine_direction=cuisine_direction,
         )
+        confirm_msg = _handle_needs_confirmation(
+            result, "swap_meal",
+            {"day": day, "reason": reason, "replacement": replacement, "cuisine_direction": cuisine_direction},
+            session,
+        )
+        if confirm_msg is not None:
+            return confirm_msg
         new_state = result.get("state", session.get("state"))
         _sync_session_state(new_state)
         session["state"] = new_state
@@ -647,6 +819,7 @@ def _build_menu_system_prompt(session: dict) -> str:
         "3. Ask for cuisine direction, then call generate_meal_plan.\n"
         "4. Show the list. Refine with swap_meal if David requests changes.\n"
         "   IMPORTANT: if David says 'lock in', 'keep', 'yes', or 'looks good' for a specific day without naming a new recipe — just confirm it verbally. Do NOT call swap_meal.\n"
+        "   A day can hold two recipes — pass replacement as a list: [\"Recipe A\", \"Recipe B\"]. Both flow through to the shopping list.\n"
         "5. Call approve_menu when David is happy with the plan.\n"
         "\nThis is SMS — keep replies short. One question per message.\n"
         "David may step away and return hours later. If there's conversation history, "
@@ -672,6 +845,14 @@ def menu_agent_reply(text: str, session: dict, config: dict) -> str:
     # Hold/pause — acknowledge and exit without advancing state
     if any(p in text.lower() for p in ("hold", "pause", "not now", "later", "stop for now")):
         return "Got it — pick it up whenever you're ready."
+
+    # Week confirmation — bypass agent entirely
+    if state == "awaiting_week_confirmation":
+        return _handle_week_confirmation(text, session, config)
+
+    # Recipe fuzzy-match confirmation — bypass agent entirely
+    if state == "awaiting_recipe_confirmation":
+        return _handle_recipe_confirmation(text, session, config)
 
     # Paste-based idea activation — doesn't fit agent model
     if state == "awaiting_idea_content":
