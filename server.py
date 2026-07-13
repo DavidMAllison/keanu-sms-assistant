@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -455,6 +456,16 @@ def is_menu_start(text: str) -> bool:
     return any(p in text.lower() for p in (
         "start menu", "menu time", "do the menu", "weekly menu", "start the menu",
     ))
+
+
+def _parse_for_week(text: str) -> str:
+    """Extract a trailing week specifier from a menu-start trigger, e.g. 'for July 6'."""
+    import re as _re
+    m = _re.search(
+        r'\bfor\s+(next week|the week of\s+\w+(?:\s+\d+)?|\w+ \d+)',
+        text, _re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
 
 # ── iMessage send ──────────────────────────────────────────────────────────────
 # send_imessage and send_imessage_group imported from tools
@@ -935,7 +946,8 @@ def main():
                 # Menu workflow — admin only
                 menu_admin = config["security"].get("menu_admin")
                 if handle == menu_admin and is_menu_start(text):
-                    reply = menu_workflow.handle_start(config)
+                    for_week_str = _parse_for_week(text)
+                    reply = menu_workflow.handle_start(config, for_week_str=for_week_str)
                     send_imessage(handle, reply)
                     continue
 

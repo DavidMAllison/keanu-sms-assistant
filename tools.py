@@ -205,13 +205,20 @@ _DEFS = {
     },
     "update_meal_plan": {
         "name": "update_meal_plan",
-        "description": "Change a meal in the weekly plan. Admin only.",
+        "description": (
+            "Change a meal in the weekly plan. Admin only. "
+            "If this tool returns a confirmation prompt and the user says yes, "
+            "re-call with instruction like 'change [day] to [exact confirmed name]'."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "instruction": {
                     "type": "string",
-                    "description": "Natural language, e.g. 'change Thursday to chicken tacos'",
+                    "description": (
+                        "Natural language, e.g. 'change Thursday to chicken tacos'. "
+                        "When confirming a fuzzy match, use the exact name from the previous response."
+                    ),
                 },
             },
             "required": ["instruction"],
@@ -858,7 +865,17 @@ def _tool_save_recipe_idea(content: str) -> str:
 
 def _tool_update_meal_plan(instruction: str) -> str:
     result = _update_plan(instruction)
-    return f"Updated: {result}" if result else "Couldn't parse that — try 'change Thursday to chicken tacos'."
+    if result is None:
+        return "Couldn't parse that — try 'change Thursday to chicken tacos'."
+    if result.get("status") == "needs_confirmation":
+        suggested = result["suggested"]
+        return (
+            f"I found '{suggested}' — did you mean that? "
+            "Reply yes to confirm, or give me the exact name."
+        )
+    if result.get("success"):
+        return f"Updated: {result['title']}"
+    return f"Couldn't update: {result.get('error', 'unknown error')}"
 
 
 def _tool_log_feedback(recipe: str, feedback: str, sentiment: str, handle: str) -> str:
