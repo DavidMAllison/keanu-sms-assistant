@@ -50,7 +50,7 @@ def call_receipt_parser(image_path: str) -> dict:
         log.error("GroceryAgent receipt_parser timed out after 60s")
         return {"error": "receipt_parser timed out"}
     except json.JSONDecodeError as e:
-        log.error(f"GroceryAgent receipt_parser returned invalid JSON: {e}")
+        log.error(f"GroceryAgent receipt_parser returned invalid JSON: {e}\n  raw={raw!r}")
         return {"error": f"invalid JSON from receipt_parser: {e}"}
     except Exception as e:
         log.error(f"GroceryAgent bridge error: {e}")
