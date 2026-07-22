@@ -44,7 +44,14 @@ def call_menubuilder_tool(tool_name: str, **kwargs) -> dict:
         if r.returncode != 0:
             log.error(f"MenuBuilder tool {tool_name} failed: {r.stderr.strip()}")
             return {"error": r.stderr.strip()}
-        return json.loads(r.stdout.strip())
+        try:
+            return json.loads(r.stdout.strip())
+        except json.JSONDecodeError as e:
+            log.error(
+                f"MenuBuilder tool {tool_name} returned non-JSON stdout: {e}\n"
+                f"  stdout={r.stdout!r}\n  stderr={r.stderr!r}"
+            )
+            return {"error": f"invalid JSON from MenuBuilder tool {tool_name}: {e}"}
     except Exception as e:
         log.error(f"MenuBuilder bridge error ({tool_name}): {e}")
         return {"error": str(e)}

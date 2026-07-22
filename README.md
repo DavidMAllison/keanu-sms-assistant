@@ -53,7 +53,12 @@ The code lives in `/Users/Shared/sms-assistant/` so both accounts can read and w
 
 - macOS with iMessage
 - A dedicated Apple ID for the bot (e.g. `mybot@icloud.com`) logged into iMessage on the bot account
-- Python 3.11+ installed on the bot account (via Homebrew: `brew install python@3.11`)
+- Python 3.9 (macOS Command Line Tools default — `python3 --version` should show 3.9.x).
+  sms-assistant intentionally runs on the CLT Python; MenuBuilder and GroceryAgent each
+  run in their own newer venv (3.12) and are called via subprocess bridges
+  (`menubuilder_bridge.py`, `groceryagent_bridge.py`) rather than imported directly —
+  see those files for why. Don't "fix" this by installing Python 3.11 on the bot
+  account; it won't be used unless `start.sh` is also repointed to it.
 - An [Anthropic API key](https://console.anthropic.com/)
 
 ### Installation
