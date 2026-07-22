@@ -17,8 +17,9 @@ def _load_paths() -> dict:
 _paths = _load_paths()
 
 COOKING_BASE = Path(_paths.get("cooking_base", "/Users/Shared/cooking"))
+COOKING_STATE_BASE = Path(_paths.get("cooking_state_base", "/Users/Shared/cooking-state"))
 RECIPES_DIR = COOKING_BASE / "Recipes"
-WEEKLYPLAN_DIR = COOKING_BASE / "weeklyplan"
+WEEKLYPLAN_DIR = COOKING_STATE_BASE / "weeklyplan"
 IDEAS_DIR = COOKING_BASE / "recipeideas"
 INVENTORY_FILE = COOKING_BASE / "inventory.md"
 METADATA_FILE = COOKING_BASE / "recipe_metadata.json"

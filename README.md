@@ -16,7 +16,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Grocery receipts** — send a photo of a receipt and Keanu parses it into the shopping inventory
 - **Recipe ideas from photos** — caption a recipe photo with "save this as an idea" and Keanu drops the raw image into the recipe ideas inbox for later review
 - **Image vision** — reads images sent via iMessage (HEIC auto-converted to JPEG)
-- **Sunday menu trigger** — launchd job fires at 9 AM Sunday to kick off the weekly menu workflow automatically
+- **Sunday menu trigger** — the polling loop fires the weekly menu workflow on the first poll after 9 AM Sunday (no launchd dependency — if the Mac was asleep at 9:00 it fires as soon as Keanu is back up). An 8:30 AM pre-flight checks API credits, the MenuBuilder bridge, shared-file writability, and the tool contract; it texts the admin only on failure — success is log-only
 - **Ashley's weekly lunch** — Saturday 10 AM launchd job sends Ashley 3 lunch suggestions; she replies to pick one; 6 PM nudge if no pick by then; Keanu handles pick and feedback via `set_lunch_pick` and `log_lunch_feedback` (bridge to MenuBuilder)
 - **URL-based meal swaps** — Ashley (or David) can send a recipe URL during menu signoff to add a new recipe and schedule it for a specific day; Keanu checks for similar existing recipes and asks which to use if a close match is found
 
@@ -27,6 +27,18 @@ A Python server polls `chat.db` (iMessage's local SQLite database) every 3 secon
 ```
 iMessage → chat.db → server.py → agent.py → Claude API (tool use) → tools.py → AppleScript → iMessage
 ```
+
+Outbound proactive messages go through the **outbox spool**: any process queues a message by dropping one JSON file into `/Users/Shared/cooking-state/outbox/` (see `tools.queue_outbox`), and the main loop drains the directory every poll. Unparseable entries are quarantined to `.bad/` instead of wedging the drain.
+
+## Admin keywords
+
+Texts from the menu admin that route to fixed handlers instead of the agent:
+
+- **`start menu`** — kick off the weekly menu workflow by hand (it also fires automatically on Sunday; the workflow refuses to double-start if a build is already active)
+- **`menu status`** — one-glance workflow status: local session state, bridge state, last Sunday trigger date, last pre-flight date, and the week being planned. Works mid-workflow.
+- **`recycle koala`** — reset a stuck menu session back to normal chat
+
+The agent also has an admin-only `start_menu_workflow` tool, so asking Keanu conversationally to "plan the menu" starts the real workflow instead of improvised meal planning.
 
 ## Mac setup
 
@@ -82,7 +94,7 @@ launchd's `KeepAlive: true` restarts it automatically after the kill.
 server.py                  # Main loop — polls chat.db, routes messages, sends replies; HTTP API on :5050 (/send, /start_menu_workflow)
 agent.py                   # Conversation loop — Claude tool use, per-handle history
 tools.py                   # Tool definitions and implementations
-trigger_menu.py            # Sunday 9 AM launchd entry point — POSTs to /start_menu_workflow on Keanu's HTTP API
+trigger_menu.py            # Manual fallback — POSTs to /start_menu_workflow on Keanu's HTTP API (Sunday scheduling is handled in-loop now)
 groceryagent_bridge.py     # Subprocess bridge to GroceryAgent receipt parser
 menubuilder_bridge.py      # Subprocess bridge to MenuBuilder MCP (Python 3.9→3.12)
 agents/
@@ -97,6 +109,10 @@ evals/
   runner.py                # Eval harness
 tests/
   test_menu_workflow.py    # Unit tests for menu workflow routing and state (no API calls)
+  test_menu_guardrails.py  # start_menu_workflow tool guard + "menu status" keyword
+  test_outbox_spool.py     # Outbox spool queue/drain/quarantine
+  test_sunday_trigger.py   # In-loop Sunday trigger guard
+  test_tool_contract.py    # Bridge call sites vs live MenuBuilder signatures (also pre-flight check 4)
   test_tools_update.py     # Unit tests for update_meal_plan confirmation flow
   mb_fixtures.py           # Shared fixtures — placeholder handles only
 ```

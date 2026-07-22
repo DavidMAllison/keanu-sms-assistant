@@ -11,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,7 +29,13 @@ from agent import get_reply
 from agents import menu_workflow
 from groceryagent_bridge import call_receipt_parser
 from menubuilder_bridge import call_menubuilder_tool as _call_menubuilder_tool
-from tools import send_imessage, send_imessage_group, drain_outbox, _pending_image_recipe
+from tools import (send_imessage, send_imessage_group, drain_outbox, queue_outbox,
+                   OUTBOX_DIR, _pending_image_recipe, INVENTORY_FILE)
+from agents.menu_agent import (
+    METADATA_FILE as _METADATA_FILE,
+    WEEKLYPLAN_DIR as _WEEKLYPLAN_DIR,
+    FEEDBACK_CURRENT_FILE as _FEEDBACK_CURRENT_FILE,
+)
 from agents.menu_agent import save_recipe_idea as _save_recipe_idea_fn, IDEAS_DIR as _RECIPE_IDEAS_DIR
 
 load_dotenv()
@@ -39,11 +46,9 @@ log = logging.getLogger(__name__)
 
 CONFIG_FILE = Path(__file__).parent / "config/settings.yaml"
 STATE_FILE = Path(__file__).parent / ".keanu_state.json"
-OUTBOX_FILE = Path(__file__).parent / ".outbox.json"
-_outbox_lock = threading.Lock()
 MENU_PENDING_FILE = Path(__file__).parent / "menu_feedback_pending.json"
-MENU_RESPONSE_FILE = Path("/Users/Shared/cooking/menu_feedback_response.json")
-MENU_SESSION_FILE = Path("/Users/Shared/cooking/menu_session.json")
+MENU_RESPONSE_FILE = Path("/Users/Shared/cooking-state/menu_feedback_response.json")
+MENU_SESSION_FILE = Path("/Users/Shared/cooking-state/menu_session.json")
 CHAT_DB = Path.home() / "Library/Messages/chat.db"
 POLL_INTERVAL = 3
 
@@ -169,6 +174,173 @@ def maybe_send_trash_reminder(state: dict, config: dict):
     log.info("Trash reminder sent to Eleanor")
 
     state["last_trash_reminder_date"] = today.isoformat()
+    save_state(state)
+
+
+# ── Sunday menu trigger ────────────────────────────────────────────────────────
+
+def maybe_start_sunday_menu(state: dict, config: dict):
+    """In-loop Sunday menu trigger — no launchd dependency. If the Mac was
+    asleep or Keanu was down at 9:00, this fires the moment Keanu is back up
+    and polling. Modeled on maybe_send_trash_reminder."""
+    today = date.today()
+    now = datetime.now()
+
+    if today.weekday() != 6:  # Sunday
+        return
+    if now.hour < 9:
+        return
+    if state.get("last_menu_trigger_date") == today.isoformat():
+        return
+
+    session = menu_workflow._load_session()
+    if session.get("state") in menu_workflow.LOCAL_STATES:
+        return  # workflow already mid-conversation
+    # One bridge call, once per Sunday: every path below either fires the
+    # trigger or stands down for the day, and both set last_menu_trigger_date.
+    wf = _call_menubuilder_tool("get_workflow_state")
+    if isinstance(wf, dict) and wf.get("state") in menu_workflow.ACTIVE_BRIDGE_STATES:
+        # This week's build is already in flight — don't auto-fire a duplicate
+        # after it completes. Manual recovery if it's stale: text "start menu".
+        log.info(f"Sunday trigger: workflow already active ({wf.get('state')}) — standing down today")
+        state["last_menu_trigger_date"] = today.isoformat()
+        save_state(state)
+        return
+
+    admin_handle = config["security"].get("menu_admin")
+    if not admin_handle:
+        log.warning("Sunday menu trigger: no menu_admin in config")
+        return
+
+    try:
+        reply = menu_workflow.handle_start(config)
+        queue_outbox({"handle": admin_handle, "text": reply})
+        log.info(f"In-loop Sunday trigger: queued opening message to {admin_handle}")
+    except Exception as e:
+        log.error(f"In-loop Sunday trigger failed: {e}")
+        return  # don't set last_menu_trigger_date on failure — retry next poll
+
+    state["last_menu_trigger_date"] = today.isoformat()
+    save_state(state)
+
+
+# ── Sunday pre-flight ──────────────────────────────────────────────────────────
+
+_PREFLIGHT_START = (8, 30)  # Sundays from 8:30 AM
+
+# MenuBuilder's ACTIVITY_FILE (mcp/menu_server.py) — bridge workflow state,
+# owned by MenuBuilder, in shared cooking-state since Phase 2.1.
+_MENU_ACTIVITY_FILE = Path("/Users/Shared/cooking-state/menu_activity.json")
+
+
+def _check_writable(target: Path) -> Optional[str]:
+    """Open-for-append an existing file; for a directory (or a missing file)
+    create-and-delete a probe file instead, so we never leave behind an empty
+    state file that json.loads would choke on. Returns error string or None."""
+    try:
+        if target.is_dir():
+            probe = target / ".preflight_probe"
+        elif target.exists():
+            with open(target, "a"):
+                return None
+        else:
+            probe = target.parent / ".preflight_probe"
+        with open(probe, "w"):
+            pass
+        probe.unlink()
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def _preflight_failures() -> list:
+    """Run the three pre-flight checks. Returns a list of 'check — error' strings."""
+    failures = []
+
+    # 1. API key and credits: 1-token Haiku ping
+    try:
+        anthropic.Anthropic().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except Exception as e:
+        err = str(e)
+        if "credit balance is too low" in err:
+            failures.append("API credits — credit balance is too low")
+        else:
+            failures.append(f"API ping — {err}")
+
+    # 2. MenuBuilder bridge round-trip
+    try:
+        result = _call_menubuilder_tool("get_workflow_state")
+        if isinstance(result, dict) and result.get("error"):
+            failures.append(f"bridge get_workflow_state — {result['error']}")
+    except Exception as e:
+        failures.append(f"bridge get_workflow_state — {e}")
+
+    # 3. Writability of every file both accounts write
+    write_targets = [
+        ("menu_session.json", menu_workflow.MENU_SESSION_FILE),
+        ("outbox dir", OUTBOX_DIR),
+        ("menu_activity.json", _MENU_ACTIVITY_FILE),
+        ("weeklyplan dir", _WEEKLYPLAN_DIR),
+        ("feedback_current.json", _FEEDBACK_CURRENT_FILE),
+        ("recipe_metadata.json", _METADATA_FILE),
+        ("inventory.json", INVENTORY_FILE),
+    ]
+    for label, target in write_targets:
+        err = _check_writable(target)
+        if err:
+            failures.append(f"write {label} — {err}")
+
+    # 4. Tool contract — call-site kwargs vs live MenuBuilder signatures, so
+    # drift introduced mid-week is caught here, before the run, not during it
+    try:
+        r = subprocess.run(
+            [sys.executable, str(Path(__file__).parent / "tests" / "test_tool_contract.py")],
+            capture_output=True, text=True, timeout=180,
+        )
+        if r.returncode != 0:
+            detail = (r.stderr.strip() or r.stdout.strip()).splitlines()
+            failures.append("tool contract — " + " | ".join(detail[-8:]))
+    except Exception as e:
+        failures.append(f"tool contract — {e}")
+
+    return failures
+
+
+def maybe_run_preflight(state: dict, config: dict):
+    """Sunday-morning pre-flight for the menu run: API credits, bridge
+    round-trip, shared-file writability. Texts the admin only on failure;
+    success is log-only. Sends directly (not via outbox) so an unwritable
+    outbox spool can't swallow its own failure report."""
+    today = date.today()
+    now = datetime.now()
+
+    if today.weekday() != 6:  # Sunday
+        return
+    if (now.hour, now.minute) < _PREFLIGHT_START:
+        return
+    if state.get("last_preflight_date") == today.isoformat():
+        return
+    if state.get("last_menu_trigger_date") == today.isoformat():
+        return  # run already started; pre-flight is moot
+
+    failures = _preflight_failures()
+
+    if failures:
+        log.error(f"Sunday pre-flight failed: {failures}")
+        admin_handle = config["security"].get("menu_admin")
+        if admin_handle:
+            send_imessage(
+                admin_handle,
+                "Pre-flight for today's menu run failed: " + "; ".join(failures),
+            )
+    else:
+        log.info("Sunday pre-flight passed")
+
+    state["last_preflight_date"] = today.isoformat()
     save_state(state)
 
 
@@ -467,6 +639,40 @@ def _parse_for_week(text: str) -> str:
     )
     return m.group(1).strip() if m else ""
 
+# ── Menu status keyword ────────────────────────────────────────────────────────
+
+def _menu_status_reply(state: dict) -> str:
+    """Human-readable workflow status, one line per item."""
+    session = menu_workflow._load_session()
+    lines = [f"Local session state: {session.get('state') or 'none'}"]
+    try:
+        wf = _call_menubuilder_tool("get_workflow_state")
+        if isinstance(wf, dict) and wf.get("error"):
+            lines.append(f"Bridge state: error — {wf['error']}")
+        elif isinstance(wf, dict):
+            lines.append(f"Bridge state: {wf.get('state') or 'none'}")
+        else:
+            lines.append(f"Bridge state: unexpected reply — {wf!r}")
+    except Exception as e:
+        lines.append(f"Bridge state: error — {e}")
+    lines.append(f"Last Sunday trigger: {state.get('last_menu_trigger_date') or 'never'}")
+    lines.append(f"Last pre-flight: {state.get('last_preflight_date') or 'never'}")
+    if session.get("week_start"):
+        lines.append(f"Planning week of: {session['week_start']}")
+    return "\n".join(lines)
+
+
+def maybe_handle_menu_status(text: str, handle: str, config: dict, state: dict) -> bool:
+    """Admin-only 'menu status' keyword (exact match). Returns True when handled.
+    Must run before menu-workflow routing so it works mid-workflow."""
+    if text.strip().lower() != "menu status":
+        return False
+    if handle != config["security"].get("menu_admin"):
+        return False
+    send_imessage(handle, _menu_status_reply(state))
+    return True
+
+
 # ── iMessage send ──────────────────────────────────────────────────────────────
 # send_imessage and send_imessage_group imported from tools
 
@@ -759,10 +965,7 @@ class _SendHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"error": "missing handle or text"}')
                 return
-            with _outbox_lock:
-                outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-                outbox.append({"handle": handle, "text": text})
-                OUTBOX_FILE.write_text(json.dumps(outbox))
+            queue_outbox({"handle": handle, "text": text})
             log.info(f"API /send: queued message to {handle}")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -770,17 +973,29 @@ class _SendHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"ok": true}')
 
         elif self.path == "/start_menu_workflow":
-            # Triggered by launchd (davidallison user) — runs as allisonbot so file writes succeed.
+            # Manual-use fallback (Sunday scheduling now handled by the in-loop
+            # trigger) — runs as allisonbot so file writes succeed.
             try:
                 cfg = load_config()
                 admin_handle = cfg["security"].get("menu_admin")
                 if not admin_handle:
                     raise ValueError("no menu_admin in config")
+
+                # Idempotency vs the in-loop Sunday trigger: this handler runs in
+                # the API thread with no view of the main loop's in-memory state,
+                # so the dedupe has to go through disk.
+                today_iso = date.today().isoformat()
+                disk_state = load_state()
+                if disk_state.get("last_menu_trigger_date") == today_iso:
+                    log.info("API /start_menu_workflow: already triggered today, skipping")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok": true, "skipped": "already_triggered"}')
+                    return
+
                 reply = menu_workflow.handle_start(cfg)
-                with _outbox_lock:
-                    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-                    outbox.append({"handle": admin_handle, "text": reply})
-                    OUTBOX_FILE.write_text(json.dumps(outbox))
+                queue_outbox({"handle": admin_handle, "text": reply})
                 log.info(f"API /start_menu_workflow: queued opening message to {admin_handle}")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -832,6 +1047,8 @@ def main():
             drain_outbox()
             config = load_config()
             maybe_send_trash_reminder(state, config)
+            maybe_run_preflight(state, config)
+            maybe_start_sunday_menu(state, config)
             maybe_send_holiday_message(state, config)
             min_date = startup_cutoff if first_poll else None
             messages = poll_new_messages(state["last_rowid"], min_date)
@@ -943,6 +1160,11 @@ def main():
                     send_imessage(handle, reply)
                     continue
 
+                # "menu status" — admin status keyword, before workflow routing
+                # so it works mid-workflow instead of being swallowed by it
+                if maybe_handle_menu_status(text, handle, config, state):
+                    continue
+
                 # Menu workflow — admin only
                 menu_admin = config["security"].get("menu_admin")
                 if handle == menu_admin and is_menu_start(text):
@@ -951,16 +1173,28 @@ def main():
                     send_imessage(handle, reply)
                     continue
 
-                if handle == menu_admin and MENU_SESSION_FILE.exists():
+                # Route into the workflow when EITHER menu_session.json holds a
+                # local sub-state OR MenuBuilder reports an active bridge state.
+                # At most one bridge call per inbound message, admin handle only.
+                if handle == menu_admin:
                     try:
-                        session = json.loads(MENU_SESSION_FILE.read_text())
-                        wf_state = session.get("state", "idle")
-                        if wf_state not in ("idle", "complete", None):
+                        session = {}
+                        if MENU_SESSION_FILE.exists():
+                            session = json.loads(MENU_SESSION_FILE.read_text())
+                        local_state = session.get("state") or ""
+                        bridge_state = ""
+                        if local_state not in menu_workflow.LOCAL_STATES:
+                            result = _call_menubuilder_tool("get_workflow_state")
+                            if isinstance(result, dict):
+                                bridge_state = result.get("state") or ""
+                        if (local_state in menu_workflow.LOCAL_STATES
+                                or bridge_state in menu_workflow.ACTIVE_BRIDGE_STATES):
                             if text.strip().lower() == "recycle koala":
-                                MENU_SESSION_FILE.write_text(json.dumps({"state": "idle"}))
+                                MENU_SESSION_FILE.write_text(json.dumps({}))
                                 send_imessage(handle, "Menu reset — you're back to normal.")
                             else:
-                                reply = menu_workflow.menu_agent_reply(text, session, config)
+                                reply = menu_workflow.menu_agent_reply(
+                                    text, session, config, bridge_state=bridge_state)
                                 if reply:
                                     send_imessage(handle, reply)
                             continue
@@ -979,19 +1213,21 @@ def main():
                             MENU_PENDING_FILE.unlink()
                             admin_handle = config["security"].get("menu_admin")
                             if admin_handle:
-                                outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-                                outbox.append({"handle": admin_handle, "text": f"Ashley replied to the menu: {text}"})
-                                OUTBOX_FILE.write_text(json.dumps(outbox))
+                                queue_outbox({"handle": admin_handle, "text": f"Ashley replied to the menu: {text}"})
                             send_imessage(handle, "Thanks! Passed it on to David.")
                             log.info(f"Menu feedback captured from {handle}: {text[:80]}")
                             # Also advance the menu workflow if awaiting Ashley's signoff
-                            if MENU_SESSION_FILE.exists():
-                                try:
-                                    wf_session = json.loads(MENU_SESSION_FILE.read_text())
-                                    if wf_session.get("state") == "awaiting_ashley_signoff":
-                                        menu_workflow.handle_ashley_reply(text, wf_session, config)
-                                except Exception as e:
-                                    log.error(f"Ashley reply session update error: {e}")
+                            # (bridge state — read via get_workflow_state, never from
+                            # menu_session.json)
+                            try:
+                                wf = _call_menubuilder_tool("get_workflow_state")
+                                if isinstance(wf, dict) and wf.get("state") == "awaiting_ashley_signoff":
+                                    wf_session = {}
+                                    if MENU_SESSION_FILE.exists():
+                                        wf_session = json.loads(MENU_SESSION_FILE.read_text())
+                                    menu_workflow.handle_ashley_reply(text, wf_session, config)
+                            except Exception as e:
+                                log.error(f"Ashley reply session update error: {e}")
                             continue
                     except Exception as e:
                         log.error(f"Menu pending check error: {e}")
@@ -1004,9 +1240,7 @@ def main():
                         and handle != admin
                         and admin):
                     sender_name = config["security"].get("handle_to_person", {}).get(handle, "Family member")
-                    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-                    outbox.append({"handle": admin, "text": f"{sender_name} re: menu — {text}"})
-                    OUTBOX_FILE.write_text(json.dumps(outbox))
+                    queue_outbox({"handle": admin, "text": f"{sender_name} re: menu — {text}"})
                     log.info(f"Forwarded Sunday menu feedback from {handle} to admin")
 
                 # Everything else goes through the agent

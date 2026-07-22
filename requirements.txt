@@ -1,7 +1,7 @@
-anthropic
-python-dotenv
+anthropic==0.76.0
+python-dotenv==1.2.1
 pyyaml==6.0.3
-beautifulsoup4
-httpx
-playwright
-yt-dlp
+beautifulsoup4==4.14.3
+httpx==0.28.1
+playwright==1.60.0
+yt-dlp==2025.10.14

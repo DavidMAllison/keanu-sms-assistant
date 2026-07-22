@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import os
 import subprocess
 import time
 from datetime import date, timedelta
@@ -20,6 +21,7 @@ from agents.menu_agent import (
     save_preference,
     _load_handle_to_name,
     COOKING_BASE,
+    COOKING_STATE_BASE,
     IDEAS_DIR,
     RECIPES_DIR,
     WEEKLYPLAN_DIR,
@@ -62,9 +64,22 @@ def _search_local_collection_safe(query: str) -> list:
 
 _BASE = Path(__file__).parent
 GAPS_FILE = _BASE / "capability_gaps.json"
-OUTBOX_FILE = _BASE / ".outbox.json"
+OUTBOX_DIR = Path("/Users/Shared/cooking-state/outbox")
 PENDING_FRIEND_FILE = _BASE / ".pending_friend_requests.json"
-INVENTORY_FILE = Path("/Users/Shared/cooking/inventory.json")
+INVENTORY_FILE = COOKING_STATE_BASE / "inventory.json"
+
+
+def queue_outbox(entry: dict):
+    """Queue an outbound iMessage as one create-exclusive spool file.
+    Safe for concurrent writers across threads, processes, and Mac accounts —
+    unlike the legacy .outbox.json read-modify-write, which could drop messages.
+    Entry schema unchanged: {"handle": ..., "text": ...} or {"handles": [...], "text": ...}.
+    """
+    OUTBOX_DIR.mkdir(exist_ok=True)
+    path = OUTBOX_DIR / f"{time.time_ns()}_{os.getpid()}.json"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(entry))
 
 
 def send_imessage(handle: str, text: str):
@@ -102,21 +117,37 @@ def send_imessage_group(handles: list, text: str):
         log.info(f"Sent group message to {handles}")
 
 
+def _send_outbox_entry(entry: dict):
+    if "handles" in entry:
+        send_imessage_group(entry["handles"], entry["text"])
+        log.info(f"Outbox: sent group message to {entry['handles']}")
+    else:
+        send_imessage(entry["handle"], entry["text"])
+        log.info(f"Outbox: sent to {entry['handle']}")
+
+
 def drain_outbox():
-    if not OUTBOX_FILE.exists():
+    # Spool dir — one entry per file. Any bad file (unparseable or wrong
+    # schema) is quarantined to .bad/ so it can never wedge the drain loop.
+    if not OUTBOX_DIR.is_dir():
         return
-    try:
-        messages = json.loads(OUTBOX_FILE.read_text())
-        OUTBOX_FILE.unlink()
-        for entry in messages:
-            if "handles" in entry:
-                send_imessage_group(entry["handles"], entry["text"])
-                log.info(f"Outbox: sent group message to {entry['handles']}")
-            else:
-                send_imessage(entry["handle"], entry["text"])
-                log.info(f"Outbox: sent to {entry['handle']}")
-    except Exception as e:
-        log.error(f"Outbox drain error: {e}")
+    for path in sorted(OUTBOX_DIR.glob("*.json")):
+        try:
+            entry = json.loads(path.read_text())
+            _send_outbox_entry(entry)
+        except Exception as e:
+            log.error(f"Outbox spool: bad entry {path.name} ({e}) — quarantining to .bad/")
+            bad_dir = OUTBOX_DIR / ".bad"
+            try:
+                bad_dir.mkdir(exist_ok=True)
+                path.rename(bad_dir / path.name)
+            except Exception as e2:
+                log.error(f"Outbox spool: could not quarantine {path.name}: {e2}")
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 # ── Tool definitions (sent to Claude API) ─────────────────────────────────────
@@ -514,6 +545,17 @@ _DEFS = {
             "required": ["recipe_name", "image_b64"],
         },
     },
+    "start_menu_workflow": {
+        "name": "start_menu_workflow",
+        "description": (
+            "Start the weekly menu-building workflow (the same one 'start menu' triggers). "
+            "Use when David asks to build, plan, or redo the weekly menu and no build is "
+            "already active. Never plan a menu yourself with other tools. Returns the "
+            "workflow's opening message — relay it to the user exactly as written, never "
+            "summarize or rephrase it."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 }
 
 
@@ -527,7 +569,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
         names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal",
                   "process_recipe_url", "process_recipe_image", "set_recipe_image"]
     if is_admin:
-        names += ["update_meal_plan", "update_inventory"]
+        names += ["update_meal_plan", "update_inventory", "start_menu_workflow"]
     return [_DEFS[n] for n in names]
 
 
@@ -726,9 +768,7 @@ def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) 
 
     # Not found locally — search externally
     if handle:
-        outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-        outbox.append({"handle": handle, "text": "Nothing in the local collection — searching online, this takes about a minute..."})
-        OUTBOX_FILE.write_text(json.dumps(outbox))
+        queue_outbox({"handle": handle, "text": "Nothing in the local collection — searching online, this takes about a minute..."})
         drain_outbox()
     try:
         results = _recipe_run_agent(name)
@@ -878,9 +918,24 @@ def _tool_update_meal_plan(instruction: str) -> str:
     return f"Couldn't update: {result.get('error', 'unknown error')}"
 
 
+_MENU_BUILD_IN_PROGRESS = "A menu build is already in progress — just keep texting."
+
+
+def _tool_start_menu_workflow(config: dict) -> str:
+    # Imported here — module-level would cycle (menu_workflow imports from tools)
+    from agents import menu_workflow
+    session = menu_workflow._load_session()
+    if session.get("state") in menu_workflow.LOCAL_STATES:
+        return _MENU_BUILD_IN_PROGRESS
+    wf = _call_menubuilder_tool("get_workflow_state")
+    if isinstance(wf, dict) and wf.get("state") in menu_workflow.ACTIVE_BRIDGE_STATES:
+        return _MENU_BUILD_IN_PROGRESS
+    return menu_workflow.handle_start(config)
+
+
 def _tool_log_feedback(recipe: str, feedback: str, sentiment: str, handle: str) -> str:
     from datetime import datetime, timedelta
-    queue_file = COOKING_BASE / "feedback_queue.json"
+    queue_file = COOKING_STATE_BASE / "feedback_queue.json"
     handle_map = _load_handle_to_name()
     entry = {
         "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1075,10 +1130,8 @@ def _notify_parents_individual(kid_handle: str, kid_name: str, meal: str, food_o
             f"Schedule's clear but I don't have serving info. Reply yes or no and I'll pass it on!"
         )
 
-    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
     for h in parent_handles:
-        outbox.append({"handle": h, "text": msg})
-    OUTBOX_FILE.write_text(json.dumps(outbox))
+        queue_outbox({"handle": h, "text": msg})
 
     import time as _time
     pending = json.loads(PENDING_FRIEND_FILE.read_text()) if PENDING_FRIEND_FILE.exists() else []
@@ -1172,9 +1225,7 @@ def _tool_relay_message(recipient: str, message: str, config: dict) -> str:
     handle = name_to_handle.get(recipient) or name_to_handle.get(recipient.title())
     if not handle:
         return f"Don't know a handle for '{recipient}' — check the name and try again."
-    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-    outbox.append({"handle": handle, "text": message})
-    OUTBOX_FILE.write_text(json.dumps(outbox))
+    queue_outbox({"handle": handle, "text": message})
     return f"Sent to {recipient}."
 
 
@@ -1306,6 +1357,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_get_lunch_pick()
         if name == "set_lunch_pick":
             return _tool_set_lunch_pick(inputs["recipe_name"])
+        if name == "start_menu_workflow":
+            return _tool_start_menu_workflow(config)
         if name == "log_lunch_feedback":
             return _tool_log_lunch_feedback(inputs["recipe"], inputs["sentiment"], inputs.get("note", ""))
         if name == "process_recipe_url":

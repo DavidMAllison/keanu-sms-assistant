@@ -3,8 +3,8 @@ Unit tests for the menu workflow state machine (agents/menu_workflow.py).
 
 Mocks:
   - call_menubuilder_tool  → canned fixture dicts (no subprocess, no MenuBuilder)
-  - MENU_SESSION_FILE      → temp file (no writes to /Users/Shared/cooking/)
-  - OUTBOX_FILE            → temp file (no writes to .outbox.json)
+  - MENU_SESSION_FILE      → temp file (no writes to /Users/Shared/cooking-state/)
+  - tools.OUTBOX_DIR       → temp dir (no writes to the real outbox spool)
 
 Claude API is never called — pre-agent guards are tested by asserting on the
 return value before the agent loop is reached.
@@ -12,6 +12,7 @@ return value before the agent loop is reached.
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import agents.menu_workflow as mw
 from tests.mb_fixtures import (
+    APPROVE_MISMATCH,
     FAKE_CONFIG,
     START_DEFAULT,
     START_ERROR,
@@ -39,8 +41,10 @@ from tests.mb_fixtures import (
 
 class _Base(unittest.TestCase):
     """
-    Patches MENU_SESSION_FILE and OUTBOX_FILE to temp files for every test.
-    Subclasses get self.session_path and self.outbox_path as Path objects.
+    Patches MENU_SESSION_FILE and the outbox spool dir to temp paths for every
+    test. Subclasses get self.session_path and self.outbox_dir as Path objects.
+    (queue_outbox reads tools.OUTBOX_DIR at call time, so patching the module
+    global redirects menu_workflow's _send_outbox too.)
     """
 
     def setUp(self):
@@ -49,24 +53,25 @@ class _Base(unittest.TestCase):
         self.session_path = Path(p)
         self.session_path.unlink()  # start with no file — matches real idle state
 
-        fd2, p2 = tempfile.mkstemp(suffix=".json")
-        os.close(fd2)
-        self.outbox_path = Path(p2)
-        self.outbox_path.unlink()
+        self.outbox_dir = Path(tempfile.mkdtemp())
 
         self._p_sess = patch("agents.menu_workflow.MENU_SESSION_FILE", self.session_path)
-        self._p_outbox = patch("agents.menu_workflow.OUTBOX_FILE", self.outbox_path)
+        self._p_outbox = patch("tools.OUTBOX_DIR", self.outbox_dir)
         self._p_sess.start()
         self._p_outbox.start()
 
     def tearDown(self):
         self._p_sess.stop()
         self._p_outbox.stop()
-        for p in (self.session_path, self.outbox_path):
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
+        try:
+            self.session_path.unlink()
+        except FileNotFoundError:
+            pass
+        shutil.rmtree(self.outbox_dir, ignore_errors=True)
+
+    def _outbox_entries(self) -> list:
+        """Read all spool entries, oldest first."""
+        return [json.loads(p.read_text()) for p in sorted(self.outbox_dir.glob("*.json"))]
 
     def _session(self) -> dict:
         """Read the current temp session file."""
@@ -216,8 +221,12 @@ class TestWeekConfirmation(_Base):
 
 class TestHandleNeedsConfirmation(_Base):
 
-    def _base_session(self, state="awaiting_meal_approval") -> dict:
-        s = {"state": state, "week_start": "2026-07-07", "selected_meals": {}}
+    def _base_session(self, state=None) -> dict:
+        # No "state" key by default — bridge phases (e.g. awaiting_meal_approval)
+        # are owned by MenuBuilder and never stored in menu_session.json.
+        s = {"week_start": "2026-07-07", "selected_meals": {}}
+        if state:
+            s["state"] = state
         self._write_session(s)
         return s
 
@@ -230,7 +239,7 @@ class TestHandleNeedsConfirmation(_Base):
         self.assertEqual(self._session()["state"], "awaiting_recipe_confirmation")
 
     def test_saves_all_three_pending_keys(self):
-        session = self._base_session("awaiting_meal_approval")
+        session = self._base_session()
         mw._handle_needs_confirmation(
             SWAP_NEEDS_CONFIRMATION,
             "swap_meal",
@@ -240,7 +249,15 @@ class TestHandleNeedsConfirmation(_Base):
         self.assertEqual(session["pending_suggested"], "Test Chicken Tikka Masala")
         self.assertEqual(session["pending_confirmation"]["tool"], "swap_meal")
         self.assertEqual(session["pending_confirmation"]["args"]["day"], "Tue")
-        self.assertEqual(session["pre_confirmation_state"], "awaiting_meal_approval")
+        # Confirmation began during a bridge phase — no local state to restore
+        self.assertIsNone(session["pre_confirmation_state"])
+
+    def test_saves_local_pre_confirmation_state_when_present(self):
+        session = self._base_session("awaiting_schedule")
+        mw._handle_needs_confirmation(
+            SWAP_NEEDS_CONFIRMATION, "swap_meal", {"day": "Tue"}, session
+        )
+        self.assertEqual(session["pre_confirmation_state"], "awaiting_schedule")
 
     def test_returns_message_from_mcp(self):
         session = self._base_session()
@@ -248,10 +265,10 @@ class TestHandleNeedsConfirmation(_Base):
         self.assertIn("Test Chicken Tikka Masala", msg)
 
     def test_success_result_returns_none_and_leaves_state_unchanged(self):
-        session = self._base_session("awaiting_meal_approval")
+        session = self._base_session()
         result = mw._handle_needs_confirmation(SWAP_SUCCESS, "swap_meal", {}, session)
         self.assertIsNone(result)
-        self.assertEqual(session["state"], "awaiting_meal_approval")
+        self.assertNotIn("state", session)
 
     def test_error_result_returns_none(self):
         session = self._base_session()
@@ -263,7 +280,9 @@ class TestHandleNeedsConfirmation(_Base):
 
 class TestRecipeConfirmation(_Base):
 
-    def _confirmation_session(self, prev_state="awaiting_meal_approval") -> dict:
+    def _confirmation_session(self, prev_state=None) -> dict:
+        # prev_state=None models a confirmation that began during a bridge phase
+        # (e.g. awaiting_meal_approval) — no local state to restore afterwards.
         s = {
             "state": "awaiting_recipe_confirmation",
             "week_start": "2026-07-07",
@@ -326,11 +345,23 @@ class TestRecipeConfirmation(_Base):
         self.assertNotIn("pending_suggested", saved)
         self.assertNotIn("pre_confirmation_state", saved)
 
-    def test_no_restores_previous_state(self):
-        session = self._confirmation_session(prev_state="awaiting_meal_approval")
+    def test_yes_clears_local_state_when_no_previous_state(self):
+        session = self._confirmation_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_SUCCESS):
+            mw._handle_recipe_confirmation("yes", session, FAKE_CONFIG)
+        self.assertNotIn("state", self._session())
+
+    def test_no_restores_previous_local_state(self):
+        session = self._confirmation_session(prev_state="awaiting_schedule")
         reply = mw._handle_recipe_confirmation("no", session, FAKE_CONFIG)
         self.assertEqual(reply, "What's the recipe name?")
-        self.assertEqual(self._session()["state"], "awaiting_meal_approval")
+        self.assertEqual(self._session()["state"], "awaiting_schedule")
+
+    def test_no_clears_local_state_when_no_previous_state(self):
+        session = self._confirmation_session()
+        reply = mw._handle_recipe_confirmation("no", session, FAKE_CONFIG)
+        self.assertEqual(reply, "What's the recipe name?")
+        self.assertNotIn("state", self._session())
 
     def test_no_clears_all_pending_keys(self):
         session = self._confirmation_session()
@@ -341,10 +372,10 @@ class TestRecipeConfirmation(_Base):
         self.assertNotIn("pre_confirmation_state", saved)
 
     def test_arbitrary_text_restores_state_and_asks_for_name(self):
-        session = self._confirmation_session(prev_state="awaiting_meal_approval")
+        session = self._confirmation_session(prev_state="awaiting_schedule")
         reply = mw._handle_recipe_confirmation("hmm not sure", session, FAKE_CONFIG)
         self.assertEqual(reply, "What's the recipe name?")
-        self.assertEqual(self._session()["state"], "awaiting_meal_approval")
+        self.assertEqual(self._session()["state"], "awaiting_schedule")
 
 
 # ── TestSwapMealIntegration ───────────────────────────────────────────────────
@@ -357,8 +388,8 @@ class TestSwapMealIntegration(_Base):
     """
 
     def _approval_session(self) -> dict:
+        # Meal approval is a bridge phase — no "state" key in the local session.
         s = {
-            "state": "awaiting_meal_approval",
             "week_start": "2026-07-07",
             "selected_meals": {"Mon": "Test Pasta", "Tue": "Test Tacos"},
             "quick_days": [],
@@ -391,7 +422,7 @@ class TestSwapMealIntegration(_Base):
         saved = self._session()
         self.assertEqual(saved["pending_confirmation"]["tool"], "swap_meal")
         self.assertEqual(saved["pending_suggested"], "Test Chicken Tikka Masala")
-        self.assertEqual(saved["pre_confirmation_state"], "awaiting_meal_approval")
+        self.assertIsNone(saved["pre_confirmation_state"])
 
     def test_success_returns_formatted_day_list(self):
         session = self._approval_session()
@@ -414,7 +445,98 @@ class TestSwapMealIntegration(_Base):
                 session,
                 FAKE_CONFIG,
             )
-        self.assertEqual(self._session()["state"], "awaiting_meal_approval")
+        # Bridge state from the swap result is never written into the session
+        self.assertNotIn("state", self._session())
+
+    def test_approve_menu_clears_local_state(self):
+        session = self._approval_session()
+        session["state"] = "awaiting_schedule"  # leftover local sub-state
+        self._write_session(session)
+        mock_mb = MagicMock(return_value={"ok": True})
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb):
+            result = mw._execute_menu_tool("approve_menu", {}, session, FAKE_CONFIG)
+        self.assertIn("Ashley", result)
+        # awaiting_ashley_signoff is bridge-owned — local state must be cleared
+        self.assertNotIn("state", self._session())
+        # Guardrail: the local plan snapshot must be sent along for drift detection.
+        # (call_args is the *last* call — generate_shopping_list also fires — so
+        # find the approve_menu call specifically.)
+        approve_call = next(
+            c for c in mock_mb.call_args_list if c.args[0] == "approve_menu"
+        )
+        self.assertEqual(
+            approve_call.kwargs["expected_selected_meals"], session["selected_meals"]
+        )
+
+    def test_approve_menu_mismatch_blocks_send_and_shows_actual_plan(self):
+        session = self._approval_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=APPROVE_MISMATCH):
+            result = mw._execute_menu_tool("approve_menu", {}, session, FAKE_CONFIG)
+        self.assertIn("changed", result.lower())
+        self.assertIn("Test Chicken Tikka Masala", result)
+        self.assertNotIn("Ashley", result)  # never claims it was sent
+        # Local mirror is corrected to the actual bridge state
+        self.assertEqual(self._session()["selected_meals"], APPROVE_MISMATCH["actual"])
+
+
+# ── TestPendingUrlSwap ────────────────────────────────────────────────────────
+
+class TestPendingUrlSwap(_Base):
+    """
+    _handle_pending_url_swap had its own independent instance of the
+    selected_meals-drift bug: it never refreshed session["selected_meals"]
+    before calling approve_menu. Verifies it now pulls fresh state from
+    get_workflow_state and passes it as expected_selected_meals.
+    """
+
+    def _session_with_pending(self) -> dict:
+        s = {
+            "week_start": "2026-07-07",
+            "selected_meals": {"Wed": "Test Stir Fry"},  # stale local mirror
+            "pending_url_swap": {
+                "url": "https://example.com/recipe",
+                "day": "Wed",
+                "existing_recipe": "Test Stir Fry",
+            },
+        }
+        self._write_session(s)
+        return s
+
+    def test_refreshes_selected_meals_from_bridge_before_approving(self):
+        session = self._session_with_pending()
+        fresh_meals = {"Wed": "Test Chicken Tikka Masala", "Thu": "Test Tacos"}
+
+        def fake_mb(tool_name, **kwargs):
+            if tool_name == "get_workflow_state":
+                return {"selected_meals": fresh_meals}
+            return {"ok": True}
+
+        mock_mb = MagicMock(side_effect=fake_mb)
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb), \
+             patch("agents.menu_workflow._send_to_ashley"):
+            mw._handle_pending_url_swap("no thanks, keep it", session, FAKE_CONFIG)
+
+        self.assertEqual(self._session()["selected_meals"], fresh_meals)
+        approve_call = next(
+            c for c in mock_mb.call_args_list if c.args[0] == "approve_menu"
+        )
+        self.assertEqual(approve_call.kwargs["expected_selected_meals"], fresh_meals)
+
+    def test_missing_bridge_selected_meals_keeps_prior_local_mirror(self):
+        session = self._session_with_pending()
+
+        def fake_mb(tool_name, **kwargs):
+            if tool_name == "get_workflow_state":
+                return {"selected_meals": {}}  # bridge has nothing to offer
+            return {"ok": True}
+
+        mock_mb = MagicMock(side_effect=fake_mb)
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb), \
+             patch("agents.menu_workflow._send_to_ashley"):
+            mw._handle_pending_url_swap("no thanks, keep it", session, FAKE_CONFIG)
+
+        # Falsy selected_meals from the bridge must not clobber the local mirror
+        self.assertEqual(self._session()["selected_meals"], {"Wed": "Test Stir Fry"})
 
 
 # ── TestAgentReplyRouting ─────────────────────────────────────────────────────
@@ -438,10 +560,25 @@ class TestAgentReplyRouting(_Base):
         self.assertIn("pick it up", reply.lower())
 
     def test_awaiting_ashley_signoff_returns_holding_message(self):
-        self._write_session({"state": "awaiting_ashley_signoff", "conversation": []})
+        # Signoff is a bridge state — passed in by server.py routing, not stored locally
+        self._write_session({"conversation": []})
         session = self._session()
-        reply = mw.menu_agent_reply("what's the status?", session, FAKE_CONFIG)
+        reply = mw.menu_agent_reply("what's the status?", session, FAKE_CONFIG,
+                                    bridge_state="awaiting_ashley_signoff")
         self.assertIn("Ashley", reply)
+
+    def test_awaiting_finalization_calls_finalize_and_replies(self):
+        self._write_session({"conversation": []})
+        session = self._session()
+        mock_mb = MagicMock(return_value={"state": "complete"})
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb):
+            reply = mw.menu_agent_reply("done?", session, FAKE_CONFIG,
+                                        bridge_state="awaiting_finalization")
+        self.assertEqual(reply, "Plan ready!")
+        self.assertEqual(mock_mb.call_args[0][0], "finalize_plan")
+        # No bridge state may leak into the local session file
+        saved = self._session()
+        self.assertNotIn("state", saved)
 
     def test_awaiting_week_confirmation_routed_without_api(self):
         s = {
@@ -483,6 +620,97 @@ class TestAgentReplyRouting(_Base):
             reply = mw.menu_agent_reply("yes", dict(s), FAKE_CONFIG)
         # Should get a formatted plan back, not a Claude API error
         self.assertIn("Mon", reply)
+
+
+# ── TestAgentLoop ─────────────────────────────────────────────────────────────
+
+class _FakeBlock:
+    """Plain attribute holder — MagicMock can't be used for content blocks
+    because hasattr(mock, 'text') is always True."""
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _tool_use_response(name="swap_meal", tool_input=None, tool_id="tu_1"):
+    resp = _FakeBlock(
+        stop_reason="tool_use",
+        content=[_FakeBlock(type="tool_use", name=name,
+                            input=tool_input or {"day": "Monday"}, id=tool_id)],
+    )
+    return resp
+
+
+def _text_response(text):
+    return _FakeBlock(stop_reason="end_turn",
+                      content=[_FakeBlock(type="text", text=text)])
+
+
+class TestAgentLoop(_Base):
+    """Exercises menu_agent_reply's API loop with a fake Anthropic client:
+    the 8-round cap, the tool_choice:none finisher, its static fallback, and
+    the persisted [already done: ...] tool notes (Task 2)."""
+
+    def _run(self, responses, text="swap everything"):
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = responses
+        fake_anthropic = MagicMock()
+        fake_anthropic.Anthropic.return_value = fake_client
+        with patch.dict(sys.modules, {"anthropic": fake_anthropic}), \
+             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}), \
+             patch("agents.menu_workflow._execute_menu_tool", return_value="ok"):
+            reply = mw.menu_agent_reply(text, session={}, config=FAKE_CONFIG)
+        return reply, fake_client
+
+    def test_text_response_returned_directly(self):
+        reply, client = self._run([_text_response("All set!")])
+        self.assertEqual(reply, "All set!")
+        self.assertEqual(client.messages.create.call_count, 1)
+
+    def test_loop_runs_up_to_eight_rounds_before_finisher(self):
+        responses = [_tool_use_response(tool_id=f"tu_{i}") for i in range(8)]
+        responses.append(_text_response("Did all eight."))
+        reply, client = self._run(responses)
+        self.assertEqual(reply, "Did all eight.")
+        # 8 tool rounds + 1 finisher
+        self.assertEqual(client.messages.create.call_count, 9)
+
+    def test_finisher_uses_tool_choice_none(self):
+        responses = [_tool_use_response(tool_id=f"tu_{i}") for i in range(8)]
+        responses.append(_text_response("Wrapped up."))
+        _, client = self._run(responses)
+        finisher_kwargs = client.messages.create.call_args_list[-1][1]
+        self.assertEqual(finisher_kwargs["tool_choice"], {"type": "none"})
+
+    def test_finisher_error_falls_back_to_static_done_message(self):
+        responses = [_tool_use_response(tool_id=f"tu_{i}") for i in range(8)]
+        responses.append(RuntimeError("api down"))
+        reply, _ = self._run(responses)
+        self.assertEqual(reply, "Done — text 'menu' to see the updated week.")
+
+    def test_tool_rounds_persist_already_done_notes(self):
+        responses = [
+            _tool_use_response("swap_meal", {"day": "Monday"}, "tu_1"),
+            _tool_use_response("swap_meal", {"day": "Tuesday"}, "tu_2"),
+            _text_response("Swapped both."),
+        ]
+        self._run(responses)
+        convo = self._session()["conversation"]
+        notes = [m["content"] for m in convo
+                 if m["role"] == "assistant" and m["content"].startswith("[already done:")]
+        self.assertEqual(len(notes), 2)
+        self.assertIn("swap_meal", notes[0])
+        self.assertIn("Monday", notes[0])
+        self.assertIn("Tuesday", notes[1])
+
+    def test_notes_precede_final_reply_in_conversation(self):
+        responses = [
+            _tool_use_response("generate_meal_plan", {}, "tu_1"),
+            _text_response("Here's the plan."),
+        ]
+        self._run(responses)
+        convo = self._session()["conversation"]
+        self.assertTrue(convo[-2]["content"].startswith("[already done:"))
+        self.assertEqual(convo[-1]["content"], "Here's the plan.")
 
 
 if __name__ == "__main__":

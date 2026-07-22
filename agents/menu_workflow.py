@@ -1,7 +1,10 @@
 """
 menu_workflow.py — SMS-triggered weekly menu workflow, agent-driven.
 
-State lives in /Users/Shared/cooking/menu_session.json.
+Local sub-state lives in /Users/Shared/cooking-state/menu_session.json.
+Bridge workflow state is owned by MenuBuilder (menu_activity.json) and is
+read only via call_menubuilder_tool("get_workflow_state") — no state value
+is ever written in two places.
 "start menu" from admin triggers handle_start(). Subsequent messages
 from admin route to menu_agent_reply(), which uses Claude Sonnet with
 tool use to drive the conversation naturally.
@@ -20,9 +23,28 @@ log = logging.getLogger(__name__)
 
 DRY_RUN = False
 
-MENU_SESSION_FILE = Path("/Users/Shared/cooking/menu_session.json")
-OUTBOX_FILE = Path("/Users/Shared/sms-assistant/.outbox.json")
+MENU_SESSION_FILE = Path("/Users/Shared/cooking-state/menu_session.json")
 MENU_PENDING_FILE = Path("/Users/Shared/sms-assistant/menu_feedback_pending.json")
+
+# State ownership — local sub-states are stored in session["state"]
+# (menu_session.json); bridge states are owned by MenuBuilder and are only
+# ever read via get_workflow_state. While the workflow is in a bridge phase,
+# menu_session.json has no "state" key at all.
+LOCAL_STATES = (
+    "awaiting_week_confirmation",
+    "awaiting_recipe_confirmation",
+    "awaiting_idea_content",
+    "awaiting_idea_url",
+    "awaiting_first_cook_feedback",
+    "awaiting_meal_logging",
+    "awaiting_schedule",
+)
+ACTIVE_BRIDGE_STATES = (
+    "awaiting_meal_approval",
+    "awaiting_ashley_signoff",
+    "awaiting_idea_activation",
+    "awaiting_finalization",
+)
 
 DAYS_ORDER = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
@@ -84,7 +106,7 @@ def _load_session() -> dict:
             return json.loads(MENU_SESSION_FILE.read_text())
         except Exception:
             pass
-    return {"state": "idle"}
+    return {}
 
 
 def _save_session(session: dict):
@@ -97,28 +119,14 @@ def _save_session(session: dict):
 # ── MenuBuilder MCP bridge ────────────────────────────────────────────────────
 
 from menubuilder_bridge import call_menubuilder_tool  # noqa: E402
-
-
-def _sync_session_state(state: str):
-    """Write just the state to menu_session.json so server.py routing stays current."""
-    if DRY_RUN:
-        log.info(f"[DRY_RUN] Would sync session state={state}")
-        return
-    try:
-        existing = json.loads(MENU_SESSION_FILE.read_text()) if MENU_SESSION_FILE.exists() else {}
-        existing["state"] = state
-        MENU_SESSION_FILE.write_text(json.dumps(existing, indent=2))
-    except Exception as e:
-        log.error(f"Could not sync session state: {e}")
+from tools import queue_outbox  # noqa: E402
 
 
 def _send_outbox(handle: str, text: str):
     if DRY_RUN:
         log.info(f"[DRY_RUN] Would send to {handle}: {text[:80]}")
         return
-    outbox = json.loads(OUTBOX_FILE.read_text()) if OUTBOX_FILE.exists() else []
-    outbox.append({"handle": handle, "text": text})
-    OUTBOX_FILE.write_text(json.dumps(outbox))
+    queue_outbox({"handle": handle, "text": text})
 
 
 def _recreate_pending_file(handle: str):
@@ -177,7 +185,7 @@ def handle_finalize(session: dict, config: dict):
             prep = result.get("prep_guide", "")
             if prep:
                 _send_outbox(admin_handle, prep)
-        session["state"] = "complete"
+        session.pop("state", None)  # "complete" is bridge-owned — MenuBuilder holds it
         _save_session(session)
         log.info("Menu workflow complete.")
     else:
@@ -317,7 +325,8 @@ def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
     lower = text.lower().strip()
     pending = session.get("pending_confirmation", {})
     suggested = session.get("pending_suggested", "")
-    prev_state = session.get("pre_confirmation_state", "awaiting_meal_approval")
+    # prev_state is None when confirmation began during a bridge phase
+    prev_state = session.get("pre_confirmation_state")
 
     def _clear_pending():
         session.pop("pending_confirmation", None)
@@ -331,9 +340,10 @@ def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
         result = call_menubuilder_tool(tool_name, **args)
         _clear_pending()
 
-        new_state = result.get("state", prev_state)
-        _sync_session_state(new_state)
-        session["state"] = new_state
+        if prev_state:
+            session["state"] = prev_state
+        else:
+            session.pop("state", None)
         updated = result.get("selected_meals")
         if updated:
             session["selected_meals"] = updated
@@ -346,7 +356,10 @@ def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
         note = result.get("note", "")
         return f"{note}\n\n{plan}".strip() if note else plan
     else:
-        session["state"] = prev_state
+        if prev_state:
+            session["state"] = prev_state
+        else:
+            session.pop("state", None)
         _clear_pending()
         _save_session(session)
         return "What's the recipe name?"
@@ -405,8 +418,6 @@ def handle_ashley_reply(text: str, session: dict, config: dict):
         return
 
     new_state = result.get("state", "")
-    if new_state:
-        _sync_session_state(new_state)
 
     if new_state == "complete":
         if admin_handle:
@@ -473,8 +484,19 @@ def _handle_pending_url_swap(text: str, session: dict, config: dict):
             _send_outbox(admin_handle, f"Ashley chose existing recipe '{existing}' for {day}.")
 
     session.pop("pending_url_swap", None)
+
+    # process_recipe_url doesn't return the full selected_meals dict (only
+    # swapped_day/outgoing_recipe) — refresh from the bridge instead of
+    # trusting a partial/stale local mirror.
+    wf = call_menubuilder_tool("get_workflow_state")
+    if isinstance(wf, dict) and wf.get("selected_meals"):
+        session["selected_meals"] = wf["selected_meals"]
     _save_session(session)
-    call_menubuilder_tool("approve_menu")
+
+    call_menubuilder_tool(
+        "approve_menu",
+        expected_selected_meals=session.get("selected_meals", {}),
+    )
 
 
 # ── _handle_idea_content ──────────────────────────────────────────────────────
@@ -718,7 +740,8 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         quick_days = result.get("quick_days", [])
         session["selected_meals"] = selected
         session["quick_days"] = quick_days
-        session["state"] = "awaiting_meal_approval"
+        # awaiting_meal_approval is bridge-owned — hand state over to MenuBuilder
+        session.pop("state", None)
         _save_session(session)
 
         # MCP already wrote to activity — no advance_to_meal_approval needed
@@ -744,9 +767,6 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         )
         if confirm_msg is not None:
             return confirm_msg
-        new_state = result.get("state", session.get("state"))
-        _sync_session_state(new_state)
-        session["state"] = new_state
         updated = result.get("selected_meals")
         if updated:
             session["selected_meals"] = updated
@@ -757,7 +777,27 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         return f"{note}\n\n{plan}" if note else plan
 
     if tool_name == "approve_menu":
-        result = call_menubuilder_tool("approve_menu")
+        result = call_menubuilder_tool(
+            "approve_menu",
+            expected_selected_meals=session.get("selected_meals", {}),
+        )
+        if result.get("error") == "selected_meals_mismatch":
+            log.warning(
+                f"approve_menu blocked — plan drifted. "
+                f"expected={result.get('expected')} actual={result.get('actual')}"
+            )
+            session["selected_meals"] = result.get("actual", {})
+            _save_session(session)
+            week_start = date.fromisoformat(session["week_start"])
+            plan = _format_numbered_list(
+                session["selected_meals"], week_start, session.get("quick_days", [])
+            )
+            return (
+                "Hold on — the plan changed since we last talked about it "
+                "(maybe another session touched it). Here's what's actually "
+                f"current:\n\n{plan}\n\nSay \"send it\" again if this looks "
+                "right, or make changes first."
+            )
         if "error" in result:
             log.error(f"approve_menu MCP error: {result['error']}")
             return "Something went wrong sending the menu to Ashley — check the logs."
@@ -769,7 +809,8 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         )
         if "error" in sl_result:
             log.warning(f"generate_shopping_list failed: {sl_result['error']}")
-        session["state"] = "awaiting_ashley_signoff"
+        # awaiting_ashley_signoff is bridge-owned — hand state over to MenuBuilder
+        session.pop("state", None)
         _save_session(session)
         return "Menu sent to Ashley."
 
@@ -831,16 +872,30 @@ def _build_menu_system_prompt(session: dict) -> str:
 
 # ── Main agent entry point ────────────────────────────────────────────────────
 
-def menu_agent_reply(text: str, session: dict, config: dict) -> str:
+def _describe_tool_call(name: str, tool_input: dict) -> str:
+    """Terse record of an executed tool call, safe to persist in the
+    conversation history (goes through the 40-turn cap)."""
+    try:
+        args = json.dumps(tool_input, default=str)
+    except Exception:
+        args = str(tool_input)
+    if len(args) > 100:
+        args = args[:100] + "..."
+    return f"{name} {args}"
+
+
+def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str = "") -> str:
     """
     Route an inbound message from the menu admin through Claude agent tool-use.
     Replaces the old dispatch() state machine.
+    bridge_state is MenuBuilder's workflow state as read by server.py routing
+    via get_workflow_state (empty when routing matched a local sub-state).
     Conversation history is accumulated in session["conversation"] and persisted
     to menu_session.json so context survives across SMS gaps.
     """
     import anthropic as _anthropic
 
-    state = session.get("state", "idle")
+    state = session.get("state") or ""
 
     # Hold/pause — acknowledge and exit without advancing state
     if any(p in text.lower() for p in ("hold", "pause", "not now", "later", "stop for now")):
@@ -862,15 +917,12 @@ def menu_agent_reply(text: str, session: dict, config: dict) -> str:
         return _handle_idea_url(text, session, config)
 
     # Waiting on Ashley — David just gets a status update
-    if state == "awaiting_ashley_signoff":
+    if bridge_state == "awaiting_ashley_signoff":
         return "Still waiting on Ashley's OK — I'll let you know when she replies."
 
-    # Finalization pass-through
-    if state == "awaiting_finalization":
-        result = call_menubuilder_tool("finalize_plan")
-        _sync_session_state("complete")
-        session["state"] = "complete"
-        _save_session(session)
+    # Finalization pass-through — MenuBuilder owns the transition to complete
+    if bridge_state == "awaiting_finalization":
+        call_menubuilder_tool("finalize_plan")
         return "Plan ready!"
 
     # Build conversation history for this turn
@@ -892,7 +944,7 @@ def menu_agent_reply(text: str, session: dict, config: dict) -> str:
     final_reply = ""
 
     try:
-        for _ in range(5):
+        for _ in range(8):
             response = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=500,
@@ -904,6 +956,7 @@ def menu_agent_reply(text: str, session: dict, config: dict) -> str:
 
             if response.stop_reason == "tool_use":
                 tool_results = []
+                executed = []
                 for block in response.content:
                     if block.type == "tool_use":
                         result = _execute_menu_tool(block.name, block.input, session, config)
@@ -913,15 +966,46 @@ def menu_agent_reply(text: str, session: dict, config: dict) -> str:
                             "tool_use_id": block.id,
                             "content": result,
                         })
+                        executed.append(_describe_tool_call(block.name, block.input))
                 # Append tool use/result to local messages only (not persisted)
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})
+                # Persist a terse record of what ran — tool blocks themselves
+                # are never persisted, and without this the model re-calls the
+                # same tools on the next message
+                if executed:
+                    conversation.append({
+                        "role": "assistant",
+                        "content": "[already done: " + "; ".join(executed) + "]",
+                    })
             else:
                 final_reply = next(
                     (b.text for b in response.content if hasattr(b, "text")),
                     "Sorry, something went wrong."
                 ).strip()
                 break
+
+        if not final_reply:
+            # Every round went to tool calls — force a text-only wrap-up so
+            # the turn never ends with nothing to send. Tools have already
+            # saved their changes, so on error don't invite a retry.
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=500,
+                    system=system,
+                    tools=tools,
+                    tool_choice={"type": "none"},
+                    messages=messages,
+                )
+                final_reply = next(
+                    (b.text for b in response.content if hasattr(b, "text")),
+                    ""
+                ).strip()
+            except Exception as e:
+                log.error(f"Menu finisher error: {e}")
+            if not final_reply:
+                final_reply = "Done — text 'menu' to see the updated week."
 
     except Exception as e:
         log.error(f"Menu agent error: {e}")
