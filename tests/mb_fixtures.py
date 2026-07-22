@@ -76,6 +76,14 @@ SWAP_SUCCESS_WITH_NOTE = {
     "note": "Swapped to an idea recipe.",
 }
 
+# ── approve_menu responses ────────────────────────────────────────────────────
+
+APPROVE_MISMATCH = {
+    "error": "selected_meals_mismatch",
+    "expected": {"Mon": "Test Pasta", "Tue": "Test Tacos"},
+    "actual": {"Mon": "Test Pasta", "Tue": "Test Chicken Tikka Masala"},
+}
+
 SWAP_NEEDS_CONFIRMATION = {
     "status": "needs_confirmation",
     "suggested": "Test Chicken Tikka Masala",
