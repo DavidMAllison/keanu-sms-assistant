@@ -1008,6 +1008,19 @@ class _SendHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
 
+        elif self.path == "/restart":
+            log.info("API /restart: restart requested")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true, "restarting": true}')
+            self.wfile.flush()
+            # Exit after the response is on the wire — launchd's KeepAlive
+            # brings the process back up. Runs self-restarts as allisonbot,
+            # so no cross-user admin password prompt (unlike killing from
+            # the davidallison account).
+            threading.Timer(0.5, lambda: os._exit(0)).start()
+
         else:
             self.send_response(404)
             self.end_headers()
