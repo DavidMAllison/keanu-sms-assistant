@@ -67,6 +67,8 @@ GAPS_FILE = _BASE / "capability_gaps.json"
 OUTBOX_DIR = Path("/Users/Shared/cooking-state/outbox")
 PENDING_FRIEND_FILE = _BASE / ".pending_friend_requests.json"
 INVENTORY_FILE = COOKING_STATE_BASE / "inventory.json"
+MUSIC_API_BASE = os.environ.get("MUSIC_API_BASE")
+MUSIC_ADMIN_KEY = os.environ.get("MUSIC_ADMIN_KEY")
 
 
 def queue_outbox(entry: dict):
@@ -456,6 +458,32 @@ _DEFS = {
             "required": ["recipe", "sentiment"],
         },
     },
+    "add_music_seed": {
+        "name": "add_music_seed",
+        "description": "Mark a song or artist as a seed for this week's music discovery "
+                        "playlist. Call when the user texts something like 'seed this' with a "
+                        "song/artist name, or otherwise clearly asks to add a track/artist as "
+                        "this week's playlist seed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Song and/or artist name as texted, e.g. 'Hurt by Nine Inch Nails' or just 'Nine Inch Nails'"},
+            },
+            "required": ["query"],
+        },
+    },
+    "build_music_playlist": {
+        "name": "build_music_playlist",
+        "description": "Build and create this week's Spotify discovery playlist from whatever "
+                        "artists have been seeded so far. Call when the user texts something like "
+                        "'build my playlist', 'make the playlist now', or 'create playlist' — an "
+                        "on-demand alternative to waiting for the Sunday auto-build.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     "get_lunch_pick": {
         "name": "get_lunch_pick",
         "description": "Look up Ashley's lunch pick for this week. Returns the recipe name, URL, and status ('picked' or 'none'). Use when anyone asks what Ashley is having for lunch this week.",
@@ -556,6 +584,19 @@ _DEFS = {
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    "send_ashley_recipe_batch": {
+        "name": "send_ashley_recipe_batch",
+        "description": (
+            "Pick 5 fresh recipe candidates from the idea queue (favoring quick cook times) "
+            "and text Ashley a link to review just those 5 in the Review UI. Use when David "
+            "asks to send Ashley new recipes to look at, clear out the idea queue, or similar — "
+            "or when Ashley herself asks for more recipes to look through. Returns a confirmation "
+            "to relay back to whoever asked — do not text Ashley directly yourself, this tool "
+            "already does that (even when she's the one who asked, since the link needs to land "
+            "in her own thread)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 }
 
 
@@ -567,9 +608,10 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
              "get_prep_guide", "check_inventory", "get_lunch_pick", "set_lunch_pick", "log_lunch_feedback"]
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal",
-                  "process_recipe_url", "process_recipe_image", "set_recipe_image"]
+                  "process_recipe_url", "process_recipe_image", "set_recipe_image",
+                  "send_ashley_recipe_batch"]
     if is_admin:
-        names += ["update_meal_plan", "update_inventory", "start_menu_workflow"]
+        names += ["update_meal_plan", "update_inventory", "start_menu_workflow", "add_music_seed", "build_music_playlist"]
     return [_DEFS[n] for n in names]
 
 
@@ -1289,6 +1331,92 @@ def _tool_get_prep_guide(mode: str = "auto") -> str:
     return result.get("prep_guide", "No prep guide available for this week.")
 
 
+def _tool_send_ashley_recipe_batch(config: dict) -> str:
+    result = _call_menubuilder_tool("send_ashley_recipe_batch")
+    if "error" in result:
+        if result["error"] == "queue_empty":
+            handle = config["security"]["partner_handle"]
+            trigger = _call_menubuilder_tool("refresh_ashley_recipe_queue", notify_handle=handle)
+            if trigger.get("status") == "started":
+                return ("Idea queue is empty right now — kicking off a refresh. "
+                        "I'll text a fresh batch over in a few minutes once it's ready.")
+            if trigger.get("status") == "already_running":
+                return "Idea queue is empty, and a refresh is already running — hang tight, a batch is on its way."
+            return "Idea queue is empty right now — nothing fresh to send Ashley."
+        log.error(f"send_ashley_recipe_batch bridge error: {result['error']}")
+        return "something went wrong on my end"
+    handle = config["security"]["partner_handle"]
+    picks = result["picks"]
+    queue_outbox({"handle": handle, "text": "5 new recipe ideas to look through when you get a sec:"})
+    for p in picks:
+        time_part = f" ({p['time']})" if p.get("time") else ""
+        queue_outbox({"handle": handle, "text": f"{p['title']}{time_part}\n{p['url']}"})
+    titles = ", ".join(p["title"] for p in picks)
+    return f"Sent Ashley {len(picks)} new recipes to look through: {titles}."
+
+
+def _tool_add_music_seed(query: str) -> str:
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(
+            f"{MUSIC_API_BASE}/api/seed-from-text",
+            data=json.dumps({"query": query}).encode(),
+            headers={
+                "x-admin-key": MUSIC_ADMIN_KEY,
+                "Content-Type": "application/json",
+                "User-Agent": "Keanu-SMS-Assistant/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read().decode())
+        except Exception:
+            log.error(f"add_music_seed request failed: HTTP {e.code}")
+            return "something went wrong reaching the music dashboard"
+    except Exception as e:
+        log.error(f"add_music_seed request failed: {e}")
+        return "something went wrong reaching the music dashboard"
+    if not data.get("ok"):
+        return f"Couldn't find an artist match for '{query}' — try a clearer name."
+    return f"Seeded {data['artist']['name']} for this week's playlist."
+
+
+def _tool_build_music_playlist() -> str:
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(
+            f"{MUSIC_API_BASE}/api/build-playlist",
+            data=b"{}",
+            headers={
+                "x-admin-key": MUSIC_ADMIN_KEY,
+                "Content-Type": "application/json",
+                "User-Agent": "Keanu-SMS-Assistant/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read().decode())
+        except Exception:
+            log.error(f"build_music_playlist request failed: HTTP {e.code}")
+            return "something went wrong reaching the music dashboard"
+    except Exception as e:
+        log.error(f"build_music_playlist request failed: {e}")
+        return "something went wrong reaching the music dashboard"
+    if not data.get("ok"):
+        if data.get("error") == "no seeds yet":
+            return "No seeds picked yet this week — add some first, then ask me to build the playlist."
+        return "Couldn't build a playlist from this week's seeds — try again in a bit."
+    return f"Built \"{data['playlist_name']}\" ({data['track_count']} tracks): {data['playlist_url']}"
+
+
 def _tool_get_lunch_pick() -> str:
     result = _call_menubuilder_tool("get_lunch_pick")
     if "error" in result:
@@ -1359,8 +1487,14 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_set_lunch_pick(inputs["recipe_name"])
         if name == "start_menu_workflow":
             return _tool_start_menu_workflow(config)
+        if name == "send_ashley_recipe_batch":
+            return _tool_send_ashley_recipe_batch(config)
         if name == "log_lunch_feedback":
             return _tool_log_lunch_feedback(inputs["recipe"], inputs["sentiment"], inputs.get("note", ""))
+        if name == "add_music_seed":
+            return _tool_add_music_seed(inputs["query"])
+        if name == "build_music_playlist":
+            return _tool_build_music_playlist()
         if name == "process_recipe_url":
             result = _call_menubuilder_tool("process_recipe_url",
                                             url=inputs["url"],

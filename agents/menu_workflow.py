@@ -38,6 +38,7 @@ LOCAL_STATES = (
     "awaiting_first_cook_feedback",
     "awaiting_meal_logging",
     "awaiting_schedule",
+    "awaiting_cancel_confirmation",
 )
 ACTIVE_BRIDGE_STATES = (
     "awaiting_meal_approval",
@@ -119,7 +120,7 @@ def _save_session(session: dict):
 # ── MenuBuilder MCP bridge ────────────────────────────────────────────────────
 
 from menubuilder_bridge import call_menubuilder_tool  # noqa: E402
-from tools import queue_outbox  # noqa: E402
+from tools import queue_outbox, _tool_get_schedule  # noqa: E402
 
 
 def _send_outbox(handle: str, text: str):
@@ -365,6 +366,63 @@ def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
         return "What's the recipe name?"
 
 
+# ── cancel confirmation ───────────────────────────────────────────────────────
+
+_CANCEL_PHRASES = (
+    "cancel", "stop", "abort", "don't build", "dont build",
+    "never mind", "nevermind", "we already planned", "already planned",
+    "already did this", "skip this week", "forget it", "not needed",
+)
+
+
+def _maybe_start_cancel_confirmation(text: str, session: dict, bridge_state: str) -> Optional[str]:
+    """
+    Detect cancel intent (any state, local or bridge). Doesn't cancel immediately —
+    asks for confirmation first so an offhand "stop" doesn't nuke real progress.
+    Remembers the state to resume to if the answer is no.
+    """
+    if not any(p in text.lower() for p in _CANCEL_PHRASES):
+        return None
+    session["_pre_cancel_state"] = session.get("state", "")
+    session["_pre_cancel_bridge_state"] = bridge_state
+    session["state"] = "awaiting_cancel_confirmation"
+    _save_session(session)
+    return "Just to confirm — want me to cancel this week's menu planning? (yes/no)"
+
+
+def _handle_cancel_confirmation(text: str, session: dict, config: dict) -> str:
+    """
+    awaiting_cancel_confirmation state handler.
+    'yes' -> clears local session; also cancels the MenuBuilder-side workflow via
+    the bridge if the interrupted phase was bridge-owned.
+    Anything else -> restores the state that was active before the cancel prompt.
+    """
+    lower = text.lower().strip()
+    prev_state = session.get("_pre_cancel_state", "")
+    prev_bridge_state = session.get("_pre_cancel_bridge_state", "")
+
+    if any(w in lower for w in _CONFIRM_WORDS) or any(p in lower for p in _CANCEL_PHRASES):
+        note = ""
+        if prev_bridge_state in ACTIVE_BRIDGE_STATES:
+            try:
+                result = call_menubuilder_tool("cancel_workflow")
+                if not isinstance(result, dict) or result.get("error"):
+                    note = (" (Heads up — MenuBuilder's own state may still show "
+                            "this in progress; the cancel_workflow bridge call failed.)")
+            except Exception as e:
+                log.error(f"cancel_workflow bridge call failed: {e}")
+                note = (" (Heads up — MenuBuilder's own state may still show "
+                        "this in progress; couldn't reach the bridge to cancel it.)")
+        _save_session({})
+        return f"Menu planning cancelled — text 'start menu' whenever you want to build it.{note}"
+
+    session["state"] = prev_state
+    session.pop("_pre_cancel_state", None)
+    session.pop("_pre_cancel_bridge_state", None)
+    _save_session(session)
+    return "No worries — picking back up where we left off."
+
+
 # ── handle_ashley_reply ───────────────────────────────────────────────────────
 
 def handle_ashley_reply(text: str, session: dict, config: dict):
@@ -593,6 +651,29 @@ def _build_menu_tools() -> list:
             },
         },
         {
+            "name": "get_schedule",
+            "description": (
+                "Look up upcoming games and practices for a family member from the family schedule. "
+                "Use this to check what's already on the calendar, separately from "
+                "record_schedule_note (which saves a constraint David tells you about)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "person": {
+                        "type": "string",
+                        "description": "Family member name: Eleanor, Wren, David, or Ashley",
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "enum": ["game", "practice", "any"],
+                        "description": "Type of event to look up",
+                    },
+                },
+                "required": ["person", "event_type"],
+            },
+        },
+        {
             "name": "generate_meal_plan",
             "description": (
                 "Generate this week's meal suggestions based on accumulated schedule notes "
@@ -720,6 +801,9 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         _save_session(session)
         log.info(f"Schedule note recorded: {note}")
         return f"Schedule note saved: {note}"
+
+    if tool_name == "get_schedule":
+        return _tool_get_schedule(tool_input.get("person", ""), tool_input.get("event_type", "any"))
 
     if tool_name == "generate_meal_plan":
         cuisine_direction = tool_input.get("cuisine_direction", "")
@@ -896,6 +980,16 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
     import anthropic as _anthropic
 
     state = session.get("state") or ""
+
+    # Cancel confirmation in progress — bypass everything else until answered
+    if state == "awaiting_cancel_confirmation":
+        return _handle_cancel_confirmation(text, session, config)
+
+    # Cancel intent — any state, local or bridge. Asks for confirmation rather
+    # than cancelling immediately (an offhand "stop" shouldn't nuke real progress).
+    cancel_prompt = _maybe_start_cancel_confirmation(text, session, bridge_state)
+    if cancel_prompt:
+        return cancel_prompt
 
     # Hold/pause — acknowledge and exit without advancing state
     if any(p in text.lower() for p in ("hold", "pause", "not now", "later", "stop for now")):

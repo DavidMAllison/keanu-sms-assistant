@@ -19,6 +19,9 @@ The key design goal: every family member uses the device they already have. No a
 - **Sunday menu trigger** — the polling loop fires the weekly menu workflow on the first poll after 9 AM Sunday (no launchd dependency — if the Mac was asleep at 9:00 it fires as soon as Keanu is back up). An 8:30 AM pre-flight checks API credits, the MenuBuilder bridge, shared-file writability, and the tool contract; it texts the admin only on failure — success is log-only
 - **Ashley's weekly lunch** — Saturday 10 AM launchd job sends Ashley 3 lunch suggestions; she replies to pick one; 6 PM nudge if no pick by then; Keanu handles pick and feedback via `set_lunch_pick` and `log_lunch_feedback` (bridge to MenuBuilder)
 - **URL-based meal swaps** — Ashley (or David) can send a recipe URL during menu signoff to add a new recipe and schedule it for a specific day; Keanu checks for similar existing recipes and asks which to use if a close match is found
+- **Menu workflow cancel confirmation** — cancel intent ("stop", "never mind", "already planned", etc.) during any menu-build state prompts for a yes/no confirmation before cancelling, so an offhand remark doesn't nuke real progress; "no" resumes exactly where the session left off
+- **Ashley recipe batch send** — idea submitters can ask Keanu to send Ashley 5 fresh recipe candidates from the idea queue to review; kicks off a queue refresh automatically if the queue is empty
+- **Music playlist seeding** — admin can text a song or artist to seed the week's Spotify discovery playlist, or ask Keanu to build the playlist on demand instead of waiting for the scheduled build
 
 ## How it works
 
@@ -87,11 +90,16 @@ The code lives in `/Users/Shared/sms-assistant/` so both accounts can read and w
 
 ### Restarting
 
-From your main account (prompts for Mac password):
+Preferred — self-restart via the HTTP API, no password prompt (runs as the bot account):
+```bash
+curl -X POST http://localhost:5050/restart
+```
+launchd's `KeepAlive: true` restarts it automatically after the exit.
+
+Fallback — from your main account (prompts for Mac password):
 ```bash
 osascript -e 'do shell script "kill $(pgrep -u botaccount -f server.py)" with administrator privileges'
 ```
-launchd's `KeepAlive: true` restarts it automatically after the kill.
 
 ## Project structure
 
