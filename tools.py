@@ -699,6 +699,19 @@ def _find_in_condiments(name: str) -> Optional[str]:
     return "\n".join(lines)
 
 
+def _append_recipe_notes(text: str, recipe_name: str) -> str:
+    """Append standing family notes/feedback for a recipe, via MenuBuilder's get_recipe_notes."""
+    try:
+        from agents.menu_workflow import call_menubuilder_tool
+        result = call_menubuilder_tool("get_recipe_notes", name=recipe_name)
+        notes = result.get("notes")
+        if notes and result.get("status") != "needs_confirmation":
+            return f"{text}\n\nNotes: {notes}"
+    except Exception:
+        pass
+    return text
+
+
 def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) -> str:
     # First: check the meal plan for a URL
     plan_result = _find_in_meal_plan(name)
@@ -721,6 +734,7 @@ def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) 
                 m = matches[0]
                 text = extract_recipe_text(RECIPES_DIR / m["filename"])
                 if text:
+                    text = _append_recipe_notes(text, meal_name)
                     return f"{text}\n\n[Dropbox link if user wants full recipe: {url}]"
             return f"Full recipe at: {url}"
         else:
@@ -730,6 +744,7 @@ def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) 
                 m = matches[0]
                 text = extract_recipe_text(RECIPES_DIR / m["filename"])
                 if text:
+                    text = _append_recipe_notes(text, meal_name)
                     return f"{text}\n\n[Full recipe at: {url}]"
             if METADATA_FILE.exists():
                 try:
@@ -747,7 +762,8 @@ def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) 
                                 for ing in ingredients:
                                     qty = f"{ing.get('quantity', '')} {ing.get('unit', '')}".strip()
                                     lines.append(f"- {qty} {ing['name']}".strip())
-                                return "\n".join(lines) + f"\n\n[Full recipe at: {url}]"
+                                text = _append_recipe_notes("\n".join(lines), meal_name)
+                                return text + f"\n\n[Full recipe at: {url}]"
                 except Exception:
                     pass
             return f"That one's from an external site — full recipe and ingredients at: {url}"
@@ -787,7 +803,7 @@ def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) 
         # No URL available — fall back to recipe text
         text = extract_recipe_text(RECIPES_DIR / m["filename"])
         if text:
-            return text
+            return _append_recipe_notes(text, m["name"])
 
     # Fall back to search_local_collection (includes URLs, active recipes only)
     local_results = _search_local_collection_safe(name)
@@ -802,6 +818,7 @@ def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) 
         if matches:
             text = extract_recipe_text(RECIPES_DIR / matches[0]["filename"])
             if text:
+                text = _append_recipe_notes(text, title)
                 hint = "Dropbox link if user wants full recipe" if "dropbox.com" in url else "Full recipe"
                 suffix = f"\n\n[{hint}: {url}]" if url else ""
                 return f"{text}{suffix}"

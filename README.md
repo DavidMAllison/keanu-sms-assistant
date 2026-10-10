@@ -8,13 +8,14 @@ The key design goal: every family member uses the device they already have. No a
 
 - **Meal planning** — what's for dinner, ingredients, recipe details
 - **Schedule** — upcoming soccer games, practices, events pulled from a calendar
-- **Recipes** — searches local collection first (all statuses, scored by keyword match); falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally; returns GitHub Pages URL for collection hits
+- **Recipes** — searches local collection first (all statuses, scored by keyword match); falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally; returns GitHub Pages URL for collection hits; appends any standing family notes/feedback for the recipe (via MenuBuilder's `get_recipe_notes`)
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
 - **Feedback** — logs family reactions to meals for future planning
 - **Proactive messages** — holiday morning messages, trash reminders, game-day good-luck texts
 - **Relay** — admin can ask Keanu to forward a message to another family member
 - **Grocery receipts** — send a photo of a receipt and Keanu parses it into the shopping inventory
 - **Recipe ideas from photos** — caption a recipe photo with "save this as an idea" and Keanu drops the raw image into the recipe ideas inbox for later review
+- **Study-guide quizzes** — send a photo of a study guide, worksheet, or practice test (caption keyword like "quiz" or "practice test" skips confirmation; otherwise Haiku vision detects it and asks first) and Keanu generates a practice quiz with an answer key
 - **Image vision** — reads images sent via iMessage (HEIC auto-converted to JPEG)
 - **Sunday menu trigger** — the polling loop fires the weekly menu workflow on the first poll after 9 AM Sunday (no launchd dependency — if the Mac was asleep at 9:00 it fires as soon as Keanu is back up). An 8:30 AM pre-flight checks API credits, the MenuBuilder bridge, shared-file writability, and the tool contract; it texts the admin only on failure — success is log-only
 - **Ashley's weekly lunch** — Saturday 10 AM launchd job sends Ashley 3 lunch suggestions; she replies to pick one; 6 PM nudge if no pick by then; Keanu handles pick and feedback via `set_lunch_pick` and `log_lunch_feedback` (bridge to MenuBuilder)
@@ -109,6 +110,7 @@ agent.py                   # Conversation loop — Claude tool use, per-handle h
 tools.py                   # Tool definitions and implementations
 trigger_menu.py            # Manual fallback — POSTs to /start_menu_workflow on Keanu's HTTP API (Sunday scheduling is handled in-loop now)
 groceryagent_bridge.py     # Subprocess bridge to GroceryAgent receipt parser
+kidquiz_bridge.py          # Subprocess bridge to KidQuiz practice-quiz generator
 menubuilder_bridge.py      # Subprocess bridge to MenuBuilder MCP (Python 3.9→3.12)
 agents/
   menu_workflow.py         # Weekly menu workflow — feedback/schedule/cuisine via agent tool-use; all plan/selection/finalization delegates to MenuBuilder MCP; idea activation handles no-URL case (asks for URL first) and existing URL fetch failures (asks for paste)
