@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from agent import get_reply
 from agents import menu_workflow
 from groceryagent_bridge import call_receipt_parser
+from kidquiz_bridge import call_quiz_generator
 from menubuilder_bridge import call_menubuilder_tool as _call_menubuilder_tool
 from tools import (send_imessage, send_imessage_group, drain_outbox, queue_outbox,
                    OUTBOX_DIR, _pending_image_recipe, INVENTORY_FILE)
@@ -424,6 +425,61 @@ def _is_grocery_receipt_caption(text: str) -> bool:
     return any(kw in lowered for kw in _GROCERY_CAPTION_KEYWORDS)
 
 
+def _is_kidquiz_caption(text: str) -> bool:
+    """Return True if the message caption suggests a study-guide/quiz request."""
+    lowered = text.lower()
+    return any(kw in lowered for kw in _KIDQUIZ_CAPTION_KEYWORDS)
+
+
+def _prepare_kidquiz_images(attachments: list) -> list:
+    """Prepare every image attachment for the KidQuiz bridge.
+
+    Converts HEIC as needed (via _prepare_image_file) and copies each into a
+    stable /tmp/kidquiz_<ts>_<n>.jpg path so the set survives until the bridge
+    call (which may happen immediately or after a pending confirmation).
+    Returns a list of stable file paths; skips attachments that fail to prepare.
+    """
+    ts = int(time.time())
+    stable_paths = []
+    for i, att in enumerate(attachments):
+        prepared = _prepare_image_file(att)
+        if prepared is None:
+            continue
+        file_path, _mime_type = prepared
+        stable_path = f"/tmp/kidquiz_{ts}_{i}.jpg"
+        try:
+            shutil.copy2(str(file_path), stable_path)
+            if str(file_path) != stable_path:
+                Path(file_path).unlink(missing_ok=True)
+            stable_paths.append(stable_path)
+        except Exception as e:
+            log.error(f"Could not prepare kidquiz image {i}: {e}")
+    return stable_paths
+
+
+def _run_kidquiz_bridge(image_paths: list, handle: str, caption: str = ""):
+    """Call the KidQuiz bridge and send the reply to handle via outbox.
+
+    Cleans up all temp files after the call regardless of outcome.
+    """
+    try:
+        result = call_quiz_generator(image_paths, caption=caption)
+        reply = result.get("reply")
+        if not reply:
+            error = result.get("error", "unknown error")
+            log.error(f"KidQuiz bridge returned no reply for {handle}: {error}")
+            reply = "Sorry, I couldn't build that quiz — try a clearer photo?"
+        send_imessage(handle, reply)
+        log.info(f"Quiz processed for {handle}: {reply[:80]}")
+    finally:
+        for image_path in image_paths:
+            try:
+                Path(image_path).unlink(missing_ok=True)
+                log.info(f"Cleaned up temp kidquiz file: {image_path}")
+            except Exception as e:
+                log.warning(f"Could not delete temp file {image_path}: {e}")
+
+
 def _is_recipe_idea_caption(text: str) -> bool:
     """Return True if the message caption indicates the user wants to save a recipe idea."""
     lowered = text.lower()
@@ -514,18 +570,49 @@ def _vision_is_receipt(image_path: str, mime_type: str) -> bool:
         return False
 
 
+def _vision_is_study_guide(image_path: str, mime_type: str) -> bool:
+    """Ask Claude Haiku whether the image is a school study guide/worksheet. Returns True/False."""
+    try:
+        image_data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
+        response = _20q_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime_type, "data": image_data},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Is this image a photo of a school study guide, worksheet, or practice test? Reply with only 'yes' or 'no'.",
+                    },
+                ],
+            }],
+        )
+        answer = response.content[0].text.strip().lower()
+        log.info(f"Vision study-guide check answered: {answer!r}")
+        return answer.startswith("yes")
+    except Exception as e:
+        log.error(f"Vision study-guide check error: {e}")
+        return False
+
+
 def route_image_message(attachments: list, text: str, handle: str,
                         idea_submitters: Optional[list] = None):
-    """Route an inbound image through recipe-idea, grocery, or general vision handling.
+    """Route an inbound image through recipe-idea, kidquiz, grocery, or general vision handling.
 
+    - Path K-A (kidquiz caption keyword): generate a practice quiz immediately, no confirmation.
     - Path 0 (recipe idea caption + authorised handle): extract name via Vision, save idea.
     - Path A (grocery caption keyword): parse receipt immediately, no confirmation.
     - Path B (no keyword):
         - If Haiku thinks it's a receipt: ask user to confirm, set pending state.
+        - Path K-B: else if Haiku thinks it's a study guide: ask user to confirm, set pending state.
         - Otherwise: fall through to general vision handler and return a reply string.
 
-    Returns a reply string only for the general-vision fallback (Path B, not-a-receipt).
-    For Path 0, A, and receipt-confirmation paths, replies are sent directly and None is returned.
+    Returns a reply string only for the general-vision fallback (not a receipt or study guide).
+    For all other paths and their confirmation flows, replies are sent directly and None is returned.
     idea_submitters: if provided, only handles in this list may trigger Path 0.
     """
     if not attachments:
@@ -547,6 +634,19 @@ def route_image_message(attachments: list, text: str, handle: str,
         reply = _run_set_recipe_image(image_path, mime_type, handle, recipe_name)
         send_imessage(handle, reply)
         return None
+
+    # Path K-A — caption indicates a study-guide/quiz request (may span multiple images)
+    if _is_kidquiz_caption(text):
+        log.info(f"Path K-A: kidquiz caption from {handle}, routing to quiz bridge")
+        # The single-image prep above may have created a HEIC-conversion temp file
+        # that _prepare_kidquiz_images will redo for all attachments — clean it up.
+        if image_path != str(Path(attachments[0]["filename"]).expanduser()):
+            Path(image_path).unlink(missing_ok=True)
+        image_paths = _prepare_kidquiz_images(attachments)
+        if not image_paths:
+            return "Sorry, I couldn't read those images — try resending?"
+        _run_kidquiz_bridge(image_paths, handle, caption=text)
+        return None  # reply already sent inside _run_kidquiz_bridge
 
     # Path 0 — caption indicates a recipe idea save request
     if _is_recipe_idea_caption(text):
@@ -581,6 +681,19 @@ def route_image_message(attachments: list, text: str, handle: str,
 
         _pending_receipt[handle] = {"image_path": stable_path}
         send_imessage(handle, "Looks like a grocery receipt — want me to process it? (yes/no)")
+        return None  # confirmation message already sent
+
+    # Path K-B — ask Haiku to check for a study guide/worksheet
+    if _vision_is_study_guide(image_path, mime_type):
+        log.info(f"Path K-B: vision says study guide from {handle}, requesting confirmation")
+        # _prepare_kidquiz_images redoes prep for all attachments (including this one) —
+        # clean up this single-image temp first.
+        Path(image_path).unlink(missing_ok=True)
+        image_paths = _prepare_kidquiz_images(attachments)
+        if not image_paths:
+            return "Sorry, I couldn't read those images — try resending?"
+        _pending_kidquiz[handle] = {"image_paths": image_paths}
+        send_imessage(handle, "Looks like a study guide — want me to make a practice quiz with an answer key? (yes/no)")
         return None  # confirmation message already sent
 
     # Not a receipt — general vision handler
@@ -713,7 +826,7 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
                 OR (a.mime_type LIKE 'image/%')
               )
               {date_filter}
-            ORDER BY m.rowid ASC
+            ORDER BY m.rowid ASC, maj.rowid ASC
         """, params)
         # Deduplicate by rowid — one message can have multiple attachments
         seen: dict = {}
@@ -752,8 +865,15 @@ def is_rate_limited(handle: str, limit: int) -> bool:
 # Keyed by handle. Value: {"image_path": str} — held until user confirms or denies.
 _pending_receipt: dict = {}
 
+# Keyed by handle. Value: {"image_paths": list[str]} — held until user confirms or denies.
+_pending_kidquiz: dict = {}
+
 _GROCERY_CAPTION_KEYWORDS = (
     "receipt", "grocery", "kroger", "costco", "trader joe", "aldi", "whole foods",
+)
+
+_KIDQUIZ_CAPTION_KEYWORDS = (
+    "quiz", "test", "study guide", "practice", "practice test",
 )
 
 _RECIPE_IDEA_CAPTION_KEYWORDS = (
@@ -1120,6 +1240,30 @@ def main():
                     else:
                         # Not a yes/no — fall through to normal routing without consuming
                         log.info(f"Pending receipt for {handle} but reply was not yes/no, falling through")
+
+                # Pending kidquiz confirmation — intercept yes/no before other routing
+                if handle in _pending_kidquiz and not has_image:
+                    lowered = text.strip().lower()
+                    _YES = ("yes", "y", "yep", "yeah", "sure", "ok", "okay")
+                    _NO  = ("no", "n", "nope", "nah", "cancel", "never mind", "nevermind")
+                    if lowered in _YES:
+                        pending = _pending_kidquiz.pop(handle)
+                        log.info(f"Quiz confirmed by {handle}, running bridge")
+                        _run_kidquiz_bridge(pending["image_paths"], handle)
+                        continue
+                    elif lowered in _NO:
+                        pending = _pending_kidquiz.pop(handle)
+                        for image_path in pending["image_paths"]:
+                            try:
+                                Path(image_path).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                        log.info(f"Quiz declined by {handle}, discarding")
+                        send_imessage(handle, "No worries, I'll leave it!")
+                        continue
+                    else:
+                        # Not a yes/no — fall through to normal routing without consuming
+                        log.info(f"Pending kidquiz for {handle} but reply was not yes/no, falling through")
 
                 # Image messages — route via grocery detection or general vision
                 # Exception: if admin is in awaiting_idea_content, pass caption text
