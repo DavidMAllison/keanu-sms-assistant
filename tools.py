@@ -823,7 +823,7 @@ def _tool_get_recipe(name: str, handle: str = "", effort: Optional[str] = None) 
                 suffix = f"\n\n[{hint}: {url}]" if url else ""
                 return f"{text}{suffix}"
         if url:
-            return f"{title}: {url}"
+            return f"{title}\n{url}"
 
     # Not found locally — search externally
     if handle:

@@ -181,11 +181,8 @@ def handle_finalize(session: dict, config: dict):
     result = call_menubuilder_tool("finalize_plan")
     admin_handle = config["security"].get("menu_admin")
     if result.get("state") == "complete":
-        if admin_handle:
-            _send_outbox(admin_handle, "Plan ready — apps launched.")
-            prep = result.get("prep_guide", "")
-            if prep:
-                _send_outbox(admin_handle, prep)
+        # MenuBuilder's finalize_plan already sent the "Plan ready!" + review-UI link
+        # text to admin_handle and partner_handle — don't send a second text here.
         session.pop("state", None)  # "complete" is bridge-owned — MenuBuilder holds it
         _save_session(session)
         log.info("Menu workflow complete.")
@@ -506,7 +503,9 @@ def handle_partner_reply(text: str, session: dict, config: dict):
             if admin_handle:
                 _send_outbox(admin_handle, f"Couldn't parse Partner's reply: '{text}'. Handle manually.")
         else:
-            # Partner requested a change — MenuBuilder re-sent the updated menu
+            # Partner requested a change — MenuBuilder re-sent the updated menu.
+            # Re-arm capture so her reply to the re-sent menu isn't missed.
+            _recreate_pending_file(partner_handle)
             if admin_handle:
                 _send_outbox(admin_handle, f"Partner requested a change: '{text}'. Updated and re-sent.")
     else:
