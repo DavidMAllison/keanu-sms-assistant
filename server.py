@@ -786,6 +786,53 @@ def maybe_handle_menu_status(text: str, handle: str, config: dict, state: dict) 
     return True
 
 
+def maybe_capture_partner_reply(handle: str, text: str, config: dict) -> bool:
+    """If a menu approval is pending and this message is from the partner handle,
+    classify it before treating it as her answer. A bridge failure classifies as
+    "unclear" so it fails safe (keeps the pending file, falls through to the agent)
+    rather than silently consuming an unrelated message as her reply.
+    Returns True if captured (caller should skip further routing), False otherwise.
+    """
+    if not MENU_PENDING_FILE.exists():
+        return False
+    try:
+        pending = json.loads(MENU_PENDING_FILE.read_text())
+        if handle != pending.get("partner_handle"):
+            return False
+
+        r = _call_menubuilder_tool("classify_partner_reply", reply=text)
+        label = r if isinstance(r, str) else "unclear"
+        if label not in ("approve", "swap_request", "eating_out", "swap_plus_approve"):
+            log.info(f"Pending menu reply from {handle} classified '{label}' — not captured, pending file kept")
+            return False
+
+        MENU_RESPONSE_FILE.write_text(json.dumps({
+            "received_at": datetime.now().isoformat(),
+            "message": text,
+        }))
+        MENU_PENDING_FILE.unlink()
+        admin_handle = config["security"].get("menu_admin")
+        if admin_handle:
+            queue_outbox({"handle": admin_handle, "text": f"Partner replied to the menu: {text}"})
+        send_imessage(handle, "Thanks! Passed it on to David.")
+        log.info(f"Menu feedback captured from {handle}: {text[:80]}")
+        # Also advance the menu workflow if awaiting Partner's signoff
+        # (bridge state — read via get_workflow_state, never from menu_session.json)
+        try:
+            wf = _call_menubuilder_tool("get_workflow_state")
+            if isinstance(wf, dict) and wf.get("state") == "awaiting_partner_signoff":
+                wf_session = {}
+                if MENU_SESSION_FILE.exists():
+                    wf_session = json.loads(MENU_SESSION_FILE.read_text())
+                menu_workflow.handle_partner_reply(text, wf_session, config)
+        except Exception as e:
+            log.error(f"Partner reply session update error: {e}")
+        return True
+    except Exception as e:
+        log.error(f"Menu pending check error: {e}")
+        return False
+
+
 # ── iMessage send ──────────────────────────────────────────────────────────────
 # send_imessage and send_imessage_group imported from tools
 
@@ -1359,43 +1406,9 @@ def main():
                         log.error(f"Menu session routing error: {e}")
 
                 # Menu approval pending — capture partner's response, but only when
-                # it's actually menu-related. A bridge failure classifies as "unclear"
-                # so it fails safe (keeps the pending file, falls through to the agent)
-                # rather than silently consuming an unrelated message as her answer.
-                if MENU_PENDING_FILE.exists():
-                    try:
-                        pending = json.loads(MENU_PENDING_FILE.read_text())
-                        if handle == pending.get("partner_handle"):
-                            r = _call_menubuilder_tool("classify_partner_reply", reply=text)
-                            label = r if isinstance(r, str) else "unclear"
-                            if label in ("approve", "swap_request", "eating_out", "swap_plus_approve"):
-                                MENU_RESPONSE_FILE.write_text(json.dumps({
-                                    "received_at": datetime.now().isoformat(),
-                                    "message": text,
-                                }))
-                                MENU_PENDING_FILE.unlink()
-                                admin_handle = config["security"].get("menu_admin")
-                                if admin_handle:
-                                    queue_outbox({"handle": admin_handle, "text": f"Partner replied to the menu: {text}"})
-                                send_imessage(handle, "Thanks! Passed it on to David.")
-                                log.info(f"Menu feedback captured from {handle}: {text[:80]}")
-                                # Also advance the menu workflow if awaiting Partner's signoff
-                                # (bridge state — read via get_workflow_state, never from
-                                # menu_session.json)
-                                try:
-                                    wf = _call_menubuilder_tool("get_workflow_state")
-                                    if isinstance(wf, dict) and wf.get("state") == "awaiting_partner_signoff":
-                                        wf_session = {}
-                                        if MENU_SESSION_FILE.exists():
-                                            wf_session = json.loads(MENU_SESSION_FILE.read_text())
-                                        menu_workflow.handle_partner_reply(text, wf_session, config)
-                                except Exception as e:
-                                    log.error(f"Partner reply session update error: {e}")
-                                continue
-                            else:
-                                log.info(f"Pending menu reply from {handle} classified '{label}' — not captured, pending file kept")
-                    except Exception as e:
-                        log.error(f"Menu pending check error: {e}")
+                # it's actually menu-related (see maybe_capture_partner_reply).
+                if maybe_capture_partner_reply(handle, text, config):
+                    continue
 
                 # Sunday menu feedback from idea submitters → forward to admin
                 admin = config["security"].get("menu_admin")

@@ -127,6 +127,7 @@ evals/
 tests/
   test_menu_workflow.py    # Unit tests for menu workflow routing and state (no API calls)
   test_menu_guardrails.py  # start_menu_workflow tool guard + "menu status" keyword
+  test_partner_reply_capture.py  # Pending-reply classification gate (maybe_capture_partner_reply) + pending-file re-arm
   test_outbox_spool.py     # Outbox spool queue/drain/quarantine
   test_sunday_trigger.py   # In-loop Sunday trigger guard
   test_tool_contract.py    # Bridge call sites vs live MenuBuilder signatures (also pre-flight check 4)
