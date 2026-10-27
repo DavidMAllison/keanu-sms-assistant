@@ -709,7 +709,9 @@ def _build_menu_tools() -> list:
             "description": (
                 "Swap the meal for a specific day in the current plan. "
                 "Call once per day when David asks to change something. "
-                "Pass the day abbreviation and his reason — the system handles finding a replacement."
+                "Pass the day abbreviation and his reason — the system handles finding a replacement. "
+                "Never use this for a recipe URL, and never pass a name guessed from a URL — "
+                "use add_recipe_url instead."
             ),
             "input_schema": {
                 "type": "object",
@@ -740,6 +742,30 @@ def _build_menu_tools() -> list:
                     },
                 },
                 "required": ["day", "reason"],
+            },
+        },
+        {
+            "name": "add_recipe_url",
+            "description": (
+                "Add a recipe from a URL David sends and put it on a day in the plan. "
+                "Use this for every recipe link — never turn a URL into a name for swap_meal. "
+                "If it returns a similar existing recipe, ask David which he wants: for the existing "
+                "one call swap_meal with that exact name; for the new one call this again with force_add=true."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The recipe URL exactly as David sent it"},
+                    "day": {
+                        "type": "string",
+                        "description": "Three-letter day abbreviation to put it on (Mon–Sun). Omit if David didn't name a day.",
+                    },
+                    "force_add": {
+                        "type": "boolean",
+                        "description": "True only after David chose the new recipe over a similar existing one",
+                    },
+                },
+                "required": ["url"],
             },
         },
         {
@@ -863,6 +889,10 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         )
         if confirm_msg is not None:
             return confirm_msg
+        if result.get("error") == "plan_finalized":
+            return ("This week's plan is already finalized, so it can't be changed from the menu build. "
+                    "Tell David to text the swap as a normal message and it'll update the plan, "
+                    "shopping list and calendar.")
         if result.get("error"):
             return f"Couldn't make that swap: {result['error']}"
         updated = result.get("selected_meals")
@@ -873,6 +903,35 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         plan = _format_numbered_list(session.get("selected_meals", {}), week_start, session.get("quick_days", []))
         note = result.get("note", "")
         return f"{note}\n\n{plan}" if note else plan
+
+    if tool_name == "add_recipe_url":
+        url = tool_input.get("url", "")
+        day = tool_input.get("day", "")
+        result = call_menubuilder_tool(
+            "process_recipe_url", url=url, day=day, force_add=bool(tool_input.get("force_add")),
+        )
+        status = result.get("status")
+        if status == "similar_exists":
+            return (
+                f"Similar recipe already in the collection: \"{result.get('recipe', '')}\" "
+                f"({result.get('match_score', 0):.0%} match). Ask David whether to use that one "
+                f"or add the new recipe from the link."
+            )
+        if status != "added":
+            return f"Couldn't add that recipe: {result.get('error') or result.get('message') or 'fetch failed'}"
+        title = result.get("recipe", "")
+        if result.get("note"):
+            # Plan already finalized — recipe saved but not put on the day
+            return f"Added '{title}' to the collection. {result['note']}"
+        if result.get("swapped_day"):
+            selected = dict(session.get("selected_meals", {}))
+            selected[result["swapped_day"]] = title
+            session["selected_meals"] = selected
+            _save_session(session)
+            week_start = date.fromisoformat(session["week_start"])
+            plan = _format_numbered_list(selected, week_start, session.get("quick_days", []))
+            return f"Added '{title}' and put it on {result['swapped_day']}.\n\n{plan}"
+        return f"Added '{title}' to the collection (no day given — ask David which day it's for)."
 
     if tool_name == "approve_menu":
         result = call_menubuilder_tool(

@@ -563,6 +563,81 @@ class TestPendingUrlSwap(_Base):
         self.assertEqual(self._session()["selected_meals"], {"Wed": "Test Stir Fry"})
 
 
+class TestAddRecipeUrl(_Base):
+    """
+    A recipe URL in the planning chat goes to process_recipe_url — never a
+    name guessed from the URL slug for swap_meal (Oct 25 Fri mix-up).
+    """
+
+    def _planning_session(self) -> dict:
+        s = {
+            "week_start": "2026-07-07",
+            "selected_meals": {"Mon": "Test Pasta", "Thu": "Test Tacos"},
+            "quick_days": [],
+        }
+        self._write_session(s)
+        return s
+
+    def test_calls_process_recipe_url_with_url_and_day(self):
+        session = self._planning_session()
+        mock_mb = MagicMock(return_value={"status": "added", "recipe": "Test Pork", "swapped_day": "Thu"})
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb):
+            mw._execute_menu_tool("add_recipe_url", {"url": "https://example.com/r", "day": "Thu"}, session, FAKE_CONFIG)
+        mock_mb.assert_called_once_with("process_recipe_url", url="https://example.com/r", day="Thu", force_add=False)
+
+    def test_added_updates_local_plan_and_shows_it(self):
+        session = self._planning_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"status": "added", "recipe": "Test Pork", "swapped_day": "Thu"}):
+            reply = mw._execute_menu_tool("add_recipe_url", {"url": "https://example.com/r", "day": "Thu"}, session, FAKE_CONFIG)
+        self.assertIn("Test Pork", reply)
+        self.assertEqual(self._session()["selected_meals"]["Thu"], "Test Pork")
+
+    def test_similar_exists_asks_instead_of_swapping(self):
+        session = self._planning_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"status": "similar_exists", "recipe": "Test Tacos", "match_score": 0.8}):
+            reply = mw._execute_menu_tool("add_recipe_url", {"url": "https://example.com/r", "day": "Thu"}, session, FAKE_CONFIG)
+        self.assertIn("Test Tacos", reply)
+        self.assertIn("Ask David", reply)
+        self.assertEqual(self._session(), {"week_start": "2026-07-07",
+                                           "selected_meals": {"Mon": "Test Pasta", "Thu": "Test Tacos"},
+                                           "quick_days": []})
+
+    def test_force_add_is_passed_through(self):
+        session = self._planning_session()
+        mock_mb = MagicMock(return_value={"status": "added", "recipe": "Test Pork", "swapped_day": "Thu"})
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb):
+            mw._execute_menu_tool("add_recipe_url",
+                                  {"url": "https://example.com/r", "day": "Thu", "force_add": True}, session, FAKE_CONFIG)
+        self.assertTrue(mock_mb.call_args.kwargs["force_add"])
+
+    def test_fetch_failure_reports_error(self):
+        session = self._planning_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value={"error": "fetch failed: 403"}):
+            reply = mw._execute_menu_tool("add_recipe_url", {"url": "https://example.com/r", "day": "Thu"}, session, FAKE_CONFIG)
+        self.assertIn("Couldn't add that recipe", reply)
+        self.assertIn("403", reply)
+
+    def test_finalized_note_is_passed_through(self):
+        session = self._planning_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"status": "added", "recipe": "Test Pork",
+                                 "note": "Plan is finalized -- 'Test Pork' was added but not swapped in."}):
+            reply = mw._execute_menu_tool("add_recipe_url", {"url": "https://example.com/r", "day": "Thu"}, session, FAKE_CONFIG)
+        self.assertIn("not swapped in", reply)
+        self.assertEqual(self._session()["selected_meals"]["Thu"], "Test Tacos")
+
+    def test_swap_meal_plan_finalized_gives_readable_reply(self):
+        session = self._planning_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"error": "plan_finalized", "message": "already finalized"}):
+            reply = mw._execute_menu_tool("swap_meal", {"day": "Thu", "reason": "x", "replacement": "Test Pork"},
+                                          session, FAKE_CONFIG)
+        self.assertIn("already finalized", reply)
+        self.assertNotIn("plan_finalized", reply)
+
+
 class TestPartnerSwapErrors(_Base):
     """
     Partner's URL swaps used to discard the swap_meal result and confirm

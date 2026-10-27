@@ -522,6 +522,22 @@ _DEFS = {
             "required": ["day", "outgoing", "incoming"],
         },
     },
+    "switch_days": {
+        "name": "switch_days",
+        "description": (
+            "Switch the dinners on two days already in this week's plan (e.g. 'switch Tue and Wed', "
+            "'do the salad tonight and the miso tomorrow'). Both meals stay in the plan, so use this "
+            "instead of two swap_meal calls. Also offer it when swap_meal says the recipe is already planned."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "day_a": {"type": "string", "description": "Day label as shown in the meal plan, e.g. 'Tue 10/27'"},
+                "day_b": {"type": "string", "description": "The other day label, e.g. 'Wed 10/28'"},
+            },
+            "required": ["day_a", "day_b"],
+        },
+    },
     "process_recipe_url": {
         "name": "process_recipe_url",
         "description": (
@@ -607,7 +623,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
              "log_feedback", "log_preference", "log_capability_gap", "relay_message",
              "get_prep_guide", "check_inventory", "get_lunch_pick", "set_lunch_pick", "log_lunch_feedback"]
     if is_idea_submitter:
-        names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal",
+        names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal", "switch_days",
                   "process_recipe_url", "process_recipe_image", "set_recipe_image",
                   "send_partner_recipe_batch"]
     if is_admin:
@@ -1335,9 +1351,36 @@ def _tool_swap_meal(day: str, outgoing: str, incoming: str,
                 "ingredients as a list, and instructions), then call swap_meal again with "
                 "incoming_content set to {title, time, servings, ingredients: [str], instructions: [str]}."
             )
+        if result.get("message") == "already_planned":
+            # Recipe is already on another night — reorder instead of duplicating
+            return (
+                f"already_planned: {result.get('detail', 'That recipe is already on another night.')} "
+                "Offer to switch the two days with switch_days instead."
+            )
         return f"Swap failed: {result.get('message', 'unknown error')}"
 
     return result.get("message", f"Swapped {outgoing} → {incoming} on {day}.")
+
+
+def _tool_switch_days(day_a: str, day_b: str) -> str:
+    import os
+    orig = os.environ.get("HOME")
+    os.environ["HOME"] = _DAVID_HOME
+    try:
+        from meal_swap import reorder_days
+        result = reorder_days(day_a, day_b)
+    except Exception as e:
+        log.error(f"reorder_days error: {e}", exc_info=True)
+        return f"Switch failed: {e}"
+    finally:
+        if orig is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = orig
+
+    if not result.get("success"):
+        return f"Switch failed: {result.get('message', 'unknown error')}"
+    return result.get("message", f"Switched {day_a} and {day_b}.")
 
 
 def _tool_get_prep_guide(mode: str = "auto") -> str:
@@ -1494,6 +1537,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
         if name == "swap_meal":
             return _tool_swap_meal(inputs["day"], inputs["outgoing"], inputs["incoming"],
                                    inputs.get("incoming_content"))
+        if name == "switch_days":
+            return _tool_switch_days(inputs["day_a"], inputs["day_b"])
         if name == "get_prep_guide":
             return _tool_get_prep_guide(inputs.get("mode", "auto"))
         if name == "check_inventory":
