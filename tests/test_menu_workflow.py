@@ -638,6 +638,87 @@ class TestAddRecipeUrl(_Base):
         self.assertNotIn("plan_finalized", reply)
 
 
+class TestTypedNameConfirmation(_Base):
+    """
+    MenuBuilder only applies a typed recipe name on a confirmed=True re-call
+    (Oct 27 2026). The reply picks from the options it offered.
+    """
+
+    _NEEDS = {
+        "status": "needs_confirmation",
+        "suggested": "Test Salad A",
+        "options": [{"recipe": "Test Salad A", "url": "u1"}, {"recipe": "Test Salad B", "url": "u2"}],
+        "message": "Which one did you mean? 1) Test Salad A - u1 2) Test Salad B - u2",
+    }
+
+    def _pending_session(self) -> dict:
+        s = {"week_start": "2026-07-07", "selected_meals": {"Tue": "Test Tacos"}, "quick_days": []}
+        self._write_session(s)
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=self._NEEDS):
+            msg = mw._execute_menu_tool("swap_meal", {"day": "Tue", "reason": "x", "replacement": "salad"},
+                                        s, FAKE_CONFIG)
+        self.assertEqual(msg, self._NEEDS["message"])
+        return json.loads(self.session_path.read_text())
+
+    def test_options_are_saved_with_pending(self):
+        session = self._pending_session()
+        self.assertEqual(session["pending_confirmation"]["options"], ["Test Salad A", "Test Salad B"])
+
+    def _reply(self, text):
+        session = self._pending_session()
+        mock_mb = MagicMock(return_value={"selected_meals": {"Tue": "Test Salad B"}})
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb):
+            mw._handle_recipe_confirmation(text, session, FAKE_CONFIG)
+        return mock_mb
+
+    def test_number_picks_that_option_with_confirmed(self):
+        mock_mb = self._reply("2")
+        self.assertEqual(mock_mb.call_args.kwargs["replacement"], "Test Salad B")
+        self.assertTrue(mock_mb.call_args.kwargs["confirmed"])
+
+    def test_option_name_picks_that_option(self):
+        mock_mb = self._reply("the test salad b one")
+        self.assertEqual(mock_mb.call_args.kwargs["replacement"], "Test Salad B")
+
+    def test_yes_picks_suggested_with_confirmed(self):
+        mock_mb = self._reply("yes")
+        self.assertEqual(mock_mb.call_args.kwargs["replacement"], "Test Salad A")
+        self.assertTrue(mock_mb.call_args.kwargs["confirmed"])
+
+    def test_out_of_range_number_does_not_swap(self):
+        mock_mb = self._reply("5")
+        mock_mb.assert_not_called()
+
+    def test_add_recipe_url_exists_puts_it_on_the_day(self):
+        s = {"week_start": "2026-07-07", "selected_meals": {"Thu": "Test Tacos"}, "quick_days": []}
+        self._write_session(s)
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"status": "exists", "recipe": "Test Pork", "swapped_day": "Thu"}):
+            reply = mw._execute_menu_tool("add_recipe_url", {"url": "https://example.com/p", "day": "Thu"},
+                                          s, FAKE_CONFIG)
+        self.assertIn("already in the collection", reply)
+        self.assertEqual(json.loads(self.session_path.read_text())["selected_meals"]["Thu"], "Test Pork")
+
+    def test_partner_link_derived_swap_is_confirmed(self):
+        self._write_session({"week_start": "2026-07-07"})
+        session = json.loads(self.session_path.read_text())
+        calls = []
+
+        def fake_mb(tool_name, **kwargs):
+            calls.append((tool_name, kwargs))
+            if tool_name == "handle_partner_reply":
+                return {"has_url": True, "url": "https://example.com/r", "extracted_day": "Thu"}
+            if tool_name == "process_recipe_url":
+                return {"status": "added", "recipe": "Test Tacos"}
+            return {"selected_meals": {}}
+
+        with patch("agents.menu_workflow.call_menubuilder_tool", side_effect=fake_mb), \
+             patch("agents.menu_workflow._send_to_partner"):
+            mw.handle_partner_reply("thursday https://example.com/r", session, FAKE_CONFIG)
+        swap = next(kw for name, kw in calls if name == "swap_meal")
+        self.assertTrue(swap["confirmed"])
+
+
 class TestPartnerSwapErrors(_Base):
     """
     Partner's URL swaps used to discard the swap_meal result and confirm

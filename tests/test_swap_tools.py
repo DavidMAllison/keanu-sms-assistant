@@ -69,5 +69,41 @@ class TestSwapMealAlreadyPlanned(unittest.TestCase):
         self.assertIn("switch_days", reply)
 
 
+class TestSwapMealConfirmation(unittest.TestCase):
+
+    def _swap(self, return_value, confirmed=False):
+        swap = MagicMock(return_value=return_value)
+        with patch.dict(sys.modules, {"meal_swap": _fake_meal_swap(execute_swap=swap)}), \
+             patch("tools.find_all_recipe_matches", return_value=[{"name": "Test Salad"}]):
+            reply = tools._tool_swap_meal("Tue 10/27", "Test Miso", "test salad", confirmed=confirmed)
+        return reply, swap
+
+    def test_needs_confirmation_relays_question_verbatim(self):
+        reply, _ = self._swap({
+            "success": False,
+            "message": "needs_confirmation",
+            "detail": "Is this the right recipe? Test Salad - https://example.com/salad",
+        })
+        self.assertTrue(reply.startswith("needs_confirmation"))
+        self.assertIn("Is this the right recipe? Test Salad - https://example.com/salad", reply)
+        self.assertIn("confirmed=true", reply)
+
+    def test_confirmed_defaults_false_and_passes_through(self):
+        _, swap = self._swap({"success": True, "message": "ok"})
+        self.assertFalse(swap.call_args.kwargs["confirmed"])
+        _, swap = self._swap({"success": True, "message": "ok"}, confirmed=True)
+        self.assertTrue(swap.call_args.kwargs["confirmed"])
+
+
+class TestRecipeUrlExists(unittest.TestCase):
+
+    def test_save_recipe_idea_exact_link_says_already_in_collection(self):
+        with patch("tools._call_menubuilder_tool",
+                   return_value={"status": "exists", "recipe": "Test Salad", "url": "https://example.com/s"}):
+            reply = tools._tool_save_recipe_idea("https://example.com/s")
+        self.assertIn("already in the collection", reply)
+        self.assertNotIn("Couldn't fetch", reply)
+
+
 if __name__ == "__main__":
     unittest.main()

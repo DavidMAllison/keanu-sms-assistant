@@ -417,7 +417,7 @@ def is_menu_change(message: str) -> bool:
     ))
 
 
-def update_meal_plan(message: str) -> Optional[dict]:
+def update_meal_plan(message: str, confirmed: bool = False) -> Optional[dict]:
     """
     Parse a menu change request and call the MenuBuilder MCP.
     Returns the raw MCP result dict, or None if the message couldn't be parsed.
@@ -457,7 +457,7 @@ def update_meal_plan(message: str) -> Optional[dict]:
         from menubuilder_bridge import call_menubuilder_tool
         _WEEKDAY_TO_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         day_abbrev = _WEEKDAY_TO_ABBREV[target_date.weekday()]
-        return call_menubuilder_tool("update_plan_meal", day=day_abbrev, title=new_recipe)
+        return call_menubuilder_tool("update_plan_meal", day=day_abbrev, title=new_recipe, confirmed=confirmed)
     except Exception:
         return None
 

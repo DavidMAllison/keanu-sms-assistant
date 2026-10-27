@@ -240,8 +240,8 @@ _DEFS = {
         "name": "update_meal_plan",
         "description": (
             "Change a meal in the weekly plan. Admin only. "
-            "If this tool returns a confirmation prompt and the user says yes, "
-            "re-call with instruction like 'change [day] to [exact confirmed name]'."
+            "If this tool returns needs_confirmation, send its question to the user word for word; "
+            "once they pick, re-call with instruction like 'change [day] to [exact chosen name]' and confirmed=true."
         ),
         "input_schema": {
             "type": "object",
@@ -253,6 +253,7 @@ _DEFS = {
                         "When confirming a fuzzy match, use the exact name from the previous response."
                     ),
                 },
+                "confirmed": {"type": "boolean", "description": "True only on the re-call after the user picked one of the recipes MenuBuilder asked about"},
             },
             "required": ["instruction"],
         },
@@ -499,7 +500,9 @@ _DEFS = {
             "Swap a meal in the current week's plan. Confirm day + outgoing recipe with the user first. "
             "Pass incoming as a recipe name (existing collection) or a URL (new recipe). "
             "If the result starts with 'fetch_failed', ask the user to paste the recipe content and "
-            "call again with incoming_content."
+            "call again with incoming_content. If it starts with 'needs_confirmation', send the question "
+            "to the user word for word; once they pick, call again with that exact recipe name as "
+            "incoming and confirmed=true."
         ),
         "input_schema": {
             "type": "object",
@@ -518,6 +521,7 @@ _DEFS = {
                         "instructions": {"type": "array", "items": {"type": "string"}},
                     },
                 },
+                "confirmed": {"type": "boolean", "description": "True only on the re-call after the user picked one of the recipes MenuBuilder asked about"},
             },
             "required": ["day", "outgoing", "incoming"],
         },
@@ -971,6 +975,8 @@ def _tool_save_recipe_idea(content: str) -> str:
         status = result.get("status")
         if status == "added":
             return f"Added '{result['recipe']}' to the collection. It's ready to use."
+        elif status == "exists":
+            return f"'{result['recipe']}' is already in the collection — that's the same link."
         elif status == "similar_exists":
             return f"Already have something similar: \"{result['recipe']}\" ({result.get('match_score', 0):.0%} match). Use that one, or confirm to add this new variety?"
         else:
@@ -978,15 +984,16 @@ def _tool_save_recipe_idea(content: str) -> str:
     return "Saved to the ideas list." if _save_idea(content) else "Couldn't save that one."
 
 
-def _tool_update_meal_plan(instruction: str) -> str:
-    result = _update_plan(instruction)
+def _tool_update_meal_plan(instruction: str, confirmed: bool = False) -> str:
+    result = _update_plan(instruction, confirmed=confirmed)
     if result is None:
         return "Couldn't parse that — try 'change Thursday to chicken tacos'."
     if result.get("status") == "needs_confirmation":
-        suggested = result["suggested"]
+        # MenuBuilder never applies a typed name until the user picks one
         return (
-            f"I found '{suggested}' — did you mean that? "
-            "Reply yes to confirm, or give me the exact name."
+            f"needs_confirmation: {result.get('message') or 'Did you mean ' + repr(result['suggested']) + '?'} "
+            "Send that to the user word for word. After they pick, call update_meal_plan again "
+            "with the exact recipe name and confirmed=true."
         )
     if result.get("success"):
         return f"Updated: {result['title']}"
@@ -1317,10 +1324,10 @@ def _tool_log_capability_gap(description: str, handle: str) -> str:
 
 
 def _tool_swap_meal(day: str, outgoing: str, incoming: str,
-                    incoming_content: Optional[dict] = None) -> str:
+                    incoming_content: Optional[dict] = None, confirmed: bool = False) -> str:
     import os
     is_url = incoming.startswith("http")
-    kwargs = {"day": day, "outgoing_recipe": outgoing}
+    kwargs = {"day": day, "outgoing_recipe": outgoing, "confirmed": confirmed}
     if incoming_content:
         kwargs["incoming_content"] = incoming_content
     elif is_url:
@@ -1350,6 +1357,13 @@ def _tool_swap_meal(day: str, outgoing: str, incoming: str,
                 "Ask the user to paste the full recipe content (title, cook time, servings, "
                 "ingredients as a list, and instructions), then call swap_meal again with "
                 "incoming_content set to {title, time, servings, ingredients: [str], instructions: [str]}."
+            )
+        if result.get("message") == "needs_confirmation":
+            # Typed names are never trusted on their own — ask, then re-call confirmed
+            return (
+                f"needs_confirmation: {result.get('detail', 'Which recipe did you mean?')} "
+                "Send that to the user word for word. After they pick, call swap_meal again with "
+                "that exact recipe name as incoming and confirmed=true."
             )
         if result.get("message") == "already_planned":
             # Recipe is already on another night — reorder instead of duplicating
@@ -1521,7 +1535,7 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
         if name == "save_recipe_idea":
             return _tool_save_recipe_idea(inputs["content"])
         if name == "update_meal_plan":
-            return _tool_update_meal_plan(inputs["instruction"])
+            return _tool_update_meal_plan(inputs["instruction"], bool(inputs.get("confirmed")))
         if name == "log_feedback":
             return _tool_log_feedback(inputs["recipe"], inputs["feedback"], inputs["sentiment"], handle)
         if name == "log_preference":
@@ -1536,7 +1550,7 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_relay_message(inputs["recipient"], inputs["message"], config)
         if name == "swap_meal":
             return _tool_swap_meal(inputs["day"], inputs["outgoing"], inputs["incoming"],
-                                   inputs.get("incoming_content"))
+                                   inputs.get("incoming_content"), bool(inputs.get("confirmed")))
         if name == "switch_days":
             return _tool_switch_days(inputs["day_a"], inputs["day_b"])
         if name == "get_prep_guide":
@@ -1564,6 +1578,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             status = result.get("status")
             if status == "added":
                 return f"Added '{result['recipe']}' to the collection. It's ready to use."
+            elif status == "exists":
+                return f"'{result['recipe']}' is already in the collection — that's the same link."
             elif status == "similar_exists":
                 return (f"Similar recipe already exists: \"{result['recipe']}\" "
                         f"({result.get('match_score', 0):.0%} match). "

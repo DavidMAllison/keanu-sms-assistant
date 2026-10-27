@@ -302,7 +302,11 @@ def _handle_needs_confirmation(
     """
     if result.get("status") != "needs_confirmation":
         return None
-    session["pending_confirmation"] = {"tool": tool_name, "args": args}
+    session["pending_confirmation"] = {
+        "tool": tool_name,
+        "args": args,
+        "options": [o.get("recipe", "") for o in result.get("options", []) if o.get("recipe")],
+    }
     session["pending_suggested"] = result["suggested"]
     session["pre_confirmation_state"] = session.get("state")
     session["state"] = "awaiting_recipe_confirmation"
@@ -314,15 +318,33 @@ def _handle_needs_confirmation(
 
 _CONFIRM_WORDS = ("yes", "yeah", "yep", "yup", "that's it", "correct", "ok", "okay")
 
+
+def _pick_confirmation_option(lower: str, options: list) -> Optional[str]:
+    """Match a reply like '2', '2)' or an option's recipe name to one of the
+    needs_confirmation options. None when the reply names no option."""
+    m = re.match(r"^#?([1-9])\)?\.?$", lower)
+    if m:
+        i = int(m.group(1)) - 1
+        return options[i] if i < len(options) else None
+    for name in options:
+        if name.lower() in lower:
+            return name
+    return None
+
 def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
     """
     awaiting_recipe_confirmation state handler.
+    '1'/'2'/'3' or an option's name → re-calls original tool with that recipe.
     'yes' → re-calls original tool with suggested name.
     Anything else → restores previous state and asks for re-entry.
+    MenuBuilder only applies a typed-name change on a confirmed=True re-call.
     """
     lower = text.lower().strip()
     pending = session.get("pending_confirmation", {})
-    suggested = session.get("pending_suggested", "")
+    options = pending.get("options", [])
+    chosen = _pick_confirmation_option(lower, options)
+    if chosen is None and any(w in lower for w in _CONFIRM_WORDS):
+        chosen = session.get("pending_suggested", "")
     # prev_state is None when confirmation began during a bridge phase
     prev_state = session.get("pre_confirmation_state")
 
@@ -331,10 +353,11 @@ def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
         session.pop("pending_suggested", None)
         session.pop("pre_confirmation_state", None)
 
-    if any(w in lower for w in _CONFIRM_WORDS):
+    if chosen:
         tool_name = pending.get("tool", "swap_meal")
         args = dict(pending.get("args", {}))
-        args["replacement"] = suggested
+        args["replacement"] = chosen
+        args["confirmed"] = True
         result = call_menubuilder_tool(tool_name, **args)
         _clear_pending()
 
@@ -460,20 +483,24 @@ def handle_partner_reply(text: str, session: dict, config: dict):
             )
             if admin_handle:
                 _send_outbox(admin_handle, f"Partner sent a URL for {day} — similar recipe exists. Waiting on her choice.")
-        elif status == "added":
+        elif status in ("added", "exists"):
+            # "exists": her link exactly matches a recipe already in the collection
             new_recipe = url_result["recipe"]
+            how = "added as" if status == "added" else "matches existing recipe"
             if day and url_result.get("swapped_day"):
                 _send_to_partner(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             elif day:
-                swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request", replacement=new_recipe)
+                # Name comes from MenuBuilder's processing of her exact link, not typed — trusted
+                swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request",
+                                                    replacement=new_recipe, confirmed=True)
                 if swap_result.get("error"):
                     _send_to_partner(f"Added {new_recipe}, but couldn't swap it onto {day} — David will sort it.", partner_handle)
                     if admin_handle:
-                        _send_outbox(admin_handle, f"Partner's URL added as '{new_recipe}' but swap onto {day} failed: {swap_result['error']}")
+                        _send_outbox(admin_handle, f"Partner's URL {how} '{new_recipe}' but swap onto {day} failed: {swap_result['error']}")
                     return
                 _send_to_partner(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"Partner's URL added as '{new_recipe}' and scheduled for {day}.")
+                _send_outbox(admin_handle, f"Partner's URL {how} '{new_recipe}' and scheduled for {day}.")
         else:
             _send_to_partner("Couldn't fetch that recipe. Can you paste the name?", partner_handle)
             if admin_handle:
@@ -543,7 +570,9 @@ def _handle_pending_url_swap(text: str, session: dict, config: dict):
         if admin_handle:
             _send_outbox(admin_handle, f"Partner chose to add new recipe '{new_recipe}' for {day}.")
     else:
-        swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request", replacement=existing)
+        # existing_recipe came from process_recipe_url's match on her link, not typed — trusted
+        swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request",
+                                            replacement=existing, confirmed=True)
         if swap_result.get("error"):
             _send_to_partner(f"Couldn't swap {day} to {existing} — David will sort it.", partner_handle)
             if admin_handle:
@@ -917,12 +946,14 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
                 f"({result.get('match_score', 0):.0%} match). Ask David whether to use that one "
                 f"or add the new recipe from the link."
             )
-        if status != "added":
+        if status not in ("added", "exists"):
             return f"Couldn't add that recipe: {result.get('error') or result.get('message') or 'fetch failed'}"
         title = result.get("recipe", "")
+        # "exists": the link exactly matches a recipe already in the collection
+        lead = f"Added '{title}'" if status == "added" else f"'{title}' is already in the collection"
         if result.get("note"):
-            # Plan already finalized — recipe saved but not put on the day
-            return f"Added '{title}' to the collection. {result['note']}"
+            # Plan already finalized — recipe not put on the day
+            return f"{lead}. {result['note']}"
         if result.get("swapped_day"):
             selected = dict(session.get("selected_meals", {}))
             selected[result["swapped_day"]] = title
@@ -930,8 +961,8 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
             _save_session(session)
             week_start = date.fromisoformat(session["week_start"])
             plan = _format_numbered_list(selected, week_start, session.get("quick_days", []))
-            return f"Added '{title}' and put it on {result['swapped_day']}.\n\n{plan}"
-        return f"Added '{title}' to the collection (no day given — ask David which day it's for)."
+            return f"{lead} — put it on {result['swapped_day']}.\n\n{plan}"
+        return f"{lead} (no day given — ask David which day it's for)."
 
     if tool_name == "approve_menu":
         result = call_menubuilder_tool(

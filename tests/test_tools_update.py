@@ -32,11 +32,17 @@ class TestToolUpdateMealPlan(unittest.TestCase):
         self.assertIn("Test Chicken Tikka Masala", result)
         self.assertIn("did you mean", result.lower())
 
-    def test_needs_confirmation_asks_for_yes_or_exact_name(self):
+    def test_needs_confirmation_relays_menubuilder_question(self):
         with patch("tools._update_plan", return_value=UPDATE_PLAN_NEEDS_CONFIRMATION):
             result = tools._tool_update_meal_plan("change Thursday to chicken tik")
-        self.assertIn("yes", result.lower())
-        self.assertIn("exact name", result.lower())
+        self.assertTrue(result.startswith("needs_confirmation"))
+        self.assertIn("Did you mean 'Test Chicken Tikka Masala'?", result)
+        self.assertIn("confirmed=true", result)
+
+    def test_confirmed_is_passed_to_update_plan(self):
+        with patch("tools._update_plan", return_value=UPDATE_PLAN_SUCCESS) as mock_up:
+            tools._tool_update_meal_plan("change Thursday to Test Chicken Tacos", confirmed=True)
+        mock_up.assert_called_once_with("change Thursday to Test Chicken Tacos", confirmed=True)
 
     def test_success_returns_updated_title(self):
         with patch("tools._update_plan", return_value=UPDATE_PLAN_SUCCESS):
