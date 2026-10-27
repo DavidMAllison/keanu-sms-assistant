@@ -342,6 +342,9 @@ def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
             session["state"] = prev_state
         else:
             session.pop("state", None)
+        if result.get("error"):
+            _save_session(session)
+            return f"Couldn't make that swap: {result['error']}"
         updated = result.get("selected_meals")
         if updated:
             session["selected_meals"] = updated
@@ -462,7 +465,12 @@ def handle_partner_reply(text: str, session: dict, config: dict):
             if day and url_result.get("swapped_day"):
                 _send_to_partner(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             elif day:
-                call_menubuilder_tool("swap_meal", day=day, reason="Partner request", replacement=new_recipe)
+                swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request", replacement=new_recipe)
+                if swap_result.get("error"):
+                    _send_to_partner(f"Added {new_recipe}, but couldn't swap it onto {day} — David will sort it.", partner_handle)
+                    if admin_handle:
+                        _send_outbox(admin_handle, f"Partner's URL added as '{new_recipe}' but swap onto {day} failed: {swap_result['error']}")
+                    return
                 _send_to_partner(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             if admin_handle:
                 _send_outbox(admin_handle, f"Partner's URL added as '{new_recipe}' and scheduled for {day}.")
@@ -535,10 +543,15 @@ def _handle_pending_url_swap(text: str, session: dict, config: dict):
         if admin_handle:
             _send_outbox(admin_handle, f"Partner chose to add new recipe '{new_recipe}' for {day}.")
     else:
-        call_menubuilder_tool("swap_meal", day=day, reason="Partner request", replacement=existing)
-        _send_to_partner(f"Got it — using {existing} for {day}.", partner_handle)
-        if admin_handle:
-            _send_outbox(admin_handle, f"Partner chose existing recipe '{existing}' for {day}.")
+        swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request", replacement=existing)
+        if swap_result.get("error"):
+            _send_to_partner(f"Couldn't swap {day} to {existing} — David will sort it.", partner_handle)
+            if admin_handle:
+                _send_outbox(admin_handle, f"Partner chose existing recipe '{existing}' for {day}, but the swap failed: {swap_result['error']}")
+        else:
+            _send_to_partner(f"Got it — using {existing} for {day}.", partner_handle)
+            if admin_handle:
+                _send_outbox(admin_handle, f"Partner chose existing recipe '{existing}' for {day}.")
 
     session.pop("pending_url_swap", None)
 
@@ -850,6 +863,8 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         )
         if confirm_msg is not None:
             return confirm_msg
+        if result.get("error"):
+            return f"Couldn't make that swap: {result['error']}"
         updated = result.get("selected_meals")
         if updated:
             session["selected_meals"] = updated
@@ -1074,8 +1089,12 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
             else:
                 final_reply = next(
                     (b.text for b in response.content if hasattr(b, "text")),
-                    "Sorry, something went wrong."
+                    ""
                 ).strip()
+                if not final_reply:
+                    # Empty text after a tool round — fall through to the
+                    # text-only finisher below instead of sending a canned error
+                    log.warning(f"Menu agent returned no text (stop_reason={response.stop_reason})")
                 break
 
         if not final_reply:

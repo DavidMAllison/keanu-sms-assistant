@@ -31,6 +31,7 @@ from tests.mb_fixtures import (
     START_SUNDAY_DATE,
     START_WITH_FIRSTCOOK,
     START_WITH_KNOWN_NO_FEEDBACK,
+    SWAP_ERROR,
     SWAP_NEEDS_CONFIRMATION,
     SWAP_SUCCESS,
     SWAP_SUCCESS_WITH_NOTE,
@@ -303,6 +304,16 @@ class TestRecipeConfirmation(_Base):
         self._write_session(s)
         return s
 
+    def test_yes_with_error_result_reports_error_and_clears_pending(self):
+        session = self._confirmation_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_ERROR):
+            reply = mw._handle_recipe_confirmation("yes", session, FAKE_CONFIG)
+        self.assertIn("Couldn't make that swap", reply)
+        self.assertNotIn("Test Pasta", reply)
+        saved = self._session()
+        self.assertNotIn("pending_confirmation", saved)
+        self.assertNotIn("state", saved)
+
     def test_yes_recalls_tool_with_suggested_name(self):
         session = self._confirmation_session()
         mock_mb = MagicMock(return_value=SWAP_SUCCESS)
@@ -436,6 +447,19 @@ class TestSwapMealIntegration(_Base):
         self.assertIn("Mon", result)
         self.assertIn("Tue", result)
 
+    def test_error_returns_message_not_unchanged_plan(self):
+        session = self._approval_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_ERROR):
+            result = mw._execute_menu_tool(
+                "swap_meal",
+                {"day": "Tue", "reason": "swap", "replacement": "Soy Salmon"},
+                session,
+                FAKE_CONFIG,
+            )
+        self.assertIn("Couldn't make that swap", result)
+        self.assertIn("Test Soy Salmon", result)
+        self.assertNotIn("Test Tacos", result)
+
     def test_success_does_not_set_confirmation_state(self):
         session = self._approval_session()
         with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_SUCCESS):
@@ -537,6 +561,63 @@ class TestPendingUrlSwap(_Base):
 
         # Falsy selected_meals from the bridge must not clobber the local mirror
         self.assertEqual(self._session()["selected_meals"], {"Wed": "Test Stir Fry"})
+
+
+class TestPartnerSwapErrors(_Base):
+    """
+    Partner's URL swaps used to discard the swap_meal result and confirm
+    success regardless. A failed swap must tell her so and alert the admin.
+    """
+
+    def test_pending_url_swap_existing_recipe_error(self):
+        self._write_session({
+            "week_start": "2026-07-07",
+            "selected_meals": {"Wed": "Test Stir Fry"},
+            "pending_url_swap": {
+                "url": "https://example.com/recipe",
+                "day": "Wed",
+                "existing_recipe": "Test Stir Fry",
+            },
+        })
+        session = self._session()
+
+        def fake_mb(tool_name, **kwargs):
+            if tool_name == "swap_meal":
+                return SWAP_ERROR
+            if tool_name == "get_workflow_state":
+                return {"selected_meals": {}}
+            return {"ok": True}
+
+        with patch("agents.menu_workflow.call_menubuilder_tool", side_effect=fake_mb), \
+             patch("agents.menu_workflow._send_to_partner") as mock_send:
+            mw._handle_pending_url_swap("no thanks, keep it", session, FAKE_CONFIG)
+
+        self.assertIn("Couldn't swap Wed", mock_send.call_args_list[0].args[0])
+        admin_texts = [e["text"] for e in self._outbox_entries() if e.get("handle") == "+10000000001"]
+        self.assertTrue(any("Test Soy Salmon" in t for t in admin_texts))
+
+    def test_added_url_swap_error(self):
+        self._write_session({"week_start": "2026-07-07"})
+        session = self._session()
+
+        def fake_mb(tool_name, **kwargs):
+            if tool_name == "handle_partner_reply":
+                return {"has_url": True, "url": "https://example.com/r", "extracted_day": "Thu"}
+            if tool_name == "process_recipe_url":
+                return {"status": "added", "recipe": "Test Tacos"}
+            if tool_name == "swap_meal":
+                return SWAP_ERROR
+            return {}
+
+        with patch("agents.menu_workflow.call_menubuilder_tool", side_effect=fake_mb), \
+             patch("agents.menu_workflow._send_to_partner") as mock_send:
+            mw.handle_partner_reply("use this for thursday https://example.com/r", session, FAKE_CONFIG)
+
+        partner_texts = [c.args[0] for c in mock_send.call_args_list]
+        self.assertTrue(any("couldn't swap it onto Thu" in t for t in partner_texts))
+        self.assertFalse(any("swapped Thu" in t for t in partner_texts))
+        admin_texts = [e["text"] for e in self._outbox_entries() if e.get("handle") == "+10000000001"]
+        self.assertTrue(any("failed" in t and "Test Soy Salmon" in t for t in admin_texts))
 
 
 # ── TestAgentReplyRouting ─────────────────────────────────────────────────────

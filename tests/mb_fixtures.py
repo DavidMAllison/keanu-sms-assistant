@@ -78,6 +78,8 @@ SWAP_SUCCESS_WITH_NOTE = {
 
 # ── approve_menu responses ────────────────────────────────────────────────────
 
+SWAP_ERROR = {"error": "Recipe 'Test Soy Salmon' not found."}
+
 APPROVE_MISMATCH = {
     "error": "selected_meals_mismatch",
     "expected": {"Mon": "Test Pasta", "Tue": "Test Tacos"},
