@@ -121,7 +121,7 @@ def _save_session(session: dict):
 # ── MenuBuilder MCP bridge ────────────────────────────────────────────────────
 
 from menubuilder_bridge import call_menubuilder_tool  # noqa: E402
-from tools import queue_outbox, _tool_get_schedule  # noqa: E402
+from tools import queue_outbox, _tool_get_schedule, _partner_name  # noqa: E402
 
 
 def _send_outbox(handle: str, text: str):
@@ -132,7 +132,7 @@ def _send_outbox(handle: str, text: str):
 
 
 def _recreate_pending_file(handle: str):
-    """Recreate PENDING_FILE so Partner's next reply is routed back to signoff capture."""
+    """Recreate PENDING_FILE so the partner's next reply is routed back to signoff capture."""
     if DRY_RUN or not handle:
         return
     MENU_PENDING_FILE.write_text(json.dumps({
@@ -142,9 +142,9 @@ def _recreate_pending_file(handle: str):
 
 
 def _send_to_partner(text: str, handle: str):
-    """Send a message to Partner via outbox and recreate PENDING_FILE so her reply is routed back."""
+    """Send a message to the menu partner via outbox and recreate PENDING_FILE so her reply is routed back."""
     if not handle:
-        log.error("No partner_handle in settings — cannot send to Partner.")
+        log.error("No partner_handle in settings — cannot send to partner.")
         return
     _send_outbox(handle, text)
     _recreate_pending_file(handle)
@@ -451,7 +451,7 @@ def _handle_cancel_confirmation(text: str, session: dict, config: dict) -> str:
 
 def handle_partner_reply(text: str, session: dict, config: dict):
     """
-    Called from server.py after Partner replies while awaiting_partner_signoff.
+    Called from server.py after the partner replies while awaiting_partner_signoff.
     Delegates to MenuBuilder via bridge.
     """
     admin_handle = config["security"].get("menu_admin")
@@ -464,7 +464,7 @@ def handle_partner_reply(text: str, session: dict, config: dict):
 
     result = call_menubuilder_tool("handle_partner_reply", reply=text)
 
-    # MenuBuilder detected a URL in Partner's message — resolve it
+    # MenuBuilder detected a URL in the partner's message — resolve it
     if result.get("has_url"):
         url = result["url"]
         day = result.get("extracted_day", "")
@@ -483,7 +483,7 @@ def handle_partner_reply(text: str, session: dict, config: dict):
                 partner_handle,
             )
             if admin_handle:
-                _send_outbox(admin_handle, f"Partner sent a URL for {day} — similar recipe exists. Waiting on her choice.")
+                _send_outbox(admin_handle, f"{_partner_name(config)} sent a URL for {day} — similar recipe exists. Waiting on her choice.")
         elif status in ("added", "exists"):
             # "exists": her link exactly matches a recipe already in the collection
             new_recipe = url_result["recipe"]
@@ -492,20 +492,20 @@ def handle_partner_reply(text: str, session: dict, config: dict):
                 _send_to_partner(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             elif day:
                 # Name comes from MenuBuilder's processing of her exact link, not typed — trusted
-                swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request",
+                swap_result = call_menubuilder_tool("swap_meal", day=day, reason="partner request",
                                                     replacement=new_recipe, confirmed=True)
                 if swap_result.get("error"):
                     _send_to_partner(f"Added {new_recipe}, but couldn't swap it onto {day} — David will sort it.", partner_handle)
                     if admin_handle:
-                        _send_outbox(admin_handle, f"Partner's URL {how} '{new_recipe}' but swap onto {day} failed: {swap_result['error']}")
+                        _send_outbox(admin_handle, f"{_partner_name(config)}'s URL {how} '{new_recipe}' but swap onto {day} failed: {swap_result['error']}")
                     return
                 _send_to_partner(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"Partner's URL {how} '{new_recipe}' and scheduled for {day}.")
+                _send_outbox(admin_handle, f"{_partner_name(config)}'s URL {how} '{new_recipe}' and scheduled for {day}.")
         else:
             _send_to_partner("Couldn't fetch that recipe. Can you paste the name?", partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"Partner sent an unfetchable URL: {url}")
+                _send_outbox(admin_handle, f"{_partner_name(config)} sent an unfetchable URL: {url}")
         return
 
     new_state = result.get("state", "")
@@ -537,23 +537,23 @@ def handle_partner_reply(text: str, session: dict, config: dict):
             # Unparseable reply — nothing was changed or re-sent
             _recreate_pending_file(partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"Couldn't parse Partner's reply: '{text}'. Handle manually.")
+                _send_outbox(admin_handle, f"Couldn't parse {_partner_name(config)}'s reply: '{text}'. Handle manually.")
         else:
             # Partner requested a change — MenuBuilder re-sent the updated menu.
             # Re-arm capture so her reply to the re-sent menu isn't missed.
             _recreate_pending_file(partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"Partner requested a change: '{text}'. Updated and re-sent.")
+                _send_outbox(admin_handle, f"{_partner_name(config)} requested a change: '{text}'. Updated and re-sent.")
     else:
         if admin_handle:
-            _send_outbox(admin_handle, f"Partner replied but something went wrong. Handle manually: '{text}'")
+            _send_outbox(admin_handle, f"{_partner_name(config)} replied but something went wrong. Handle manually: '{text}'")
 
 
 # ── _handle_pending_url_swap ──────────────────────────────────────────────────
 
 def _handle_pending_url_swap(text: str, session: dict, config: dict):
     """
-    Partner replied to the 'similar recipe exists' question.
+    The partner replied to the 'similar recipe exists' question.
     Pending context is in session["pending_url_swap"].
     """
     admin_handle = config["security"].get("menu_admin")
@@ -569,19 +569,19 @@ def _handle_pending_url_swap(text: str, session: dict, config: dict):
         new_recipe = result.get("recipe", url)
         _send_to_partner(f"Added and swapped {day} to {new_recipe}.", partner_handle)
         if admin_handle:
-            _send_outbox(admin_handle, f"Partner chose to add new recipe '{new_recipe}' for {day}.")
+            _send_outbox(admin_handle, f"{_partner_name(config)} chose to add new recipe '{new_recipe}' for {day}.")
     else:
         # existing_recipe came from process_recipe_url's match on her link, not typed — trusted
-        swap_result = call_menubuilder_tool("swap_meal", day=day, reason="Partner request",
+        swap_result = call_menubuilder_tool("swap_meal", day=day, reason="partner request",
                                             replacement=existing, confirmed=True)
         if swap_result.get("error"):
             _send_to_partner(f"Couldn't swap {day} to {existing} — David will sort it.", partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"Partner chose existing recipe '{existing}' for {day}, but the swap failed: {swap_result['error']}")
+                _send_outbox(admin_handle, f"{_partner_name(config)} chose existing recipe '{existing}' for {day}, but the swap failed: {swap_result['error']}")
         else:
             _send_to_partner(f"Got it — using {existing} for {day}.", partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"Partner chose existing recipe '{existing}' for {day}.")
+                _send_outbox(admin_handle, f"{_partner_name(config)} chose existing recipe '{existing}' for {day}.")
 
     session.pop("pending_url_swap", None)
 
@@ -801,7 +801,7 @@ def _build_menu_tools() -> list:
         {
             "name": "approve_menu",
             "description": (
-                "Approve the current meal plan and send it to Partner for sign-off. "
+                "Approve the current meal plan and send it to the menu partner for sign-off. "
                 "Call when David says the plan looks good, or approves it."
             ),
             "input_schema": {
@@ -989,7 +989,7 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
             )
         if "error" in result:
             log.error(f"approve_menu MCP error: {result['error']}")
-            return "Something went wrong sending the menu to Partner — check the logs."
+            return f"Something went wrong sending the menu to {_partner_name(config)} — check the logs."
         # Generate shopping list now that meals are locked
         sl_result = call_menubuilder_tool(
             "generate_shopping_list",
@@ -1001,7 +1001,7 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         # awaiting_partner_signoff is bridge-owned — hand state over to MenuBuilder
         session.pop("state", None)
         _save_session(session)
-        return "Menu sent to Partner."
+        return f"Menu sent to {_partner_name(config)}."
 
     return f"Unknown tool: {tool_name}"
 
@@ -1115,9 +1115,9 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
     if state == "awaiting_idea_url":
         return _handle_idea_url(text, session, config)
 
-    # Waiting on Partner — David just gets a status update
+    # Waiting on the partner — David just gets a status update
     if bridge_state == "awaiting_partner_signoff":
-        return "Still waiting on Partner's OK — I'll let you know when she replies."
+        return f"Still waiting on {_partner_name(config)}'s OK — I'll let you know when she replies."
 
     # Finalization pass-through — MenuBuilder owns the transition to complete
     if bridge_state == "awaiting_finalization":

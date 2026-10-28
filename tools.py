@@ -406,7 +406,7 @@ _DEFS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "recipient": {"type": "string", "description": "Name of the recipient (e.g. 'Partner')"},
+                "recipient": {"type": "string", "description": "Name of the recipient (e.g. 'David')"},
                 "message": {"type": "string", "description": "The message text to send"},
             },
             "required": ["recipient", "message"],
@@ -437,7 +437,7 @@ _DEFS = {
     },
     "set_lunch_pick": {
         "name": "set_lunch_pick",
-        "description": "Save Partner's lunch pick for the week. Called when she replies to the Saturday lunch suggestion text with a choice.",
+        "description": "Save the menu partner's lunch pick for the week. Called when she replies to the Saturday lunch suggestion text with a choice.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -449,7 +449,7 @@ _DEFS = {
     "add_lunch_recipe_url": {
         "name": "add_lunch_recipe_url",
         "description": (
-            "Add a recipe URL Partner sent as a lunch recipe (e.g. in reply to the Saturday lunch text). "
+            "Add a recipe URL the menu partner sent as a lunch recipe (e.g. in reply to the Saturday lunch text). "
             "Checks for similar existing recipes first. If similar_exists comes back and she says it's "
             "a new recipe, call again with force_add=true."
         ),
@@ -464,7 +464,7 @@ _DEFS = {
     },
     "log_lunch_feedback": {
         "name": "log_lunch_feedback",
-        "description": "Log Partner's feedback on last week's lunch. Call when she rates or comments on her lunch in reply to the weekly check-in.",
+        "description": "Log the menu partner's feedback on last week's lunch. Call when she rates or comments on her lunch in reply to the weekly check-in.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -503,7 +503,7 @@ _DEFS = {
     },
     "get_lunch_pick": {
         "name": "get_lunch_pick",
-        "description": "Look up Partner's lunch pick for this week. Returns the recipe name, URL, and status ('picked' or 'none'). Use when anyone asks what Partner is having for lunch this week.",
+        "description": "Look up the menu partner's lunch pick for this week. Returns the recipe name, URL, and status ('picked' or 'none'). Use when anyone asks what the menu partner is having for lunch this week.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -624,10 +624,10 @@ _DEFS = {
         "name": "send_partner_recipe_batch",
         "description": (
             "Pick 5 fresh recipe candidates from the idea queue (favoring quick cook times) "
-            "and text Partner a link to review just those 5 in the Review UI. Use when David "
-            "asks to send Partner new recipes to look at, clear out the idea queue, or similar — "
-            "or when Partner herself asks for more recipes to look through. Returns a confirmation "
-            "to relay back to whoever asked — do not text Partner directly yourself, this tool "
+            "and text the menu partner a link to review just those 5 in the Review UI. Use when David "
+            "asks to send the menu partner new recipes to look at, clear out the idea queue, or similar — "
+            "or when the menu partner herself asks for more recipes to look through. Returns a confirmation "
+            "to relay back to whoever asked — do not text the menu partner directly yourself, this tool "
             "already does that (even when she's the one who asked, since the link needs to land "
             "in her own thread)."
         ),
@@ -1211,9 +1211,18 @@ def _tool_check_inventory(query: str) -> str:
     return "Yes:\n" + "\n".join(f"- {m}" for m in matches)
 
 
+def _partner_name(config: Optional[dict] = None) -> str:
+    """Menu partner's first name from config, so it never appears in committed code."""
+    if config is None:
+        import yaml
+        config = yaml.safe_load((Path(__file__).parent / "config/settings.yaml").read_text())
+    sec = config.get("security", {})
+    return sec.get("handle_to_person", {}).get(sec.get("partner_handle", ""), "your partner")
+
+
 def _notify_parents_individual(kid_handle: str, kid_name: str, meal: str, food_ok, food_reason: str, day_label: str, config: dict) -> None:
-    name_to_handle = {v: k for k, v in config.get("security", {}).get("handle_to_person", {}).items()}
-    parent_handles = [h for h in [name_to_handle.get("David"), name_to_handle.get("Partner")] if h]
+    sec = config.get("security", {})
+    parent_handles = [h for h in [sec.get("menu_admin"), sec.get("partner_handle")] if h]
 
     if food_ok is True:
         msg = (
@@ -1435,7 +1444,7 @@ def _tool_send_partner_recipe_batch(config: dict) -> str:
                         "I'll text a fresh batch over in a few minutes once it's ready.")
             if trigger.get("status") == "already_running":
                 return "Idea queue is empty, and a refresh is already running — hang tight, a batch is on its way."
-            return "Idea queue is empty right now — nothing fresh to send Partner."
+            return f"Idea queue is empty right now — nothing fresh to send {_partner_name(config)}."
         log.error(f"send_partner_recipe_batch bridge error: {result['error']}")
         return "something went wrong on my end"
     handle = config["security"]["partner_handle"]
@@ -1445,7 +1454,7 @@ def _tool_send_partner_recipe_batch(config: dict) -> str:
         time_part = f" ({p['time']})" if p.get("time") else ""
         queue_outbox({"handle": handle, "text": f"{p['title']}{time_part}\n{p['url']}"})
     titles = ", ".join(p["title"] for p in picks)
-    return f"Sent Partner {len(picks)} new recipes to look through: {titles}."
+    return f"Sent {_partner_name(config)} {len(picks)} new recipes to look through: {titles}."
 
 
 def _tool_add_music_seed(query: str) -> str:
@@ -1516,10 +1525,10 @@ def _tool_get_lunch_pick() -> str:
         log.error(f"get_lunch_pick bridge error: {result['error']}")
         return "something went wrong on my end"
     if result.get("status") == "none":
-        return "Partner hasn't picked a lunch recipe for this week yet."
+        return f"{_partner_name()} hasn't picked a lunch recipe for this week yet."
     name = result.get("name", "unknown")
     url = result.get("url", "")
-    return f"Partner's lunch this week: {name}" + (f" — {url}" if url else "")
+    return f"{_partner_name()}'s lunch this week: {name}" + (f" — {url}" if url else "")
 
 
 def _tool_set_lunch_pick(recipe_name: str) -> str:

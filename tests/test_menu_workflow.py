@@ -721,7 +721,7 @@ class TestTypedNameConfirmation(_Base):
 
 class TestPartnerSwapErrors(_Base):
     """
-    Partner's URL swaps used to discard the swap_meal result and confirm
+    the partner's URL swaps used to discard the swap_meal result and confirm
     success regardless. A failed swap must tell her so and alert the admin.
     """
 

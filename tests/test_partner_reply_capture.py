@@ -4,7 +4,7 @@ Unit tests for server.maybe_capture_partner_reply.
 2026-10-18: week 2026-10-19 got stuck in awaiting_partner_signoff all day
 because the pending-reply block captured whichever message from the
 partner handle arrived FIRST, regardless of content — an unrelated
-recipe-idea URL consumed the capture before Partner's real "Looks good"
+recipe-idea URL consumed the capture before the partner's real "Looks good"
 showed up six hours later. Fixed by classifying before capturing.
 
 Mocks:
@@ -134,7 +134,7 @@ class TestMaybeCapturePartnerReply(unittest.TestCase):
         self.assertFalse(self.response_file.exists())
         self.assertEqual(self.handle_partner_reply_calls, [])
 
-    # ── Not Partner / no pending file ────────────────────────────────────────
+    # ── Not the partner / no pending file ────────────────────────────────────────
 
     def test_message_from_someone_else_is_ignored(self):
         bridge_mock = MagicMock(return_value="approve")

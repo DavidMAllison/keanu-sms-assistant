@@ -31,7 +31,7 @@ from groceryagent_bridge import call_receipt_parser
 from kidquiz_bridge import call_quiz_generator
 from menubuilder_bridge import call_menubuilder_tool as _call_menubuilder_tool
 from tools import (send_imessage, send_imessage_group, drain_outbox, queue_outbox,
-                   OUTBOX_DIR, _pending_image_recipe, INVENTORY_FILE)
+                   OUTBOX_DIR, _pending_image_recipe, INVENTORY_FILE, _partner_name)
 from agents.menu_agent import (
     METADATA_FILE as _METADATA_FILE,
     WEEKLYPLAN_DIR as _WEEKLYPLAN_DIR,
@@ -816,10 +816,10 @@ def maybe_capture_partner_reply(handle: str, text: str, config: dict) -> bool:
         MENU_PENDING_FILE.unlink()
         admin_handle = config["security"].get("menu_admin")
         if admin_handle:
-            queue_outbox({"handle": admin_handle, "text": f"Partner replied to the menu: {text}"})
+            queue_outbox({"handle": admin_handle, "text": f"{_partner_name(config)} replied to the menu: {text}"})
         send_imessage(handle, "Thanks! Passed it on to David.")
         log.info(f"Menu feedback captured from {handle}: {text[:80]}")
-        # Also advance the menu workflow if awaiting Partner's signoff
+        # Also advance the menu workflow if awaiting the partner's signoff
         # (bridge state — read via get_workflow_state, never from menu_session.json)
         try:
             wf = _call_menubuilder_tool("get_workflow_state")
