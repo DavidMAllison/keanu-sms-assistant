@@ -354,7 +354,7 @@ _TAPBACK_PREFIXES = (
     "Emphasized ", "Questioned ", "Removed a heart from ",
     "Removed a like from ", "Removed a dislike from ",
     "Removed a laugh from ", "Removed an exclamation from ",
-    "Removed a question mark from ",
+    "Removed a question mark from ", "Reacted ",
 )
 
 def is_tapback(text: str) -> bool:
@@ -856,6 +856,33 @@ def _apple_date_to_unix(apple_date) -> float:
     return secs + 978307200
 
 
+def _decode_attributed_body(blob) -> str:
+    """
+    Pull the plain text out of message.attributedBody (an NSArchiver typedstream).
+    Since Ventura some messages leave message.text NULL and only fill this column.
+    The string follows the NSString class marker: 5 bytes of header, then a length
+    (one byte, or 0x81 + 2-byte / 0x82 + 4-byte little-endian), then UTF-8 bytes.
+    Returns "" on anything unexpected — never raises.
+    """
+    if not blob:
+        return ""
+    try:
+        blob = bytes(blob)
+        idx = blob.find(b"NSString")
+        if idx == -1:
+            return ""
+        content = blob[idx + len(b"NSString") + 5:]
+        length, start = content[0], 1
+        if length == 0x81:
+            length, start = int.from_bytes(content[1:3], "little"), 3
+        elif length == 0x82:
+            length, start = int.from_bytes(content[1:5], "little"), 5
+        text = content[start:start + length].decode("utf-8", errors="replace")
+        return text.replace("￼", "").strip()
+    except Exception:
+        return ""
+
+
 _LEAD_IN_PHRASES = re.compile(
     r"\b(add (this|that) recipe|here'?s (a|the|this) recipe|check (this|that) out|"
     r"recipe (idea|for you)|this one|this is it)\b",
@@ -921,7 +948,7 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
             date_filter = "AND m.date >= ?"
             params.append(int((min_date - APPLE_EPOCH_OFFSET) * 1e9))
         cursor = conn.execute(f"""
-            SELECT m.rowid, m.text, m.date, h.id AS sender_handle,
+            SELECT m.rowid, m.text, m.attributedBody, m.date, h.id AS sender_handle,
                    a.filename AS att_filename,
                    a.mime_type AS att_mime_type
             FROM message m
@@ -933,8 +960,10 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
             WHERE m.is_from_me = 0
               AND c.chat_identifier NOT LIKE 'chat%'
               AND m.rowid > ?
+              AND m.associated_message_type = 0
               AND (
                 (m.text IS NOT NULL AND m.text != '')
+                OR m.attributedBody IS NOT NULL
                 OR (a.mime_type LIKE 'image/%')
               )
               {date_filter}
@@ -943,7 +972,7 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
         # Deduplicate by rowid — one message can have multiple attachments
         seen: dict = {}
         for row in cursor.fetchall():
-            rowid, text, apple_date, handle, att_filename, att_mime_type = row
+            rowid, text, attributed_body, apple_date, handle, att_filename, att_mime_type = row
             if rowid not in seen:
                 seen[rowid] = {
                     "rowid": rowid,
@@ -952,6 +981,11 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
                     "date": _apple_date_to_unix(apple_date),
                     "attachments": [],
                 }
+                if not text:
+                    decoded = _decode_attributed_body(attributed_body)
+                    if decoded:
+                        seen[rowid]["text"] = decoded
+                        seen[rowid]["decoded"] = True
             if att_filename and att_mime_type and att_mime_type.startswith("image/"):
                 seen[rowid]["attachments"].append({
                     "filename": att_filename,
@@ -1309,7 +1343,8 @@ def main():
                 attachments = msg.get("attachments", [])
                 has_image = len(attachments) > 0
                 log.info(f"Message from {handle}: {text[:80]}" + (f" [{len(attachments)} image(s)]" if has_image else "")
-                         + (f" [merged {msg['merged']} messages]" if msg.get("merged") else ""))
+                         + (f" [merged {msg['merged']} messages]" if msg.get("merged") else "")
+                         + (" [from attributedBody]" if msg.get("decoded") else ""))
 
                 if is_tapback(text):
                     log.info(f"Ignoring tapback from {handle}")
