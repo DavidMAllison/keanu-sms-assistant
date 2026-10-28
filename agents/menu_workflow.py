@@ -40,8 +40,7 @@ LOCAL_STATES = (
     "awaiting_schedule",
     "awaiting_cancel_confirmation",
 )
-# MenuBuilder renamed the signoff state; accept both until the legacy name is retired.
-SIGNOFF_STATES = ("awaiting_partner_signoff", "awaiting_partner_signoff")
+SIGNOFF_STATES = ("awaiting_partner_signoff",)
 ACTIVE_BRIDGE_STATES = (
     "awaiting_meal_approval",
     *SIGNOFF_STATES,
