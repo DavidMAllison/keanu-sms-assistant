@@ -52,6 +52,8 @@ MENU_RESPONSE_FILE = Path("/Users/Shared/cooking-state/menu_feedback_response.js
 MENU_SESSION_FILE = Path("/Users/Shared/cooking-state/menu_session.json")
 CHAT_DB = Path.home() / "Library/Messages/chat.db"
 POLL_INTERVAL = 3
+QUIET_WINDOW = 4      # seconds a sender must be quiet before their messages are handled
+LEAD_IN_WINDOW = 15   # longer wait after a lead-in ("This is it:") for the link/photo that follows
 
 # ── Config / state ────────────────────────────────────────────────────────────
 
@@ -846,6 +848,69 @@ def get_max_rowid() -> int:
     finally:
         conn.close()
 
+def _apple_date_to_unix(apple_date) -> float:
+    """chat.db dates are nanoseconds since 2001-01-01 (seconds on very old rows)."""
+    if not apple_date:
+        return 0.0
+    secs = apple_date / 1e9 if apple_date > 1e11 else float(apple_date)
+    return secs + 978307200
+
+
+_LEAD_IN_PHRASES = re.compile(
+    r"\b(add (this|that) recipe|here'?s (a|the|this) recipe|check (this|that) out|"
+    r"recipe (idea|for you)|this one|this is it)\b",
+    re.IGNORECASE,
+)
+
+
+def is_lead_in(text: str) -> bool:
+    """A message that announces something still to come (a link or photo in its own message)."""
+    t = text.strip().replace("\u2019", "'")
+    if not t or re.search(r"https?://", t):
+        return False
+    return t.endswith(":") or bool(_LEAD_IN_PHRASES.search(t))
+
+
+def _merge_window(group: dict) -> int:
+    if not group["attachments"] and is_lead_in(group["text"]):
+        return LEAD_IN_WINDOW
+    return QUIET_WINDOW
+
+
+def coalesce_messages(messages: list, now: float) -> list:
+    """
+    Merge a sender's back-to-back messages into one turn and hold back any that
+    may still be getting a follow-up. iMessage often splits "Let's add this
+    recipe:" and its link into two messages; without this the text is answered
+    alone before the link arrives.
+
+    Returns only the turns that are ready. Everything from the first held turn
+    onward is dropped so last_rowid stays behind it and it is re-polled.
+    """
+    groups: list = []
+    for msg in messages:
+        prev = groups[-1] if groups else None
+        if (prev
+                and prev["handle"] == msg["handle"]
+                and not is_tapback(prev["text"]) and not is_tapback(msg["text"])
+                and not prev["attachments"]
+                and (not msg["attachments"] or is_lead_in(prev["text"]))
+                and msg["date"] - prev["date"] <= _merge_window(prev)):
+            prev["text"] = "\n".join(t for t in (prev["text"], msg["text"]) if t)
+            prev["attachments"] = prev["attachments"] + msg["attachments"]
+            prev["rowid"] = msg["rowid"]
+            prev["date"] = msg["date"]
+            prev["merged"] = prev.get("merged", 1) + 1
+            continue
+        groups.append(dict(msg))
+    ready = []
+    for g in groups:
+        if not is_tapback(g["text"]) and now - g["date"] < _merge_window(g):
+            break
+        ready.append(g)
+    return ready
+
+
 def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list[dict]:
     conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
     try:
@@ -856,7 +921,7 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
             date_filter = "AND m.date >= ?"
             params.append(int((min_date - APPLE_EPOCH_OFFSET) * 1e9))
         cursor = conn.execute(f"""
-            SELECT m.rowid, m.text, h.id AS sender_handle,
+            SELECT m.rowid, m.text, m.date, h.id AS sender_handle,
                    a.filename AS att_filename,
                    a.mime_type AS att_mime_type
             FROM message m
@@ -878,12 +943,13 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
         # Deduplicate by rowid — one message can have multiple attachments
         seen: dict = {}
         for row in cursor.fetchall():
-            rowid, text, handle, att_filename, att_mime_type = row
+            rowid, text, apple_date, handle, att_filename, att_mime_type = row
             if rowid not in seen:
                 seen[rowid] = {
                     "rowid": rowid,
                     "text": text or "",
                     "handle": handle,
+                    "date": _apple_date_to_unix(apple_date),
                     "attachments": [],
                 }
             if att_filename and att_mime_type and att_mime_type.startswith("image/"):
@@ -1231,7 +1297,7 @@ def main():
             maybe_start_sunday_menu(state, config)
             maybe_send_holiday_message(state, config)
             min_date = startup_cutoff if first_poll else None
-            messages = poll_new_messages(state["last_rowid"], min_date)
+            messages = coalesce_messages(poll_new_messages(state["last_rowid"], min_date), time.time())
             first_poll = False
 
             for msg in messages:
@@ -1242,7 +1308,8 @@ def main():
                 text = msg["text"]
                 attachments = msg.get("attachments", [])
                 has_image = len(attachments) > 0
-                log.info(f"Message from {handle}: {text[:80]}" + (f" [{len(attachments)} image(s)]" if has_image else ""))
+                log.info(f"Message from {handle}: {text[:80]}" + (f" [{len(attachments)} image(s)]" if has_image else "")
+                         + (f" [merged {msg['merged']} messages]" if msg.get("merged") else ""))
 
                 if is_tapback(text):
                     log.info(f"Ignoring tapback from {handle}")

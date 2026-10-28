@@ -38,6 +38,8 @@ iMessage → chat.db → server.py → agent.py → Claude API (tool use) → to
 
 Outbound proactive messages go through the **outbox spool**: any process queues a message by dropping one JSON file into `/Users/Shared/cooking-state/outbox/` (see `tools.queue_outbox`), and the main loop drains the directory every poll. Unparseable entries are quarantined to `.bad/` instead of wedging the drain.
 
+**Split-message coalescing** — iMessage often delivers "Let's add this recipe:" and its link as separate messages. The poll loop (`coalesce_messages` in `server.py`) merges a sender's back-to-back messages into one turn and waits until they've been quiet for 4s — or 15s after a lead-in (ends in ":" or announces a recipe with no link) — before replying. A photo is merged only after a lead-in; tapbacks and different senders never merge.
+
 ## Admin keywords
 
 Texts from the menu admin that route to fixed handlers instead of the agent:
@@ -130,6 +132,7 @@ tests/
   test_menu_workflow.py    # Unit tests for menu workflow routing and state (no API calls)
   test_menu_guardrails.py  # start_menu_workflow tool guard + "menu status" keyword
   test_partner_reply_capture.py  # Pending-reply classification gate (maybe_capture_partner_reply) + pending-file re-arm
+  test_message_coalesce.py # Split-message merging and quiet-window hold
   test_outbox_spool.py     # Outbox spool queue/drain/quarantine
   test_sunday_trigger.py   # In-loop Sunday trigger guard
   test_swap_tools.py       # switch_days, swap_meal already_planned/confirmation, add_lunch_recipe_url (MenuBuilder faked)

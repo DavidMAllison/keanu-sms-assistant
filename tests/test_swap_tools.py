@@ -105,6 +105,24 @@ class TestRecipeUrlExists(unittest.TestCase):
         self.assertNotIn("Couldn't fetch", reply)
 
 
+class TestRecipeSimilarityListCuisine(unittest.TestCase):
+
+    def test_list_valued_cuisine_does_not_crash(self):
+        import json
+        import tempfile
+        meta = {"recipes": {"Test Three Cup Chicken": {
+            "status": "active", "cuisine": ["Chinese", "Taiwanese"],
+            "cooking_method": "stovetop", "ingredients": [{"name": "chicken"}],
+        }}}
+        with tempfile.TemporaryDirectory() as d:
+            meta_file = Path(d) / "recipe_metadata.json"
+            meta_file.write_text(json.dumps(meta))
+            with patch("tools.METADATA_FILE", meta_file), patch("tools.IDEAS_DIR", Path(d)):
+                reply = tools._tool_check_recipe_similarity("https://example.com/test-three-cup-chicken/")
+        self.assertIn("Already in collection: Test Three Cup Chicken", reply)
+        self.assertIn("Chinese, Taiwanese", reply)
+
+
 class TestAddLunchRecipeUrl(unittest.TestCase):
 
     def _call(self, return_value, force_add=False):

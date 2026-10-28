@@ -974,6 +974,9 @@ def _tool_check_recipe_similarity(content: str) -> str:
         status = meta.get("status", "active")
         cuisine = meta.get("cuisine", "")
         method = meta.get("cooking_method", "")
+        # A malformed entry can hold a list here; join it rather than crash
+        cuisine = ", ".join(map(str, cuisine)) if isinstance(cuisine, list) else str(cuisine or "")
+        method = ", ".join(map(str, method)) if isinstance(method, list) else str(method or "")
         ingredients = meta.get("ingredients", [])
         key_ingr = ", ".join(i["name"] for i in ingredients[:4]) if ingredients else ""
         detail = " | ".join(filter(None, [status, cuisine, method, key_ingr]))
