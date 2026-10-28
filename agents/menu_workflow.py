@@ -40,9 +40,11 @@ LOCAL_STATES = (
     "awaiting_schedule",
     "awaiting_cancel_confirmation",
 )
+# MenuBuilder renamed the signoff state; accept both until the legacy name is retired.
+SIGNOFF_STATES = ("awaiting_partner_signoff", "awaiting_partner_signoff")
 ACTIVE_BRIDGE_STATES = (
     "awaiting_meal_approval",
-    "awaiting_partner_signoff",
+    *SIGNOFF_STATES,
     "awaiting_idea_activation",
     "awaiting_finalization",
 )
@@ -451,7 +453,7 @@ def _handle_cancel_confirmation(text: str, session: dict, config: dict) -> str:
 
 def handle_partner_reply(text: str, session: dict, config: dict):
     """
-    Called from server.py after the partner replies while awaiting_partner_signoff.
+    Called from server.py after the partner replies while awaiting partner signoff.
     Delegates to MenuBuilder via bridge.
     """
     admin_handle = config["security"].get("menu_admin")
@@ -532,7 +534,7 @@ def handle_partner_reply(text: str, session: dict, config: dict):
                 session["state"] = "awaiting_idea_url"
                 _save_session(session)
                 _send_outbox(admin_handle, f"I don't have a source URL for '{name}'. What's the URL?")
-    elif new_state == "awaiting_partner_signoff":
+    elif new_state in SIGNOFF_STATES:
         if result.get("parsed") is False:
             # Unparseable reply — nothing was changed or re-sent
             _recreate_pending_file(partner_handle)
@@ -998,7 +1000,7 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         )
         if "error" in sl_result:
             log.warning(f"generate_shopping_list failed: {sl_result['error']}")
-        # awaiting_partner_signoff is bridge-owned — hand state over to MenuBuilder
+        # partner signoff is bridge-owned — hand state over to MenuBuilder
         session.pop("state", None)
         _save_session(session)
         return f"Menu sent to {_partner_name(config)}."
@@ -1116,7 +1118,7 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
         return _handle_idea_url(text, session, config)
 
     # Waiting on the partner — David just gets a status update
-    if bridge_state == "awaiting_partner_signoff":
+    if bridge_state in SIGNOFF_STATES:
         return f"Still waiting on {_partner_name(config)}'s OK — I'll let you know when she replies."
 
     # Finalization pass-through — MenuBuilder owns the transition to complete

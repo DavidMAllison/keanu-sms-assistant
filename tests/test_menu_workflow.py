@@ -804,6 +804,14 @@ class TestAgentReplyRouting(_Base):
                                     bridge_state="awaiting_partner_signoff")
         self.assertIn("Partner", reply)
 
+    def test_renamed_signoff_state_returns_holding_message(self):
+        # MenuBuilder's renamed state must route the same as the legacy one
+        self._write_session({"conversation": []})
+        session = self._session()
+        reply = mw.menu_agent_reply("what's the status?", session, FAKE_CONFIG,
+                                    bridge_state="awaiting_partner_signoff")
+        self.assertIn("Partner", reply)
+
     def test_awaiting_finalization_calls_finalize_and_replies(self):
         self._write_session({"conversation": []})
         session = self._session()

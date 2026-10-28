@@ -823,7 +823,7 @@ def maybe_capture_partner_reply(handle: str, text: str, config: dict) -> bool:
         # (bridge state — read via get_workflow_state, never from menu_session.json)
         try:
             wf = _call_menubuilder_tool("get_workflow_state")
-            if isinstance(wf, dict) and wf.get("state") == "awaiting_partner_signoff":
+            if isinstance(wf, dict) and wf.get("state") in menu_workflow.SIGNOFF_STATES:
                 wf_session = {}
                 if MENU_SESSION_FILE.exists():
                     wf_session = json.loads(MENU_SESSION_FILE.read_text())
