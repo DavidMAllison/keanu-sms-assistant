@@ -1,5 +1,6 @@
 # Personal config — copy settings.yaml.example and fill in your values
 config/settings.yaml
+system_prompts/family.txt
 
 # API key
 .env

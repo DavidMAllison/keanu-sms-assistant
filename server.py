@@ -164,17 +164,18 @@ def maybe_send_trash_reminder(state: dict, config: dict):
 
     handle_to_person = config["security"].get("handle_to_person", {})
     person_to_handle = {v: k for k, v in handle_to_person.items()}
-    child1_handle = person_to_handle.get("Child1")
-    if not child1_handle:
-        log.warning("Trash reminder: Child1 handle not found in config")
+    person = config.get("trash_reminder_person", "")
+    person_handle = person_to_handle.get(person)
+    if not person_handle:
+        log.warning("Trash reminder: trash_reminder_person missing or not in handle_to_person")
         return
 
     msg = (
-        "Hey Child1! Just a reminder — Tuesday is trash night. "
+        f"Hey {person}! Just a reminder — Tuesday is trash night. "
         "Bring the bins to the curb before bed if you want your allowance this week!"
     )
-    send_imessage(child1_handle, msg)
-    log.info("Trash reminder sent to Child1")
+    send_imessage(person_handle, msg)
+    log.info(f"Trash reminder sent to {person}")
 
     state["last_trash_reminder_date"] = today.isoformat()
     save_state(state)

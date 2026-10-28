@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from agents.menu_agent import load_context
+from agents.menu_agent import load_context, load_system_prompt
 from tools import build_tool_list, execute_tool
 
 log = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ MAX_HISTORY = 10
 MAX_TOOL_ROUNDS = 5
 SESSION_TIMEOUT = 90 * 60  # 90 minutes
 
-_SYSTEM_PROMPT = (Path(__file__).parent / "system_prompts/menu.txt").read_text()
+_SYSTEM_PROMPT = load_system_prompt()
 
 _KID_SYSTEM = """You are Keanu, a friendly koala chatting with a kid over iMessage. Keep it fun and short!
 - One or two sentences max

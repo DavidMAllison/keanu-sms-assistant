@@ -28,6 +28,9 @@ security:
     "kid@icloud.com": "Name"
     "+1XXXXXXXXXX": "Name"
 
+# Who gets the Tuesday trash-night reminder (a name from handle_to_person)
+trash_reminder_person: "Name"
+
 agents:
   menu:
     enabled: true

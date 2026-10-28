@@ -56,7 +56,8 @@ DAY_NAME_MAP = {
     "fri": "Fri", "sat": "Sat", "sun": "Sun",
 }
 
-_MENU_SYSTEM = (Path(__file__).parent.parent / "system_prompts/menu.txt").read_text()
+from agents.menu_agent import load_system_prompt  # noqa: E402
+_MENU_SYSTEM = load_system_prompt()
 
 MONTH_MAP = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
@@ -703,7 +704,7 @@ def _build_menu_tools() -> list:
                 "properties": {
                     "person": {
                         "type": "string",
-                        "description": "Family member name: Child1, Child2, David, or Partner",
+                        "description": "Family member's first name (see the Family section)",
                     },
                     "event_type": {
                         "type": "string",

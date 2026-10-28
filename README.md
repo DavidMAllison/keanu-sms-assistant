@@ -86,9 +86,11 @@ The code lives in `/Users/Shared/sms-assistant/` so both accounts can read and w
 3. Copy and fill in config:
    ```bash
    cp config/settings.yaml.example config/settings.yaml
+   cp system_prompts/family.txt.example system_prompts/family.txt
    cp .env.example .env
    ```
    Edit `config/settings.yaml` with your family's phone numbers and paths.  
+   Edit `system_prompts/family.txt` with your family's names and roles (gitignored, so names never reach the repo).  
    Edit `.env` with your Anthropic API key.
 
 4. Install the launchd service (run as the bot account) so Keanu starts on login and restarts automatically:
@@ -125,6 +127,7 @@ agents/
   menu_agent.py            # Meal plans, recipes, inventory, feedback
 system_prompts/
   menu.txt                 # Keanu's main personality prompt
+  family.txt.example       # Family names/roles template — copy to family.txt (gitignored), appended to menu.txt at load
 config/
   settings.yaml.example    # Config template — copy to settings.yaml
 evals/

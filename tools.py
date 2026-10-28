@@ -194,7 +194,7 @@ _DEFS = {
             "properties": {
                 "person": {
                     "type": "string",
-                    "description": "Family member name: Child1, Child2, David, or Partner",
+                    "description": "Family member's first name (see the Family section)",
                 },
                 "event_type": {
                     "type": "string",
@@ -297,7 +297,7 @@ _DEFS = {
             "properties": {
                 "person": {
                     "type": "string",
-                    "description": "Family member name: Child1, Child2, David, or Partner",
+                    "description": "Family member's first name (see the Family section)",
                 },
                 "description": {
                     "type": "string",
@@ -406,7 +406,7 @@ _DEFS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "recipient": {"type": "string", "description": "Name of the recipient (e.g. 'Partner', 'Child2')"},
+                "recipient": {"type": "string", "description": "Name of the recipient (e.g. 'Partner')"},
                 "message": {"type": "string", "description": "The message text to send"},
             },
             "required": ["recipient", "message"],
@@ -1257,7 +1257,7 @@ def _tool_check_friend_dinner(handle: str, config: dict, date_str: Optional[str]
     kid_name = handle_map.get(handle, "One of the kids")
 
     schedule = _load_schedule()
-    kids = {"Child1", "Child2"}
+    kids = {handle_map[h] for h in config.get("security", {}).get("kids", []) if h in handle_map}
     activities = []
 
     for entry in schedule.get("weekly_overrides", {}).get(check_date.isoformat(), []):

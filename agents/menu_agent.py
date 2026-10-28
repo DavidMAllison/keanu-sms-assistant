@@ -36,7 +36,10 @@ DAY_NAMES = {
 
 
 def load_system_prompt() -> str:
-    return SYSTEM_PROMPT_FILE.read_text()
+    # Family names live in a gitignored file so kids' names never reach the repo.
+    family_file = SYSTEM_PROMPT_FILE.parent / "family.txt"
+    family = family_file.read_text() if family_file.exists() else ""
+    return SYSTEM_PROMPT_FILE.read_text() + ("\n" + family if family else "")
 
 
 def load_context() -> str:
