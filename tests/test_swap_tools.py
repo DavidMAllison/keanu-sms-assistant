@@ -105,5 +105,55 @@ class TestRecipeUrlExists(unittest.TestCase):
         self.assertNotIn("Couldn't fetch", reply)
 
 
+class TestAddLunchRecipeUrl(unittest.TestCase):
+
+    def _call(self, return_value, force_add=False):
+        with patch("tools._call_menubuilder_tool", return_value=return_value) as mb:
+            reply = tools._tool_add_lunch_recipe_url("https://example.com/l", force_add)
+        return reply, mb
+
+    def test_added_includes_name_and_url(self):
+        reply, mb = self._call({"ok": True, "recipe": "Test Grain Bowl", "url": "https://example.com/bowl",
+                                "message": "Added 'Test Grain Bowl' as a lunch recipe."})
+        mb.assert_called_once_with("add_lunch_recipe_url", url="https://example.com/l", force_add=False)
+        self.assertIn("Test Grain Bowl", reply)
+        self.assertIn("\nhttps://example.com/bowl", reply)
+
+    def test_exact_link_already_in_collection(self):
+        reply, _ = self._call({"ok": True, "recipe": "Test Grain Bowl", "url": "https://example.com/bowl",
+                               "message": "'Test Grain Bowl' is already in the collection -- marked it for lunches."})
+        self.assertIn("already in the collection", reply)
+        self.assertIn("https://example.com/bowl", reply)
+
+    def test_similar_exists_asks_and_points_to_force_add(self):
+        reply, _ = self._call({"ok": False, "status": "similar_exists", "recipe": "Test Grain Bowl",
+                               "match_score": 0.82, "url": "https://example.com/bowl", "message": "..."})
+        self.assertTrue(reply.startswith("similar_exists"))
+        self.assertIn("82%", reply)
+        self.assertIn("force_add=true", reply)
+        self.assertIn("set_lunch_pick", reply)
+
+    def test_fetch_failed_asks_for_paste(self):
+        reply, _ = self._call({"ok": False, "recipe": "", "url": "https://example.com/l",
+                               "message": "Page has no ingredients"})
+        self.assertTrue(reply.startswith("fetch_failed"))
+        self.assertIn("Page has no ingredients", reply)
+        self.assertIn("paste", reply)
+
+    def test_force_add_passes_through(self):
+        _, mb = self._call({"ok": True, "recipe": "X", "url": "", "message": "Added"}, force_add=True)
+        self.assertTrue(mb.call_args.kwargs["force_add"])
+
+    def test_bridge_error(self):
+        reply, _ = self._call({"error": "timeout"})
+        self.assertIn("went wrong", reply)
+
+    def test_offered_to_idea_submitters_only(self):
+        submitter = [t["name"] for t in tools.build_tool_list(False, False, True)]
+        other_adult = [t["name"] for t in tools.build_tool_list(False, False, False)]
+        self.assertIn("add_lunch_recipe_url", submitter)
+        self.assertNotIn("add_lunch_recipe_url", other_adult)
+
+
 if __name__ == "__main__":
     unittest.main()

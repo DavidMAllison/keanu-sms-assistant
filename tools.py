@@ -446,6 +446,22 @@ _DEFS = {
             "required": ["recipe_name"],
         },
     },
+    "add_lunch_recipe_url": {
+        "name": "add_lunch_recipe_url",
+        "description": (
+            "Add a recipe URL Partner sent as a lunch recipe (e.g. in reply to the Saturday lunch text). "
+            "Checks for similar existing recipes first. If similar_exists comes back and she says it's "
+            "a new recipe, call again with force_add=true."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url":       {"type": "string", "description": "Recipe URL"},
+                "force_add": {"type": "boolean", "description": "Skip similarity check and add anyway"},
+            },
+            "required": ["url"],
+        },
+    },
     "log_lunch_feedback": {
         "name": "log_lunch_feedback",
         "description": "Log Partner's feedback on last week's lunch. Call when she rates or comments on her lunch in reply to the weekly check-in.",
@@ -629,7 +645,7 @@ def build_tool_list(is_kid: bool, is_admin: bool, is_idea_submitter: bool) -> li
     if is_idea_submitter:
         names += ["check_recipe_similarity", "save_recipe_idea", "swap_meal", "switch_days",
                   "process_recipe_url", "process_recipe_image", "set_recipe_image",
-                  "send_partner_recipe_batch"]
+                  "send_partner_recipe_batch", "add_lunch_recipe_url"]
     if is_admin:
         names += ["update_meal_plan", "update_inventory", "start_menu_workflow", "add_music_seed", "build_music_playlist"]
     return [_DEFS[n] for n in names]
@@ -1511,6 +1527,31 @@ def _tool_set_lunch_pick(recipe_name: str) -> str:
     return result.get("message", f"Lunch pick saved: {recipe_name}")
 
 
+def _tool_add_lunch_recipe_url(url: str, force_add: bool = False) -> str:
+    result = _call_menubuilder_tool("add_lunch_recipe_url", url=url, force_add=bool(force_add))
+    if "error" in result:
+        log.error(f"add_lunch_recipe_url bridge error: {result['error']}")
+        return "something went wrong on my end"
+    recipe = result.get("recipe", "")
+    link = result.get("url", "")
+    if result.get("ok"):
+        # Covers both a new add and an exact-link match (marked lunch_suitable)
+        msg = result.get("message") or f"Added '{recipe}' as a lunch recipe."
+        return msg + (f"\n{link}" if link else "")
+    if result.get("status") == "similar_exists":
+        return (
+            f"similar_exists: Already have \"{recipe}\" ({result.get('match_score', 0):.0%} match)"
+            + (f"\n{link}" if link else "")
+            + "\nAsk her: use that one or add this as a new one? If new, call add_lunch_recipe_url "
+            "again with force_add=true. If existing and she wants it this week, call set_lunch_pick; "
+            "otherwise just acknowledge."
+        )
+    return (
+        f"fetch_failed: {result.get('message') or 'unknown error'}. Nothing was saved. "
+        "Tell her the site wouldn't give up the recipe and ask her to paste the ingredients and steps."
+    )
+
+
 def _tool_log_lunch_feedback(recipe: str, sentiment: str, note: str = "") -> str:
     result = _call_menubuilder_tool("log_lunch_feedback", recipe=recipe, sentiment=sentiment, note=note)
     if "error" in result:
@@ -1565,6 +1606,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_start_menu_workflow(config)
         if name == "send_partner_recipe_batch":
             return _tool_send_partner_recipe_batch(config)
+        if name == "add_lunch_recipe_url":
+            return _tool_add_lunch_recipe_url(inputs["url"], inputs.get("force_add", False))
         if name == "log_lunch_feedback":
             return _tool_log_lunch_feedback(inputs["recipe"], inputs["sentiment"], inputs.get("note", ""))
         if name == "add_music_seed":

@@ -55,7 +55,7 @@ On Saturday Partner receives a text with 3 lunch suggestions. She makes one choi
 
 When Partner replies to the Saturday lunch text:
 - If she picks one of the numbered options (1, 2, or 3) or names a recipe: call set_lunch_pick with the recipe name. Confirm: "Got it! [Recipe] is on the list for this week."
-- If she sends a URL: reply "Saving that recipe for your lunches!" and call log_capability_gap with "Partner sent a lunch URL — needs add_lunch_recipe_url MCP tool" (the tool exists in MenuBuilder but isn't wired here yet).
+- If she sends a URL: call add_lunch_recipe_url with it. Don't say it's saved until the result comes back. If it was added (or was already in the collection), confirm with the recipe name and its URL on the next line. If similar_exists, ask "use [existing] or add this as a new one?" — on "new" call add_lunch_recipe_url again with force_add=true; on "existing" call set_lunch_pick if she means it for this week, otherwise just acknowledge. If fetch_failed, tell her the site wouldn't give up the recipe and ask her to paste the ingredients and steps.
 - If she says "no thanks" or doesn't want a suggestion: just acknowledge, no tool call.
 
 When Partner texts about last week's lunch (feedback):
