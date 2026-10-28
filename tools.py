@@ -1343,7 +1343,7 @@ def _tool_log_capability_gap(description: str, handle: str) -> str:
     gaps = json.loads(GAPS_FILE.read_text()) if GAPS_FILE.exists() else []
     gaps.append({
         "date": time.strftime("%Y-%m-%d"),
-        "handle": handle,
+        "person": _load_handle_to_name().get(handle, "unknown"),
         "request": description,
         "reviewed": False,
     })

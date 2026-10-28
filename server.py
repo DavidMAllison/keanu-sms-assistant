@@ -43,6 +43,33 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+_LOG_PHONE_RE = re.compile(r"\+\d{11}")
+_LOG_EMAIL_RE = re.compile(r"[\w.%+-]+@([\w-]+\.[\w.]+)")
+
+
+class _RedactHandles(logging.Filter):
+    """Keep handles out of keanu.log: family handles become names, anything else is masked."""
+
+    def __init__(self, handle_to_person: dict):
+        super().__init__()
+        # Longest first so a handle that contains another is replaced whole
+        self._names = sorted(handle_to_person.items(), key=lambda kv: -len(kv[0]))
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        for handle, name in self._names:
+            msg = msg.replace(handle, name)
+        msg = _LOG_PHONE_RE.sub(lambda m: m.group(0)[:5] + "•" * (len(m.group(0)) - 5), msg)
+        msg = _LOG_EMAIL_RE.sub(lambda m: "•••@" + m.group(1), msg)
+        record.msg, record.args = msg, ()
+        return True
+
+
+def install_log_redaction(config: dict):
+    redactor = _RedactHandles(config.get("security", {}).get("handle_to_person", {}))
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redactor)
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 CONFIG_FILE = Path(__file__).parent / "config/settings.yaml"
@@ -1307,6 +1334,7 @@ def start_api_server(port: int):
 def main():
     log.info("Keanu starting up...")
     cfg = load_config()
+    install_log_redaction(cfg)
     start_api_server(cfg.get("api_port", 5050))
     state = load_state()
 
