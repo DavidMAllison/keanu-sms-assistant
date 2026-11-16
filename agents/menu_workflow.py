@@ -207,11 +207,21 @@ def _get_week_start() -> date:
 
 # ── handle_start ──────────────────────────────────────────────────────────────
 
-def handle_start(config: dict, for_week_str: str = "") -> str:
-    """idle → awaiting_week_confirmation. Calls MB bridge, shows which week is being planned."""
+ALREADY_PLANNED_REPLY = "This week's already planned. Say 'replan' if you want to rebuild it."
+
+
+def handle_start(config: dict, for_week_str: str = "", replan: bool = False) -> str:
+    """idle → awaiting_week_confirmation. Calls MB bridge, shows which week is being planned.
+    MenuBuilder refuses a week that already has a plan file unless replan=True,
+    which only an explicit "replan" from the admin passes."""
     week_start_iso = _parse_week_start(for_week_str)
     kwargs = {"week_start": week_start_iso} if week_start_iso else {}
+    if replan:
+        kwargs["replan"] = True
     result = call_menubuilder_tool("start_menu_workflow", **kwargs)
+    if result.get("already_planned"):
+        log.info(f"Menu start refused: week {result.get('week_start')} already planned")
+        return ALREADY_PLANNED_REPLY
     if "error" in result:
         return "Sorry, couldn't start the menu workflow. Check the logs."
 

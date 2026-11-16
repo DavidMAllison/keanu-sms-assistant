@@ -100,6 +100,22 @@ def send_imessage(handle: str, text: str):
         log.info(f"Sent reply to {handle}")
 
 
+def send_imessage_chat(chat_guid: str, text: str):
+    """Send into an existing chat (e.g. a group a family member added Keanu to)."""
+    safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
+    safe_guid = chat_guid.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'''
+    tell application "Messages"
+        send "{safe_text}" to chat id "{safe_guid}"
+    end tell
+    '''
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(f"AppleScript error sending to chat {chat_guid[-6:]}: {result.stderr.strip()}")
+    else:
+        log.info(f"Sent reply to chat {chat_guid[-6:]}")
+
+
 def send_imessage_group(handles: list, text: str):
     safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
     buddy_refs = ", ".join(f'buddy "{h}"' for h in handles)

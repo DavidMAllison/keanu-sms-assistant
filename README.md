@@ -10,6 +10,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Schedule** — upcoming soccer games, practices, events pulled from a calendar
 - **Recipes** — searches local collection first (all statuses, scored by keyword match); falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally; returns GitHub Pages URL for collection hits; appends any standing family notes/feedback for the recipe (via MenuBuilder's `get_recipe_notes`)
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
+- **Group chat games** — add Keanu to a group text that includes at least one family member and play **Story Chain**: "@keanu story" starts it, players reply "in" (friends add a name, "in Sam"), "keanu go" begins, and everyone adds one sentence in turn while Keanu writes the opening and the ending. "keanu skip" / "keanu stop" control it; "keanu who's next?" gives the turn. Games are saved per chat in `game_state/` and survive restarts; a game expires after 24 hours idle (30 minutes if it was never started) and Keanu posts the story so far when it does. Friends can only play; nothing else in a group reaches the agent yet
 - **Feedback** — logs family reactions to meals for future planning
 - **Proactive messages** — holiday morning messages, trash reminders, game-day good-luck texts
 - **Relay** — admin can ask Keanu to forward a message to another family member
@@ -17,7 +18,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Recipe ideas from photos** — caption a recipe photo with "save this as an idea" and Keanu drops the raw image into the recipe ideas inbox for later review
 - **Study-guide quizzes** — send a photo of a study guide, worksheet, or practice test (caption keyword like "quiz" or "practice test" skips confirmation; otherwise Haiku vision detects it and asks first) and Keanu generates a practice quiz with an answer key
 - **Image vision** — reads images sent via iMessage (HEIC auto-converted to JPEG)
-- **Sunday menu trigger** — the polling loop fires the weekly menu workflow on the first poll after 9 AM Sunday (no launchd dependency — if the Mac was asleep at 9:00 it fires as soon as Keanu is back up). An 8:30 AM pre-flight checks API credits, the MenuBuilder bridge, shared-file writability, and the tool contract; it texts the admin only on failure — success is log-only
+- **Sunday menu trigger** — the polling loop fires the weekly menu workflow on the first poll after 9 AM Sunday (no launchd dependency — if the Mac was asleep at 9:00 it fires as soon as Keanu is back up). An 8:30 AM pre-flight checks API credits, the MenuBuilder bridge, shared-file writability, and the tool contract; it texts the admin only on failure — success is log-only. The trigger stands down for the day when a build is already in flight, when MenuBuilder reports the coming week `complete`, or when MenuBuilder refuses the start because the week already has a plan file (e.g. it was built from the MenuBuilder terminal)
 - **Partner's weekly lunch** — Saturday 10 AM launchd job sends the menu partner 3 lunch suggestions; she replies to pick one; 6 PM nudge if no pick by then; Keanu handles pick and feedback via `set_lunch_pick` and `log_lunch_feedback` (bridge to MenuBuilder); if she replies with a recipe link, `add_lunch_recipe_url` runs MenuBuilder's full recipe intake and tags it as a lunch recipe (asks use-existing-or-new on a lookalike, asks her to paste the recipe if the site won't give it up)
 - **URL-based meal swaps** — the menu partner (or David) can send a recipe URL during menu signoff to add a new recipe and schedule it for a specific day; Keanu checks for similar existing recipes and asks which to use if a close match is found. In the planning chat, David's recipe links go through the `add_recipe_url` menu tool (MenuBuilder's `process_recipe_url`) — a URL is never turned into a guessed name for `swap_meal`
 - **Post-finalize swaps** — once the plan is final, swaps go through MenuBuilder's `meal_swap.execute_swap` (`swap_meal` tool) so the plan, shopping list and calendar update together; to put two already-planned dinners on each other's nights, the `switch_days` tool wraps `meal_swap.reorder_days` (no decline cooldown or "skipped" feedback). If a swap's recipe is already on another night, Keanu offers the switch instead. Both import MenuBuilder in-process, so a Keanu restart is needed to pick up MenuBuilder changes
@@ -41,6 +42,8 @@ Outbound proactive messages go through the **outbox spool**: any process queues 
 
 **Split-message coalescing** — iMessage often delivers "Let's add this recipe:" and its link as separate messages. The poll loop (`coalesce_messages` in `server.py`) merges a sender's back-to-back messages into one turn and waits until they've been quiet for 4s — or 15s after a lead-in (ends in ":" or announces a recipe with no link) — before replying. A photo is merged only after a lead-in; tapbacks and different senders never merge.
 
+**Group chats** — `poll_new_messages` returns each message's `chat_guid` and flags groups by `chat.style = 43` (macOS 26 group identifiers no longer start with `chat`). Group messages never take the 1:1 path: `handle_group_message` answers only when the chat includes an allowed handle, only for games (`group_games.py`), and replies into the group via `send_imessage_chat` (`send ... to chat id`). Coalescing only merges messages from the same sender in the same chat.
+
 **Reading chat.db** — since macOS Ventura some messages leave `message.text` NULL and store their content only in `attributedBody`; `poll_new_messages` decodes it in that case (logged as `[from attributedBody]`). Tapbacks and emoji reactions are excluded in SQL via `associated_message_type = 0`, with `is_tapback`'s text-prefix check kept as a fallback.
 
 ## Admin keywords
@@ -49,7 +52,8 @@ Texts from the menu admin that route to fixed handlers instead of the agent:
 
 - **`start menu`** — kick off the weekly menu workflow by hand (it also fires automatically on Sunday; the workflow refuses to double-start if a build is already active)
 - **`menu status`** — one-glance workflow status: local session state, bridge state, last Sunday trigger date, last pre-flight date, and the week being planned. Works mid-workflow.
-- **`recycle koala`** — reset a stuck menu session back to normal chat
+- **`replan`** (or `replan for July 6`) — rebuild a week that's already planned; `start menu` on a planned week replies "This week's already planned" and changes nothing
+- **`recycle koala`** — reset a stuck menu session back to normal chat. A session left over from a different week than MenuBuilder's is also discarded automatically
 
 The agent also has an admin-only `start_menu_workflow` tool, so asking Keanu conversationally to "plan the menu" starts the real workflow instead of improvised meal planning.
 
@@ -118,6 +122,7 @@ osascript -e 'do shell script "kill $(pgrep -u botaccount -f server.py)" with ad
 ```
 server.py                  # Main loop — polls chat.db, routes messages, sends replies; HTTP API on :5050 (/send, /start_menu_workflow)
 agent.py                   # Conversation loop — Claude tool use, per-handle history
+group_games.py             # Group chat games (Story Chain) — chat-scoped, disk-persisted state in game_state/
 tools.py                   # Tool definitions and implementations
 trigger_menu.py            # Manual fallback — POSTs to /start_menu_workflow on Keanu's HTTP API (Sunday scheduling is handled in-loop now)
 groceryagent_bridge.py     # Subprocess bridge to GroceryAgent receipt parser
@@ -143,6 +148,7 @@ tests/
   test_chat_db_poll.py     # attributedBody decoding + reaction filtering in poll_new_messages
   test_outbox_spool.py     # Outbox spool queue/drain/quarantine
   test_sunday_trigger.py   # In-loop Sunday trigger guard
+  test_group_chat.py       # Group routing gate, chat-scoped coalescing, Story Chain lifecycle/expiry
   test_swap_tools.py       # switch_days, swap_meal already_planned/confirmation, add_lunch_recipe_url (MenuBuilder faked)
   test_tool_contract.py    # Bridge call sites vs live MenuBuilder signatures (also pre-flight check 4)
   test_tools_update.py     # Unit tests for update_meal_plan confirmation flow

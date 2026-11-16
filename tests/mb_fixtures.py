@@ -55,6 +55,14 @@ START_SUNDAY_DATE = {
 
 START_ERROR = {"error": "MenuBuilder unavailable"}
 
+# Week already has a plan file — MenuBuilder refuses without replan=True
+START_ALREADY_PLANNED = {
+    "error": "The week of 2026-07-07 is already planned. Pass replan=True to rebuild it.",
+    "already_planned": True,
+    "week_start": "2026-07-07",
+    "plan_path": "/tmp/mealplan_2026-07-07.json",
+}
+
 # ── swap_meal responses ───────────────────────────────────────────────────────
 
 SWAP_SUCCESS = {

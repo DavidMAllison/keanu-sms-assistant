@@ -30,7 +30,8 @@ from agents import menu_workflow
 from groceryagent_bridge import call_receipt_parser
 from kidquiz_bridge import call_quiz_generator
 from menubuilder_bridge import call_menubuilder_tool as _call_menubuilder_tool
-from tools import (send_imessage, send_imessage_group, drain_outbox, queue_outbox,
+import group_games
+from tools import (send_imessage, send_imessage_chat, send_imessage_group, drain_outbox, queue_outbox,
                    OUTBOX_DIR, _pending_image_recipe, INVENTORY_FILE, _partner_name)
 from agents.menu_agent import (
     METADATA_FILE as _METADATA_FILE,
@@ -237,6 +238,16 @@ def maybe_start_sunday_menu(state: dict, config: dict):
         state["last_menu_trigger_date"] = today.isoformat()
         save_state(state)
         return
+    # Already built (e.g. from the MenuBuilder terminal) — starting again would
+    # overwrite the completed workflow. MenuBuilder may report the week as the
+    # Sunday or the Monday, so accept either.
+    target_week = (today + timedelta(days=1)).isoformat()
+    if (isinstance(wf, dict) and wf.get("state") == "complete"
+            and wf.get("week_start") in (today.isoformat(), target_week)):
+        log.info(f"Sunday trigger: week {target_week} already built — standing down")
+        state["last_menu_trigger_date"] = today.isoformat()
+        save_state(state)
+        return
 
     admin_handle = config["security"].get("menu_admin")
     if not admin_handle:
@@ -245,6 +256,12 @@ def maybe_start_sunday_menu(state: dict, config: dict):
 
     try:
         reply = menu_workflow.handle_start(config)
+        if reply == menu_workflow.ALREADY_PLANNED_REPLY:
+            # Plan file exists but the bridge state wasn't "complete" — still built
+            log.info("Sunday trigger: MenuBuilder says this week is already planned — standing down")
+            state["last_menu_trigger_date"] = today.isoformat()
+            save_state(state)
+            return
         queue_outbox({"handle": admin_handle, "text": reply})
         log.info(f"In-loop Sunday trigger: queued opening message to {admin_handle}")
     except Exception as e:
@@ -773,6 +790,11 @@ def is_menu_start(text: str) -> bool:
     ))
 
 
+def is_menu_replan(text: str) -> bool:
+    """Explicit request to rebuild an already-planned week ("replan", "replan for July 6")."""
+    return bool(re.match(r"\s*replan\b", text, re.IGNORECASE))
+
+
 def _parse_for_week(text: str) -> str:
     """Extract a trailing week specifier from a menu-start trigger, e.g. 'for July 6'."""
     import re as _re
@@ -947,6 +969,7 @@ def coalesce_messages(messages: list, now: float) -> list:
         prev = groups[-1] if groups else None
         if (prev
                 and prev["handle"] == msg["handle"]
+                and prev.get("chat_guid") == msg.get("chat_guid")
                 and not is_tapback(prev["text"]) and not is_tapback(msg["text"])
                 and not prev["attachments"]
                 and (not msg["attachments"] or is_lead_in(prev["text"]))
@@ -966,6 +989,87 @@ def coalesce_messages(messages: list, now: float) -> list:
     return ready
 
 
+def load_menu_routing_state() -> tuple:
+    """
+    Returns (session, local_state, bridge_state) for admin menu routing.
+
+    One bridge call per admin message. A local session for a different week
+    than MenuBuilder's is stale (the week was started or finished from the
+    MenuBuilder terminal), so it's discarded instead of hijacking the admin's
+    texts. bridge_state stays empty while a local sub-state is live, as before.
+    """
+    session = {}
+    if MENU_SESSION_FILE.exists():
+        session = json.loads(MENU_SESSION_FILE.read_text())
+    local_state = session.get("state") or ""
+    result = _call_menubuilder_tool("get_workflow_state")
+    if not isinstance(result, dict) or result.get("error"):
+        result = {}
+    bridge_week = result.get("week_start") or ""
+    session_week = session.get("week_start") or ""
+    if local_state and bridge_week and session_week and bridge_week != session_week:
+        log.info(f"Discarded stale menu session (week {session_week}, bridge week {bridge_week})")
+        MENU_SESSION_FILE.write_text(json.dumps({}))
+        session, local_state = {}, ""
+    bridge_state = "" if local_state in menu_workflow.LOCAL_STATES else (result.get("state") or "")
+    return session, local_state, bridge_state
+
+
+GROUP_CHAT_STYLE = 43
+
+
+def get_chat_participants(chat_guid: str) -> list:
+    """Handles of everyone in a chat other than Keanu."""
+    conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("""
+            SELECT h.id FROM chat c
+            JOIN chat_handle_join chj ON chj.chat_id = c.rowid
+            JOIN handle h ON h.rowid = chj.handle_id
+            WHERE c.guid = ?
+        """, (chat_guid,)).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def handle_group_message(msg: dict, config: dict):
+    """
+    Group chats only get games for now. Keanu answers only when the chat
+    includes a family member (an allowed handle); friends in that chat can play
+    but never reach the agent. Anything that isn't a game is logged and ignored
+    rather than answered privately.
+    """
+    chat_guid = msg["chat_guid"]
+    handle = msg["handle"]
+    text = msg["text"]
+    tag = group_games.chat_tag(chat_guid)
+    allowed = config["security"]["allowed_numbers"]
+
+    if not text.strip():
+        log.info(f"Ignoring non-text group message in chat {tag}")
+        return
+    participants = get_chat_participants(chat_guid)
+    if handle not in allowed and not any(p in allowed for p in participants):
+        log.warning(f"Ignoring group chat {tag}: no family member in it")
+        return
+    if not config["agents"]["menu"]["enabled"]:
+        return
+    if (is_rate_limited(handle, config["security"]["rate_limit_per_hour"])
+            or is_rate_limited(f"chat:{chat_guid}",
+                               config["security"].get("group_rate_limit_per_hour", 200))):
+        log.warning(f"Rate limit hit in group chat {tag}")
+        return
+
+    replies = group_games.handle_group_game_message(
+        chat_guid, handle, text, is_family=handle in allowed, config=config)
+    if replies is None:
+        log.info(f"Group message in chat {tag} isn't a game, ignoring")
+        return
+    for reply in replies:
+        send_imessage_chat(chat_guid, reply)
+
+
 def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list[dict]:
     conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
     try:
@@ -977,6 +1081,7 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
             params.append(int((min_date - APPLE_EPOCH_OFFSET) * 1e9))
         cursor = conn.execute(f"""
             SELECT m.rowid, m.text, m.attributedBody, m.date, h.id AS sender_handle,
+                   c.guid AS chat_guid, c.style AS chat_style,
                    a.filename AS att_filename,
                    a.mime_type AS att_mime_type
             FROM message m
@@ -986,7 +1091,6 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
             LEFT JOIN message_attachment_join maj ON maj.message_id = m.rowid
             LEFT JOIN attachment a ON a.rowid = maj.attachment_id
             WHERE m.is_from_me = 0
-              AND c.chat_identifier NOT LIKE 'chat%'
               AND m.rowid > ?
               AND m.associated_message_type = 0
               AND (
@@ -1000,12 +1104,16 @@ def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list
         # Deduplicate by rowid — one message can have multiple attachments
         seen: dict = {}
         for row in cursor.fetchall():
-            rowid, text, attributed_body, apple_date, handle, att_filename, att_mime_type = row
+            (rowid, text, attributed_body, apple_date, handle, chat_guid, chat_style,
+             att_filename, att_mime_type) = row
             if rowid not in seen:
                 seen[rowid] = {
                     "rowid": rowid,
                     "text": text or "",
                     "handle": handle,
+                    "chat_guid": chat_guid,
+                    # style 43 = group chat (both pre- and post-macOS 26 guid formats)
+                    "is_group": chat_style == GROUP_CHAT_STYLE,
                     "date": _apple_date_to_unix(apple_date),
                     "attachments": [],
                 }
@@ -1383,6 +1491,11 @@ def main():
                     log.info(f"Ignoring empty message from {handle}")
                     continue
 
+                # Group chats never get the 1:1 routing below (or a private reply)
+                if msg.get("is_group"):
+                    handle_group_message(msg, config)
+                    continue
+
                 if handle not in config["security"]["allowed_numbers"]:
                     log.warning(f"Rejected from unauthorized handle: {handle}")
                     continue
@@ -1502,6 +1615,12 @@ def main():
 
                 # Menu workflow — admin only
                 menu_admin = config["security"].get("menu_admin")
+                if handle == menu_admin and is_menu_replan(text):
+                    reply = menu_workflow.handle_start(
+                        config, for_week_str=_parse_for_week(text), replan=True)
+                    send_imessage(handle, reply)
+                    continue
+
                 if handle == menu_admin and is_menu_start(text):
                     for_week_str = _parse_for_week(text)
                     reply = menu_workflow.handle_start(config, for_week_str=for_week_str)
@@ -1513,15 +1632,7 @@ def main():
                 # At most one bridge call per inbound message, admin handle only.
                 if handle == menu_admin:
                     try:
-                        session = {}
-                        if MENU_SESSION_FILE.exists():
-                            session = json.loads(MENU_SESSION_FILE.read_text())
-                        local_state = session.get("state") or ""
-                        bridge_state = ""
-                        if local_state not in menu_workflow.LOCAL_STATES:
-                            result = _call_menubuilder_tool("get_workflow_state")
-                            if isinstance(result, dict):
-                                bridge_state = result.get("state") or ""
+                        session, local_state, bridge_state = load_menu_routing_state()
                         if (local_state in menu_workflow.LOCAL_STATES
                                 or bridge_state in menu_workflow.ACTIVE_BRIDGE_STATES):
                             if text.strip().lower() == "recycle koala":

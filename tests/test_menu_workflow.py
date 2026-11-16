@@ -26,6 +26,7 @@ import agents.menu_workflow as mw
 from tests.mb_fixtures import (
     APPROVE_MISMATCH,
     FAKE_CONFIG,
+    START_ALREADY_PLANNED,
     START_DEFAULT,
     START_ERROR,
     START_SUNDAY_DATE,
@@ -149,6 +150,25 @@ class TestHandleStart(_Base):
         with patch("agents.menu_workflow.call_menubuilder_tool", return_value=START_ERROR):
             reply = mw.handle_start(FAKE_CONFIG)
         self.assertIn("couldn't start", reply.lower())
+
+    def test_already_planned_offers_replan_and_leaves_session(self):
+        self._write_session({"state": "", "week_start": "2026-06-29"})
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=START_ALREADY_PLANNED):
+            reply = mw.handle_start(FAKE_CONFIG)
+        self.assertEqual(reply, mw.ALREADY_PLANNED_REPLY)
+        self.assertEqual(self._session(), {"state": "", "week_start": "2026-06-29"})
+
+    def test_plain_start_never_passes_replan(self):
+        mock_mb = MagicMock(return_value=START_DEFAULT)
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb):
+            mw.handle_start(FAKE_CONFIG, for_week_str="next week")
+        self.assertNotIn("replan", mock_mb.call_args[1])
+
+    def test_replan_passes_replan_true(self):
+        mock_mb = MagicMock(return_value=START_DEFAULT)
+        with patch("agents.menu_workflow.call_menubuilder_tool", mock_mb):
+            mw.handle_start(FAKE_CONFIG, replan=True)
+        self.assertIs(mock_mb.call_args[1].get("replan"), True)
 
 
 # ── TestWeekConfirmation ──────────────────────────────────────────────────────

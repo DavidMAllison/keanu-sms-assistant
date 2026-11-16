@@ -64,13 +64,17 @@ class TestPollNewMessages(unittest.TestCase):
             CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT, attributedBody BLOB,
                 date INTEGER, handle_id INTEGER, is_from_me INTEGER, associated_message_type INTEGER);
             CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
-            CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT);
+            CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT, guid TEXT, style INTEGER);
             CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
             CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, filename TEXT, mime_type TEXT);
             CREATE TABLE message_attachment_join (ROWID INTEGER PRIMARY KEY, message_id INTEGER, attachment_id INTEGER);
         """)
         conn.execute("INSERT INTO handle VALUES (1, ?)", (DAVID,))
-        conn.execute("INSERT INTO chat VALUES (1, ?)", (DAVID,))
+        conn.execute("INSERT INTO chat VALUES (1, ?, ?, 45)", (DAVID, "any;-;" + DAVID))
+        # macOS 26 group: bare-hex chat_identifier, style 43
+        conn.execute("INSERT INTO chat VALUES (2, 'c1b2c554', 'any;+;c1b2c554', 43)")
+        conn.execute("INSERT INTO message VALUES (6, 'group hi', NULL, ?, 1, 0, 0)", (6 * NS,))
+        conn.execute("INSERT INTO chat_message_join VALUES (2, 6)")
         rows = [
             (1, "plain text", None, 0),
             (2, None, _blob("only in attributedBody"), 0),
@@ -108,6 +112,16 @@ class TestPollNewMessages(unittest.TestCase):
         msgs = self._poll()
         self.assertNotIn(3, msgs)
         self.assertNotIn(4, msgs)
+
+    def test_one_to_one_not_group(self):
+        msg = self._poll()[1]
+        self.assertFalse(msg["is_group"])
+        self.assertEqual(msg["chat_guid"], "any;-;" + DAVID)
+
+    def test_macos26_group_returned_and_flagged(self):
+        msg = self._poll()[6]
+        self.assertTrue(msg["is_group"])
+        self.assertEqual(msg["chat_guid"], "any;+;c1b2c554")
 
     def test_image_message_still_returned(self):
         msg = self._poll()[5]

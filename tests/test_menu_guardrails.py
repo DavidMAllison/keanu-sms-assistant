@@ -133,5 +133,62 @@ class TestMenuStatusKeyword(unittest.TestCase):
         self.assertIn("bridge exploded", sent[0][1])
 
 
+class TestReplanKeyword(unittest.TestCase):
+    def test_matches_explicit_replan(self):
+        self.assertTrue(server.is_menu_replan("replan"))
+        self.assertTrue(server.is_menu_replan("  Replan for next week"))
+
+    def test_ignores_other_mentions(self):
+        self.assertFalse(server.is_menu_replan("start menu"))
+        self.assertFalse(server.is_menu_replan("should we replan?"))
+        self.assertFalse(server.is_menu_replan("replanning"))
+
+
+class TestStaleMenuSession(unittest.TestCase):
+    """A local session left over from a week that was then built from the
+    MenuBuilder terminal must not keep routing the admin into the workflow."""
+
+    def setUp(self):
+        import json
+        import tempfile
+        self.json = json
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.session_file = Path(self.tmp.name) / "menu_session.json"
+
+    def _run(self, session, bridge_result):
+        self.session_file.write_text(self.json.dumps(session))
+        with patch.object(server, "MENU_SESSION_FILE", self.session_file), \
+             patch.object(server, "_call_menubuilder_tool", MagicMock(return_value=bridge_result)):
+            return server.load_menu_routing_state()
+
+    def test_week_mismatch_discards_session(self):
+        session, local, bridge = self._run(
+            {"state": "awaiting_meal_logging", "week_start": "2026-11-09"},
+            {"state": "complete", "week_start": "2026-11-16"})
+        self.assertEqual((session, local, bridge), ({}, "", "complete"))
+        self.assertEqual(self.json.loads(self.session_file.read_text()), {})
+
+    def test_same_week_keeps_session_and_blank_bridge_state(self):
+        session, local, bridge = self._run(
+            {"state": "awaiting_meal_logging", "week_start": "2026-11-16"},
+            {"state": "awaiting_partner_signoff", "week_start": "2026-11-16"})
+        self.assertEqual(local, "awaiting_meal_logging")
+        self.assertEqual(bridge, "")
+        self.assertEqual(session["week_start"], "2026-11-16")
+
+    def test_bridge_error_keeps_session(self):
+        session, local, bridge = self._run(
+            {"state": "awaiting_meal_logging", "week_start": "2026-11-09"},
+            {"error": "bridge exploded"})
+        self.assertEqual(local, "awaiting_meal_logging")
+        self.assertIn("state", self.json.loads(self.session_file.read_text()))
+
+    def test_no_session_uses_bridge_state(self):
+        session, local, bridge = self._run({}, {"state": "awaiting_finalization",
+                                                "week_start": "2026-11-16"})
+        self.assertEqual((local, bridge), ("", "awaiting_finalization"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

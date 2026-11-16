@@ -31,7 +31,7 @@ _SUNDAY_0930 = datetime(2026, 7, 19, 9, 30)
 
 class TestSundayTriggerGuard(unittest.TestCase):
 
-    def _run(self, session, bridge_result):
+    def _run(self, session, bridge_result, start_reply="Let's plan the week!"):
         """Run maybe_start_sunday_menu on a fake Sunday 9:30 AM.
         Returns (state, bridge_mock, handle_start_mock)."""
         state = {}
@@ -40,11 +40,12 @@ class TestSundayTriggerGuard(unittest.TestCase):
         fake_datetime = MagicMock()
         fake_datetime.now.return_value = _SUNDAY_0930
         bridge_mock = MagicMock(return_value=bridge_result)
-        start_mock = MagicMock(return_value="Let's plan the week!")
+        start_mock = MagicMock(return_value=start_reply)
+        self.outbox = MagicMock()
 
         with patch.object(server, "date", fake_date), \
              patch.object(server, "datetime", fake_datetime), \
-             patch.object(server, "queue_outbox", MagicMock()), \
+             patch.object(server, "queue_outbox", self.outbox), \
              patch.object(server, "save_state", MagicMock()), \
              patch.object(server, "_call_menubuilder_tool", bridge_mock), \
              patch.object(server.menu_workflow, "_load_session", return_value=session), \
@@ -87,6 +88,33 @@ class TestSundayTriggerGuard(unittest.TestCase):
         # active state, so the workflow start proceeds (handle_start has its
         # own bridge error handling).
         state, bridge_mock, start_mock = self._run({}, {"error": "boom"})
+        start_mock.assert_called_once()
+
+    def test_complete_for_target_week_stands_down(self):
+        # Week already built from the MenuBuilder terminal — starting again
+        # would overwrite the completed workflow state (2026-11-15 incident).
+        state, bridge_mock, start_mock = self._run(
+            {}, {"state": "complete", "week_start": "2026-07-20"})
+        start_mock.assert_not_called()
+        self.assertEqual(state.get("last_menu_trigger_date"), _SUNDAY.isoformat())
+
+    def test_complete_reported_as_sunday_stands_down(self):
+        state, bridge_mock, start_mock = self._run(
+            {}, {"state": "complete", "week_start": "2026-07-19"})
+        start_mock.assert_not_called()
+
+    def test_already_planned_refusal_stands_down_without_texting(self):
+        # Plan file exists but bridge state isn't "complete" — MenuBuilder
+        # refuses the start; the admin shouldn't get a "couldn't start" text.
+        state, bridge_mock, start_mock = self._run(
+            {}, {"state": "idle"}, start_reply=server.menu_workflow.ALREADY_PLANNED_REPLY)
+        start_mock.assert_called_once()
+        self.outbox.assert_not_called()
+        self.assertEqual(state.get("last_menu_trigger_date"), _SUNDAY.isoformat())
+
+    def test_complete_for_earlier_week_fires(self):
+        state, bridge_mock, start_mock = self._run(
+            {}, {"state": "complete", "week_start": "2026-07-13"})
         start_mock.assert_called_once()
 
 
