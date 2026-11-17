@@ -246,6 +246,15 @@ class TestStoryChain(_GameDirCase):
         self.assertEqual(self.say(FRIEND, "keanu stop"), [])
         self.assertEqual(group_games.load_game(GROUP)["phase"], "joining")
 
+    def test_family_join_name_overrides_config_name(self):
+        self.say(DAVID, "keanu story")
+        self.assertEqual(self.say(KID, "in WeWishYouADinoChristmas"),
+                         ["WeWishYouADinoChristmas's in! (2 players)"])
+        self.assertEqual(self.say(FRIEND, "in sam"), ["Sam's in! (3 players)"])
+        self.say(DAVID, "keanu go")
+        self.say(DAVID, "Line one.")
+        self.assertIn("WeWishYouADinoChristmas's turn", self.say(DAVID, "keanu")[0])
+
     def test_friend_without_name_gets_numbered(self):
         self.say(DAVID, "keanu story")
         self.assertEqual(self.say(FRIEND, "in"), ["Player 2's in! (2 players)"])

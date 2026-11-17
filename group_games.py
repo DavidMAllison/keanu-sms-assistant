@@ -36,7 +36,7 @@ PLAY_TIMEOUT = 24 * 60 * 60   # games drift across an afternoon; expire after a 
 MAX_LINE_CHARS = 300
 MAX_CLUE_CHARS = 80
 IMPOSTER_CLUE_ROUNDS = 2
-MAX_NAME_CHARS = 20
+MAX_NAME_CHARS = 30
 
 _client = anthropic.Anthropic()
 _MODEL = "claude-haiku-4-5-20251001"
@@ -162,11 +162,15 @@ def parse_join(text: str) -> Optional[str]:
 # ── Story Chain ────────────────────────────────────────────────────────────────
 
 def _player_name(handle: str, given: str, game: dict, config: dict) -> str:
+    """A name given when joining ("in Sam") wins for that game, family included;
+    otherwise the family name from config, else a numbered player."""
+    if given:
+        # Keep the player's own casing ("WeWishYouADinoChristmas"); just
+        # capitalize an all-lowercase name ("sam" -> "Sam")
+        return given[0].upper() + given[1:] if given.islower() else given
     family = config.get("security", {}).get("handle_to_person", {})
     if handle in family:
         return family[handle]
-    if given:
-        return given.title()
     return f"Player {len(game['players']) + 1}"
 
 
