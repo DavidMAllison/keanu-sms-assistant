@@ -1033,9 +1033,10 @@ def get_chat_participants(chat_guid: str) -> list:
         conn.close()
 
 
-GROUP_GAMES_ONLY_REPLY = "In this chat I can only run games. Say \"keanu story\" to start one!"
+GROUP_GAME_LIST = "keanu story, keanu imposter, keanu emoji, keanu hangman or keanu balderdash"
+GROUP_GAMES_ONLY_REPLY = f"In this chat I can only run games. Say {GROUP_GAME_LIST} to start one!"
 # Friends can't start games, so they're pointed at a family member instead
-GROUP_FRIEND_REPLY = "Ask a family member to say \"keanu story\" to start a game!"
+GROUP_FRIEND_REPLY = f"Ask a family member to start a game: {GROUP_GAME_LIST}!"
 
 
 def handle_group_message(msg: dict, config: dict):
@@ -1513,6 +1514,18 @@ def main():
                 if msg.get("is_group"):
                     handle_group_message(msg, config)
                     continue
+
+                # A Balderdash player texting their fake definition. Checked before
+                # the allowed-handle gate because friends play too; the text is only
+                # stored as a definition and never reaches the agent.
+                if not has_image:
+                    captured = group_games.handle_private_game_message(handle, text)
+                    if captured:
+                        chat_guid, private_reply, group_replies = captured
+                        send_imessage(handle, private_reply)
+                        for reply in group_replies:
+                            send_imessage_chat(chat_guid, reply)
+                        continue
 
                 if handle not in config["security"]["allowed_numbers"]:
                     log.warning(f"Rejected from unauthorized handle: {handle}")

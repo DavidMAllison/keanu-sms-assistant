@@ -2,8 +2,9 @@
 Group chat games: chat-scoped SMS Activities, persisted to disk so a restart
 doesn't end a game. One active game per group chat.
 
-Both games share one lobby: a family member starts it, players reply "in",
-and "keanu go" begins.
+A family member starts every game. Story Chain, Imposter and Balderdash share
+one lobby: players reply "in", and "keanu go" begins. Emoji Guess and Hangman
+start right away and anyone in the chat can guess.
 
 Story Chain — players take turns adding a sentence to a story Keanu opens and
 closes. No hidden information, so everything happens in the group thread.
@@ -13,6 +14,17 @@ imposter, who only gets the category. Players give clues in turn, vote on who
 the imposter is, and a caught imposter gets one guess at the word. Private
 texts go only to that game's players, only at the start, and only carry the
 word or the role. The word and the imposter are never logged.
+
+Emoji Guess — Keanu posts a movie or book as emojis; first right answer scores.
+Answers are checked against hand-written titles, no model call.
+
+Hangman — one shared word; text a letter or "guess <word>". The word isn't logged.
+
+Balderdash — Keanu posts a real but strange word and privately asks each
+player for a fake definition. Those come back as 1:1 texts, which server.py
+hands to handle_private_game_message before its allowed-handle check (friends
+play too); a captured text is only stored as a definition. Then everyone votes
+in the group for the real one.
 
 Functions here return the texts to post in the group; server.py sends them.
 Private texts go through the send_private callable server.py passes in.
@@ -25,6 +37,8 @@ import re
 import time
 from pathlib import Path
 from typing import Callable, List, Optional
+
+import difflib
 
 import anthropic
 
@@ -45,7 +59,10 @@ _MODEL = "claude-haiku-4-5-20251001"
 _MENTION = re.compile(r"@?\bkeanu\b", re.IGNORECASE)
 _STORY_START = re.compile(r"\bstory\b", re.IGNORECASE)
 _IMPOSTER_START = re.compile(r"\bimpost[eo]r\b", re.IGNORECASE)
-_COMMAND = re.compile(r"^\s*@?keanu[\s,:]+(go|start|stop|end|quit|cancel|skip|reveal)\W*$", re.IGNORECASE)
+_EMOJI_START = re.compile(r"\bemojis?\b", re.IGNORECASE)
+_HANGMAN_START = re.compile(r"\bhang\s?man\b", re.IGNORECASE)
+_BALDERDASH_START = re.compile(r"\b(balderdash|fake definitions?)\b", re.IGNORECASE)
+_COMMAND = re.compile(r"^\s*@?keanu[\s,:]+(go|start|stop|end|quit|cancel|skip|reveal|hint)\W*$", re.IGNORECASE)
 _TURN_QUESTION = re.compile(r"\b(who|whose|next|turn)\b", re.IGNORECASE)
 _JOIN = re.compile(r"^\s*(?:i'?m\s+)?in\b[\s,:!.-]*(.*?)\s*$", re.IGNORECASE)
 
@@ -123,6 +140,12 @@ def game_start(text: str) -> Optional[str]:
     """Which game a message asks to start, or None."""
     if not _MENTION.search(text):
         return None
+    if _BALDERDASH_START.search(text):
+        return "balderdash"
+    if _HANGMAN_START.search(text):
+        return "hangman"
+    if _EMOJI_START.search(text):
+        return "emoji"
     if _IMPOSTER_START.search(text):
         return "imposter"
     if _STORY_START.search(text):
@@ -137,7 +160,7 @@ def parse_command(text: str) -> Optional[str]:
     word = m.group(1).lower()
     if word in ("go", "start"):
         return "go"
-    if word in ("skip", "reveal"):
+    if word in ("skip", "reveal", "hint"):
         return word
     return "stop"
 
@@ -236,18 +259,26 @@ def _turn_status(game: dict) -> str:
             "Commands: keanu skip, keanu stop.")
 
 
-_TITLES = {"story_chain": "Story Chain", "imposter": "Imposter"}
-_MIN_PLAYERS = {"story_chain": 2, "imposter": 3}
+_TITLES = {"story_chain": "Story Chain", "imposter": "Imposter", "emoji": "Emoji Guess",
+           "hangman": "Hangman", "balderdash": "Balderdash"}
+_MIN_PLAYERS = {"story_chain": 2, "imposter": 3, "balderdash": 3}
 _JOIN_HELP = ("Everyone else, reply \"in\" to join "
               "(friends: \"in\" plus your name, like \"in Sam\").")
 _INTROS = {
     "story_chain": "Story Chain! We'll build a story one sentence at a time.",
     "imposter": ("Imposter! I'll text everyone a secret word, except one sneaky imposter. "
                  "Give clues, then vote out the imposter. Needs 3 or more players."),
+    "balderdash": ("Balderdash! I'll post a strange real word, everyone texts me a fake "
+                   "definition privately, then you vote for the real one. Needs 3 or more players."),
 }
 
 
 def start_game(kind: str, chat_guid: str, handle: str, config: dict) -> List[str]:
+    # Emoji Guess and Hangman have no lobby: anyone in the chat can guess
+    if kind == "emoji":
+        return _emoji_start(chat_guid, handle, config)
+    if kind == "hangman":
+        return _hangman_start(chat_guid, handle, config)
     game = {
         "game": kind,
         "phase": "joining",
@@ -286,6 +317,8 @@ def _handle_lobby(game: dict, handle: str, text: str, command: Optional[str], in
             return [f"Need at least {need} players. {_who_is_in(game)} so far. Reply \"in\" to join."]
         if kind == "imposter":
             return _imposter_go(game, send_private)
+        if kind == "balderdash":
+            return _balderdash_go(game, send_private)
         return _story_go(game)
     if command is None and not in_game:
         given = parse_join(text)
@@ -540,6 +573,584 @@ def handle_imposter(game: dict, handle: str, text: str, is_family: bool, config:
     return [f"Nope! The word was {game['word'].upper()}. Everyone else wins!"]
 
 
+# ── Shared scoring (Emoji Guess, Hangman, Balderdash) ──────────────────────────
+
+def _ensure_player(game: dict, handle: str, config: dict) -> str:
+    """Adds someone who plays without joining (Emoji Guess, Hangman); returns their name."""
+    for p in game["players"]:
+        if p["handle"] == handle:
+            return p["name"]
+    name = _player_name(handle, "", game, config)
+    game["players"].append({"handle": handle, "name": name})
+    return name
+
+
+def _mid_game_join(game: dict, handle: str, text: str, config: dict) -> List[str]:
+    """A friend naming themselves ("in Sam") during a no-lobby game, so points show a name."""
+    given = parse_join(text)
+    if not given or any(p["handle"] == handle for p in game["players"]):
+        return []
+    name = _player_name(handle, given, game, config)
+    game["players"].append({"handle": handle, "name": name})
+    save_game(game)
+    return [f"{name}'s in!"]
+
+
+def _scoreboard(game: dict) -> str:
+    scores = game["scores"]
+    ranked = sorted(game["players"], key=lambda p: -scores.get(p["handle"], 0))
+    return ", ".join(f"{p['name']} {scores.get(p['handle'], 0)}" for p in ranked)
+
+
+def _winner_line(game: dict) -> str:
+    scores = game["scores"]
+    top = max(scores.values(), default=0)
+    if top == 0:
+        return "Nobody scored this time!"
+    winners = [p["name"] for p in game["players"] if scores.get(p["handle"], 0) == top]
+    if len(winners) == 1:
+        return f"{winners[0]} wins!"
+    return f"It's a tie between {' and '.join(winners)}!"
+
+
+# ── Emoji Guess ────────────────────────────────────────────────────────────────
+
+EMOJI_ROUNDS = 5
+
+# (emojis, title, other accepted answers). Hand-written: generated emoji
+# puzzles are often unguessable, and the answer check needs exact titles.
+_EMOJI_PUZZLES = (
+    ("🦁👑", "The Lion King", ()),
+    ("❄️👸⛄", "Frozen", ()),
+    ("🐠🔍", "Finding Nemo", ("Nemo",)),
+    ("🐟🔍💙", "Finding Dory", ("Dory",)),
+    ("🧸🤠🚀", "Toy Story", ()),
+    ("🎈🏠👴", "Up", ()),
+    ("🤖🌱🗑️", "WALL-E", ("Walle",)),
+    ("🐀👨‍🍳🇫🇷", "Ratatouille", ()),
+    ("🏎️⚡", "Cars", ()),
+    ("👹👁️🚪", "Monsters, Inc.", ("Monsters Inc", "Monsters Incorporated")),
+    ("🦸‍♂️👨‍👩‍👧‍👦", "The Incredibles", ()),
+    ("😢😡😱🤢😄🧠", "Inside Out", ()),
+    ("💀🎸🌼", "Coco", ()),
+    ("🌊🛶🐓", "Moana", ()),
+    ("🌹🏰👹", "Beauty and the Beast", ()),
+    ("🧜‍♀️🐚", "The Little Mermaid", ()),
+    ("🐘👂🎪", "Dumbo", ()),
+    ("🧞‍♂️🪔🐒", "Aladdin", ()),
+    ("👸🍎🧙‍♀️", "Snow White", ("Snow White and the Seven Dwarfs",)),
+    ("👠🎃🕛", "Cinderella", ()),
+    ("👸💤🌹", "Sleeping Beauty", ()),
+    ("🕷️👨", "Spider-Man", ("Spiderman",)),
+    ("🦇👨", "Batman", ()),
+    ("🐼🥋", "Kung Fu Panda", ()),
+    ("🐉🧒📖", "How to Train Your Dragon", ("Train Your Dragon",)),
+    ("🟢👹🧅", "Shrek", ()),
+    ("🐧💃🎶", "Happy Feet", ()),
+    ("🦥🐘🧊", "Ice Age", ()),
+    ("🦹‍♂️🌙👧👧👧", "Despicable Me", ()),
+    ("🏝️🤖🪿", "The Wild Robot", ()),
+    ("🐻🍯🎈", "Winnie the Pooh", ("Pooh",)),
+    ("🐻🧥🍊", "Paddington", ()),
+    ("🧙‍♂️⚡👓", "Harry Potter", ()),
+    ("🍫🏭🎫", "Charlie and the Chocolate Factory", ("Willy Wonka", "Wonka")),
+    ("🍑🐛🐞", "James and the Giant Peach", ()),
+    ("🕷️🐷🕸️", "Charlotte's Web", ()),
+    ("🦁🧙‍♀️🚪❄️", "The Lion, the Witch and the Wardrobe", ("Narnia",)),
+    ("🐛🍎🍐🍓", "The Very Hungry Caterpillar", ("Hungry Caterpillar",)),
+    ("🐱🎩", "The Cat in the Hat", ()),
+    ("🟢🥚🍖", "Green Eggs and Ham", ()),
+    ("🎄💚😠", "The Grinch", ("How the Grinch Stole Christmas", "Grinch")),
+    ("👦🌳🍎", "The Giving Tree", ()),
+    ("🌙🐰🛏️", "Goodnight Moon", ()),
+    ("🐺👵🔴", "Little Red Riding Hood", ("Red Riding Hood",)),
+    ("🐷🐷🐷🐺", "The Three Little Pigs", ()),
+    ("👧🐻🐻🐻🥣", "Goldilocks and the Three Bears", ("Goldilocks",)),
+    ("🌪️🏠👠🌈", "The Wizard of Oz", ()),
+    ("⚔️✨🌌", "Star Wars", ()),
+    ("🦖🏝️🚙", "Jurassic Park", ()),
+    ("👻🚫", "Ghostbusters", ()),
+    ("🧒✈️🏠🎄", "Home Alone", ()),
+    ("🍝🐕🐕", "Lady and the Tramp", ()),
+    ("🐻🐯🐒👦🌴", "The Jungle Book", ()),
+    ("🍄👨‍🔧", "The Super Mario Bros. Movie", ("Super Mario", "Mario", "Super Mario Bros")),
+    ("🦊🐰🚓", "Zootopia", ()),
+    ("🏹👧🐻", "Brave", ()),
+    ("🌺⚔️🐉", "Mulan", ()),
+    ("👸💇‍♀️🗼", "Tangled", ("Rapunzel",)),
+    ("🐼🔴👧", "Turning Red", ()),
+    ("🏠🦋🕯️👨‍👩‍👧‍👦", "Encanto", ()),
+    ("🧌🎶🌈", "Trolls", ()),
+    ("🐢🥷🍕", "Teenage Mutant Ninja Turtles", ("Ninja Turtles", "TMNT")),
+    ("🐶🐱🏙️🤫", "The Secret Life of Pets", ()),
+    ("🚂❄️🎅", "The Polar Express", ()),
+    ("🐢🐇🏁", "The Tortoise and the Hare", ()),
+    ("🦆😢🦢", "The Ugly Duckling", ()),
+    ("🐟🌈✨", "The Rainbow Fish", ()),
+    ("🐶👮📖", "Dog Man", ()),
+    ("📓😩👦", "Diary of a Wimpy Kid", ("Wimpy Kid",)),
+    ("⛏️🟩🧱", "A Minecraft Movie", ("Minecraft", "Minecraft Movie")),
+)
+_EMOJI_BY_TITLE = {title: (emojis, title, aliases) for emojis, title, aliases in _EMOJI_PUZZLES}
+
+
+def _normalize_title(text: str) -> str:
+    t = text.lower().replace("&", " and ").replace("-", " ")
+    t = re.sub(r"[^a-z0-9 ]", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return re.sub(r"^((is it|it is|its|i think|i guess|maybe|the|a|an)\s+)+", "", t).strip()
+
+
+def _is_title_guess(text: str, answers) -> bool:
+    guess = _normalize_title(_MENTION.sub("", text))
+    if len(guess) < 2:
+        return False
+    for answer in answers:
+        a = _normalize_title(answer)
+        if guess == a:
+            return True
+        # Small typos ("ratatoullie"), but not for short titles like "Up"
+        if len(a) >= 5 and difflib.SequenceMatcher(None, guess, a).ratio() >= 0.85:
+            return True
+        # The whole title inside a short message ("omg its frozen!!")
+        if (len(a) >= 4 and re.search(r"\b" + re.escape(a) + r"\b", guess)
+                and len(guess.split()) <= len(a.split()) + 3):
+            return True
+    return False
+
+
+def _used_puzzles_path(chat_guid: str) -> Path:
+    path = _state_path(chat_guid)
+    return path.with_name(path.stem + "_emoji_used.txt")
+
+
+def _pick_puzzles(chat_guid: str) -> List[str]:
+    """Titles this chat hasn't seen yet; starts over once they run low."""
+    path = _used_puzzles_path(chat_guid)
+    try:
+        used = set(path.read_text().splitlines())
+    except FileNotFoundError:
+        used = set()
+    fresh = [title for title in _EMOJI_BY_TITLE if title not in used]
+    if len(fresh) < EMOJI_ROUNDS:
+        used, fresh = set(), list(_EMOJI_BY_TITLE)
+    picks = random.sample(fresh, EMOJI_ROUNDS)
+    GAME_STATE_DIR.mkdir(exist_ok=True)
+    path.write_text("\n".join(sorted(used | set(picks))))
+    return picks
+
+
+def _emoji_puzzle(game: dict) -> tuple:
+    return _EMOJI_BY_TITLE[game["puzzles"][game["round"]]]
+
+
+def _emoji_prompt(game: dict) -> str:
+    return f"Round {game['round'] + 1}/{len(game['puzzles'])}: {_emoji_puzzle(game)[0]}"
+
+
+def _emoji_start(chat_guid: str, handle: str, config: dict) -> List[str]:
+    game = {
+        "game": "emoji", "phase": "playing", "chat_guid": chat_guid, "starter": handle,
+        "players": [], "scores": {}, "puzzles": _pick_puzzles(chat_guid), "round": 0,
+        "hints": 0, "created": time.time(),
+    }
+    game["players"].append({"handle": handle, "name": _player_name(handle, "", game, config)})
+    save_game(game)
+    log.info(f"Emoji Guess started in chat {chat_tag(chat_guid)}")
+    return [f"Emoji Guess! Name the movie or book. First right answer gets the point. "
+            f"{EMOJI_ROUNDS} rounds. Commands: keanu hint, keanu skip, keanu stop.\n\n{_emoji_prompt(game)}"]
+
+
+def _emoji_next(game: dict, lead: str) -> List[str]:
+    game["round"] += 1
+    game["hints"] = 0
+    if game["round"] >= len(game["puzzles"]):
+        clear_game(game["chat_guid"])
+        log.info(f"Emoji Guess finished in chat {chat_tag(game['chat_guid'])}")
+        return [f"{lead}\n\nThat's the game! Scores: {_scoreboard(game)}. {_winner_line(game)}"]
+    save_game(game)
+    return [f"{lead}\n\n{_emoji_prompt(game)}"]
+
+
+def _emoji_hint(game: dict) -> str:
+    title = _emoji_puzzle(game)[1]
+    words = title.split()
+    game["hints"] += 1
+    save_game(game)
+    if game["hints"] == 1:
+        plural = "s" if len(words) != 1 else ""
+        return f"Hint: {len(words)} word{plural}, starting with {title[0].upper()}."
+    if game["hints"] == 2:
+        return "Hint: " + " ".join(w[0] + re.sub(r"[A-Za-z0-9]", "_", w[1:]) for w in words)
+    return "No more hints! Say \"keanu skip\" to see the answer."
+
+
+def handle_emoji(game: dict, handle: str, text: str, is_family: bool, config: dict) -> List[str]:
+    command = parse_command(text)
+    can_control = is_family or handle == game["starter"]
+    _, title, aliases = _emoji_puzzle(game)
+
+    if command == "stop" and can_control:
+        clear_game(game["chat_guid"])
+        log.info(f"Emoji Guess stopped in chat {chat_tag(game['chat_guid'])}")
+        return [f"Game stopped. The answer was {title}. Scores: {_scoreboard(game)}."]
+    if command == "skip" and can_control:
+        return _emoji_next(game, f"Skipped! It was {title}.")
+    if command == "hint":
+        return [_emoji_hint(game)]
+    if command is not None:
+        return []
+    if _is_title_guess(text, (title,) + tuple(aliases)):
+        name = _ensure_player(game, handle, config)
+        game["scores"][handle] = game["scores"].get(handle, 0) + 1
+        return _emoji_next(game, f"Yes! {name} got it: {title}.")
+    joined = _mid_game_join(game, handle, text, config)
+    if joined:
+        return joined
+    # Wrong guesses stay quiet so the chat isn't flooded
+    if mentions_keanu(text):
+        return [f"{_emoji_prompt(game)}\nName the movie or book! (keanu hint, keanu skip)"]
+    return []
+
+
+# ── Hangman ────────────────────────────────────────────────────────────────────
+
+HANGMAN_LIVES = 6
+
+# Kid level: friends may be playing too
+_HANGMAN_WORDS = (
+    "giraffe", "penguin", "octopus", "kangaroo", "hamster", "dolphin", "elephant", "cheetah",
+    "pancake", "popcorn", "spaghetti", "burrito", "sandwich", "pumpkin", "blueberry", "pineapple",
+    "volcano", "rainbow", "thunder", "blizzard", "tornado", "library", "airport", "playground",
+    "backpack", "notebook", "scissors", "crayon", "umbrella", "blanket", "pillow", "bathtub",
+    "toaster", "rocket", "planet", "astronaut", "galaxy", "dinosaur", "dragon", "unicorn",
+    "wizard", "castle", "pirate", "treasure", "skeleton", "mermaid", "jellyfish", "starfish",
+    "seahorse", "lobster", "hedgehog", "squirrel", "raccoon", "flamingo", "peacock", "kitten",
+    "basketball", "trampoline", "skateboard", "bicycle", "scooter", "snowman", "sunflower",
+    "cactus", "mushroom", "campfire", "lantern", "compass", "telescope", "keyboard", "guitar",
+    "trumpet", "violin", "cupcake", "cookie", "muffin", "waffle", "pretzel", "avocado",
+    "broccoli", "carrot", "zipper", "pajamas", "sneakers", "mittens", "igloo", "island",
+    "jungle", "desert", "canyon", "waterfall", "lighthouse", "submarine", "helicopter",
+    "tractor", "firework", "birthday", "vacation", "monster", "robot", "butterfly", "ladybug",
+)
+
+_LETTER = re.compile(r"^\s*(?:letter\s+)?([a-z])\s*[!.?]*\s*$", re.IGNORECASE)
+_WORD_GUESS = re.compile(r"^\s*(?:guess|is it)[\s:]+([a-z]+)\W*$", re.IGNORECASE)
+
+
+def _hangman_wrong_letters(game: dict) -> List[str]:
+    return [c for c in game["guessed"] if c not in game["word"]]
+
+
+def _hangman_lives(game: dict) -> int:
+    return HANGMAN_LIVES - len(_hangman_wrong_letters(game)) - len(game["wrong_words"])
+
+
+def _hangman_board(game: dict) -> str:
+    lines = [" ".join(c.upper() if c in game["guessed"] else "_" for c in game["word"]),
+             f"Lives: {_hangman_lives(game)}/{HANGMAN_LIVES}"]
+    misses = [c.upper() for c in _hangman_wrong_letters(game)] + [w.upper() for w in game["wrong_words"]]
+    if misses:
+        lines.append("Wrong: " + ", ".join(misses))
+    return "\n".join(lines)
+
+
+def _hangman_start(chat_guid: str, handle: str, config: dict) -> List[str]:
+    game = {
+        "game": "hangman", "phase": "playing", "chat_guid": chat_guid, "starter": handle,
+        "players": [], "word": random.choice(_HANGMAN_WORDS), "guessed": [], "wrong_words": [],
+        "created": time.time(),
+    }
+    game["players"].append({"handle": handle, "name": _player_name(handle, "", game, config)})
+    save_game(game)
+    log.info(f"Hangman started in chat {chat_tag(chat_guid)}")
+    return [f"Hangman! Text just a letter to guess it, or \"guess <word>\" if you know it. "
+            f"{HANGMAN_LIVES} misses and I win. \"keanu stop\" ends it.\n\n{_hangman_board(game)}"]
+
+
+def _hangman_end(game: dict, handle: Optional[str], config: dict) -> List[str]:
+    clear_game(game["chat_guid"])
+    word = game["word"].upper()
+    if handle is None:
+        log.info(f"Hangman finished in chat {chat_tag(game['chat_guid'])} (out of lives)")
+        return [f"Out of lives! The word was {word}. I win this one!"]
+    log.info(f"Hangman finished in chat {chat_tag(game['chat_guid'])} (solved)")
+    name = _ensure_player(game, handle, config)
+    lives = _hangman_lives(game)
+    return [f"{name} got it! The word was {word}, with {lives} {'life' if lives == 1 else 'lives'} to spare."]
+
+
+def handle_hangman(game: dict, handle: str, text: str, is_family: bool, config: dict) -> List[str]:
+    command = parse_command(text)
+    can_control = is_family or handle == game["starter"]
+    word = game["word"]
+
+    if command == "stop" and can_control:
+        clear_game(game["chat_guid"])
+        log.info(f"Hangman stopped in chat {chat_tag(game['chat_guid'])}")
+        return [f"Game stopped. The word was {word.upper()}."]
+    if command is not None:
+        return []
+
+    body = _MENTION.sub("", text).strip(" \t\n,:")
+    m = _LETTER.match(body)
+    if m:
+        letter = m.group(1).lower()
+        if letter in game["guessed"]:
+            return [f"{letter.upper()} was already guessed!\n\n{_hangman_board(game)}"]
+        game["guessed"].append(letter)
+        if all(c in game["guessed"] for c in word):
+            return _hangman_end(game, handle, config)
+        if _hangman_lives(game) <= 0:
+            return _hangman_end(game, None, config)
+        save_game(game)
+        verdict = f"Yes, there's {letter.upper()}!" if letter in word else f"No {letter.upper()}!"
+        return [f"{verdict}\n\n{_hangman_board(game)}"]
+
+    m = _WORD_GUESS.match(body)
+    guess = m.group(1).lower() if m else None
+    if guess is None and body.lower().strip(" !?.") == word:
+        guess = word  # just texting the word counts; any other chatter doesn't
+    if guess:
+        if guess == word:
+            return _hangman_end(game, handle, config)
+        if guess in game["wrong_words"]:
+            return [f"{guess.upper()} was already guessed!\n\n{_hangman_board(game)}"]
+        game["wrong_words"].append(guess)
+        if _hangman_lives(game) <= 0:
+            return _hangman_end(game, None, config)
+        save_game(game)
+        return [f"Not {guess.upper()}!\n\n{_hangman_board(game)}"]
+
+    joined = _mid_game_join(game, handle, text, config)
+    if joined:
+        return joined
+    if mentions_keanu(text):
+        return [f"{_hangman_board(game)}\n\nText a letter, or \"guess <word>\"."]
+    return []
+
+
+# ── Balderdash ─────────────────────────────────────────────────────────────────
+
+BALDERDASH_ROUNDS = 3
+MAX_DEFINITION_CHARS = 150
+
+# Hand-picked real words: a wrong "real" definition would break the game
+_BALDERDASH_WORDS = (
+    ("snollygoster", "A clever but dishonest person"),
+    ("collywobbles", "A nervous, fluttery feeling in your stomach"),
+    ("gardyloo", "A warning shout before throwing dirty water out of a window"),
+    ("widdershins", "In the opposite direction to the sun; counterclockwise"),
+    ("bumbershoot", "An umbrella"),
+    ("borborygmus", "A rumbling, gurgling noise in your stomach"),
+    ("gongoozler", "Someone who enjoys watching boats on canals"),
+    ("flibbertigibbet", "A silly, flighty person who talks too much"),
+    ("snickersnee", "A large knife used for fighting"),
+    ("defenestration", "Throwing someone or something out of a window"),
+    ("hornswoggle", "To trick or cheat someone"),
+    ("absquatulate", "To leave suddenly; to run off"),
+    ("taradiddle", "A small lie or fib"),
+    ("erinaceous", "Like a hedgehog"),
+    ("pandiculation", "Stretching and yawning, like when you wake up"),
+    ("ultracrepidarian", "Someone who gives opinions on things they know nothing about"),
+    ("zarf", "A holder for a coffee cup that has no handle"),
+    ("aglet", "The plastic or metal tip on the end of a shoelace"),
+    ("ferrule", "The metal ring that holds the eraser on a pencil"),
+    ("lunula", "The white half-moon shape at the bottom of a fingernail"),
+    ("philtrum", "The little groove between your nose and your upper lip"),
+    ("glabella", "The smooth space between your eyebrows"),
+    ("tittle", "The dot over a lowercase i or j"),
+    ("muntin", "A strip that separates the panes of glass in a window"),
+    ("grawlix", "Symbols like @#$%! that stand for swear words in comics"),
+    ("crepuscular", "Active at twilight, around dawn and dusk"),
+    ("petrichor", "The earthy smell when rain falls on dry ground"),
+    ("susurrus", "A soft whispering or rustling sound"),
+    ("brannigan", "A noisy fight or brawl"),
+    ("mumpsimus", "Someone who keeps doing something the wrong way even after being corrected"),
+    ("bloviate", "To talk on and on in a pompous, empty way"),
+    ("nudiustertian", "Having to do with the day before yesterday"),
+    ("groak", "To stare at people eating, hoping they'll share"),
+    ("jentacular", "Having to do with breakfast"),
+    ("yex", "To hiccup"),
+    ("lethologica", "Not being able to remember the word you want to say"),
+    ("apricity", "The warmth of the sun on a winter day"),
+    ("mondegreen", "A misheard song lyric or phrase"),
+    ("snood", "The fleshy flap that hangs over a turkey's beak"),
+    ("flews", "The droopy upper lips of a dog like a bloodhound"),
+    ("dewlap", "Loose skin hanging under the throat of an animal, like a cow"),
+    ("ort", "A scrap of food left over after a meal"),
+    ("bindle", "A bundle of belongings tied in cloth and carried on a stick"),
+    ("oxter", "An armpit"),
+    ("ninnyhammer", "A foolish person"),
+    ("bumfuzzle", "To confuse someone"),
+    ("winklepicker", "A shoe with a long, sharply pointed toe"),
+    ("crwth", "An old Welsh stringed instrument played with a bow"),
+    ("sesquipedalian", "Using lots of very long words"),
+    ("quidnunc", "A nosy person who always wants the latest gossip"),
+)
+
+
+def _tidy_definition(text: str) -> str:
+    """Same shape as the real ones, so punctuation doesn't give a fake away."""
+    t = " ".join(text.split())[:MAX_DEFINITION_CHARS].rstrip(" .")
+    return t[:1].upper() + t[1:]
+
+
+def _balderdash_deal(game: dict, send_private: Optional[Callable]) -> List[str]:
+    """Picks the round's word and asks every player privately for a fake definition."""
+    fresh = [w for w in _BALDERDASH_WORDS if w[0] not in game["used"]] or list(_BALDERDASH_WORDS)
+    word, definition = random.choice(fresh)
+    game["used"].append(word)
+    game.update({"stage": "writing", "word": word, "definition": definition,
+                 "fakes": {}, "options": [], "votes": {}})
+    n = game["round"] + 1
+    failed = []
+    for p in game["players"]:
+        msg = (f"Balderdash round {n}: what does {word.upper()} mean? Make up a definition that "
+               "sounds real and text it to me right here, not in the group.")
+        if send_private is None or not send_private(p["handle"], msg):
+            failed.append(p["name"])
+    if failed:
+        clear_game(game["chat_guid"])
+        log.warning(f"Balderdash stopped in chat {chat_tag(game['chat_guid'])}: "
+                    f"private text failed for {len(failed)} player(s)")
+        scores = f" Scores: {_scoreboard(game)}." if game["round"] else ""
+        return [f"I couldn't text {' and '.join(failed)} privately, so Balderdash is stopped.{scores}"]
+    save_game(game)
+    log.info(f"Balderdash round {n} dealt in chat {chat_tag(game['chat_guid'])}")
+    return [f"Round {n}/{BALDERDASH_ROUNDS}: what does {word.upper()} mean? Check your texts from "
+            "Keanu and reply there with a fake definition. (\"keanu reveal\" moves on without "
+            "anyone who's stuck.)"]
+
+
+def _balderdash_go(game: dict, send_private: Optional[Callable]) -> List[str]:
+    game.update({"phase": "playing", "round": 0, "scores": {}, "used": []})
+    return _balderdash_deal(game, send_private)
+
+
+def _balderdash_vote_prompt(game: dict) -> List[str]:
+    options = [{"text": text, "author": h} for h, text in game["fakes"].items()]
+    options.append({"text": game["definition"], "author": None})
+    random.shuffle(options)
+    game.update({"stage": "voting", "options": options})
+    save_game(game)
+    listing = "\n".join(f"{i}. {o['text']}" for i, o in enumerate(options, 1))
+    return [f"Definitions are in! What does {game['word'].upper()} mean?\n\n{listing}\n\n"
+            "Vote by replying with a number (not your own!)."]
+
+
+def _balderdash_status(game: dict) -> str:
+    if game["stage"] == "writing":
+        waiting = [p["name"] for p in game["players"] if p["handle"] not in game["fakes"]]
+        return f"Waiting on fake definitions from {', '.join(waiting)}. Text them to me privately!"
+    waiting = [p["name"] for p in game["players"] if p["handle"] not in game["votes"]]
+    return f"Waiting on votes from {', '.join(waiting)}. Reply with a number."
+
+
+def _balderdash_score(game: dict, send_private: Optional[Callable]) -> List[str]:
+    options = game["options"]
+    scores = game["scores"]
+    real = next(i for i, o in enumerate(options) if o["author"] is None)
+    right = []
+    fooled: dict = {}
+    for voter, idx in game["votes"].items():
+        author = options[idx]["author"]
+        if author is None:
+            scores[voter] = scores.get(voter, 0) + 2
+            right.append(_name_of(game, voter))
+        else:
+            scores[author] = scores.get(author, 0) + 1
+            fooled.setdefault(author, []).append(_name_of(game, voter))
+    lines = [f"{game['word'].upper()} really means: {game['definition']} (number {real + 1})."]
+    if right:
+        lines.append(f"Found it (+2): {', '.join(right)}.")
+    for author, voters in fooled.items():
+        lines.append(f"{_name_of(game, author)}'s fake fooled {', '.join(voters)} (+{len(voters)}).")
+    result = "\n".join(lines) + f"\n\nScores: {_scoreboard(game)}"
+    game["round"] += 1
+    if game["round"] >= BALDERDASH_ROUNDS:
+        clear_game(game["chat_guid"])
+        log.info(f"Balderdash finished in chat {chat_tag(game['chat_guid'])}")
+        return [f"{result}\n\nThat's the game! {_winner_line(game)}"]
+    return [result] + _balderdash_deal(game, send_private)
+
+
+def handle_balderdash(game: dict, handle: str, text: str, is_family: bool, config: dict,
+                      send_private: Optional[Callable]) -> List[str]:
+    command = parse_command(text)
+    in_game = any(p["handle"] == handle for p in game["players"])
+    can_control = is_family or handle == game["starter"]
+
+    if game["phase"] == "joining":
+        return _handle_lobby(game, handle, text, command, in_game, can_control, config, send_private)
+
+    if command == "stop" and (can_control or in_game):
+        clear_game(game["chat_guid"])
+        log.info(f"Balderdash stopped in chat {chat_tag(game['chat_guid'])}")
+        return [f"Game stopped. {game['word'].upper()} means: {game['definition']}. "
+                f"Scores: {_scoreboard(game)}."]
+
+    if game["stage"] == "writing":
+        if command == "reveal" and can_control:
+            if not game["fakes"]:
+                return ["No fake definitions yet! Text them to me privately."]
+            return _balderdash_vote_prompt(game)
+        return [_balderdash_status(game)] if command is None and mentions_keanu(text) else []
+
+    # voting
+    if command == "reveal" and can_control:
+        if not game["votes"]:
+            return ["No votes yet! Reply with a number."]
+        return _balderdash_score(game, send_private)
+    if command is not None or not in_game or handle in game["votes"]:
+        return [_balderdash_status(game)] if command is None and mentions_keanu(text) else []
+    m = re.match(r"^\s*#?(\d{1,2})\W*$", text)
+    if not m:
+        return [_balderdash_status(game)] if mentions_keanu(text) else []
+    choice = int(m.group(1)) - 1
+    if not 0 <= choice < len(game["options"]):
+        return [f"Pick a number from 1 to {len(game['options'])}."]
+    if game["options"][choice]["author"] == handle:
+        return ["That's your own! Pick another."]
+    game["votes"][handle] = choice
+    if len(game["votes"]) == len(game["players"]):
+        return _balderdash_score(game, send_private)
+    save_game(game)
+    return [f"Got it, {_name_of(game, handle)}! ({len(game['votes'])}/{len(game['players'])} voted)"]
+
+
+def handle_private_game_message(handle: str, text: str) -> Optional[tuple]:
+    """
+    A 1:1 text from a Balderdash player who still owes a definition. Returns
+    (chat_guid, private_reply, group_replies) when captured, else None so
+    normal routing (or the unauthorized-handle rejection) carries on. The text
+    is only ever stored as a definition; it never reaches the agent.
+    """
+    if not text.strip():
+        return None
+    waiting = []
+    for path in GAME_STATE_DIR.glob("*.json"):
+        try:
+            game = json.loads(path.read_text())
+        except Exception:
+            continue
+        if (isinstance(game, dict) and game.get("game") == "balderdash"
+                and game.get("stage") == "writing" and not is_expired(game)
+                and handle not in game["fakes"]
+                and any(p["handle"] == handle for p in game["players"])):
+            waiting.append(game)
+    if not waiting:
+        return None
+    game = max(waiting, key=lambda g: g.get("updated", 0))
+    game["fakes"][handle] = _tidy_definition(text)
+    log.info(f"Balderdash definition received in chat {chat_tag(game['chat_guid'])} "
+             f"({len(game['fakes'])}/{len(game['players'])})")
+    if len(game["fakes"]) == len(game["players"]):
+        return game["chat_guid"], "Got it! Voting's starting in the group.", _balderdash_vote_prompt(game)
+    save_game(game)
+    return game["chat_guid"], "Got it! Head back to the group chat.", []
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def handle_group_game_message(chat_guid: str, handle: str, text: str, is_family: bool,
@@ -562,12 +1173,24 @@ def handle_group_game_message(chat_guid: str, handle: str, text: str, is_family:
                       "Say \"keanu story\" to start a new one."]
         elif game.get("phase") == "playing" and game["game"] == "imposter":
             notice = [f"Our Imposter game timed out. {_imposter_reveal(game)}"]
+        elif game["game"] == "emoji":
+            notice = [f"Our Emoji Guess game timed out. Scores: {_scoreboard(game)}."]
+        elif game["game"] == "hangman":
+            notice = [f"Our Hangman game timed out. The word was {game['word'].upper()}."]
+        elif game.get("phase") == "playing" and game["game"] == "balderdash":
+            notice = [f"Our Balderdash game timed out. Scores: {_scoreboard(game)}."]
         game = None
     if game:
         if game["game"] == "story_chain":
             return handle_story_chain(game, handle, text, is_family, config)
         if game["game"] == "imposter":
             return handle_imposter(game, handle, text, is_family, config, send_private)
+        if game["game"] == "emoji":
+            return handle_emoji(game, handle, text, is_family, config)
+        if game["game"] == "hangman":
+            return handle_hangman(game, handle, text, is_family, config)
+        if game["game"] == "balderdash":
+            return handle_balderdash(game, handle, text, is_family, config, send_private)
         log.error(f"Unknown game {game.get('game')!r} in chat {chat_tag(chat_guid)}, clearing")
         clear_game(chat_guid)
         return None

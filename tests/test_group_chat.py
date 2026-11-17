@@ -490,5 +490,256 @@ class TestImposter(_GameDirCase):
         self.assertEqual(group_games._normalize_word("is it a pizza"), "pizza")
 
 
+class TestEmojiGuess(_GameDirCase):
+    PUZZLES = ["Frozen", "Up", "The Lion King", "Coco", "Shrek"]
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(group_games, "_pick_puzzles", return_value=list(self.PUZZLES))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_starts_without_lobby(self):
+        out = self.say(DAVID, "keanu emoji")
+        self.assertIn("Emoji Guess!", out[0])
+        self.assertTrue(out[0].endswith("Round 1/5: ❄️👸⛄"))
+
+    def test_full_game_scores_and_winner(self):
+        self.say(DAVID, "keanu emoji")
+        self.assertIn("Yes! Kiddo got it: Frozen.", self.say(KID, "frozen!")[0])
+        self.say(FRIEND, "up")
+        self.say(KID, "the lion king")
+        self.say(DAVID, "coco")
+        out = self.say(KID, "is it shrek")
+        self.assertIn("Scores: Kiddo 3, Dad 1, Player 3 1. Kiddo wins!", out[0])
+        self.assertIsNone(group_games.load_game(GROUP))
+
+    def test_wrong_guess_and_chatter_stay_quiet(self):
+        self.say(DAVID, "keanu emoji")
+        self.assertEqual(self.say(KID, "moana?"), [])
+        self.assertEqual(self.say(KID, "lol"), [])
+        self.assertIn("Round 1/5", self.say(KID, "keanu?")[0])
+
+    def test_hints_then_skip(self):
+        self.say(DAVID, "keanu emoji")
+        self.say(KID, "keanu skip")  # friend-or-family control: Kiddo is family
+        self.assertEqual(self.say(FRIEND, "keanu hint"), ["Hint: 1 word, starting with U."])
+        self.assertEqual(self.say(FRIEND, "keanu hint"), ["Hint: U_"])
+        self.assertIn("No more hints", self.say(FRIEND, "keanu hint")[0])
+        self.assertEqual(self.say(FRIEND, "keanu skip"), [])
+        out = self.say(DAVID, "keanu skip")
+        self.assertIn("Skipped! It was Up.", out[0])
+        self.assertIn("Round 3/5", out[0])
+
+    def test_friend_names_themselves_mid_game(self):
+        self.say(DAVID, "keanu emoji")
+        self.assertEqual(self.say(FRIEND, "in Sam"), ["Sam's in!"])
+        self.assertIn("Sam got it", self.say(FRIEND, "frozen")[0])
+
+    def test_stop_shows_answer(self):
+        self.say(DAVID, "keanu emoji")
+        self.assertIn("The answer was Frozen.", self.say(DAVID, "keanu stop")[0])
+        self.assertIsNone(group_games.load_game(GROUP))
+
+    def test_title_matching(self):
+        match = group_games._is_title_guess
+        self.assertTrue(match("omg its frozen!!", ("Frozen",)))
+        self.assertTrue(match("lion king", ("The Lion King",)))
+        self.assertTrue(match("ratatoullie", ("Ratatouille",)))
+        self.assertTrue(match("Monsters Inc", ("Monsters, Inc.",)))
+        self.assertTrue(match("up", ("Up",)))
+        self.assertFalse(match("what's up", ("Up",)))
+        self.assertFalse(match("lion", ("The Lion King",)))
+
+    def test_every_puzzle_title_matches_itself(self):
+        for emojis, title, aliases in group_games._EMOJI_PUZZLES:
+            for answer in (title,) + aliases:
+                self.assertTrue(group_games._is_title_guess(answer, (title,) + aliases), answer)
+
+
+class TestEmojiPuzzlePicks(_GameDirCase):
+    def test_no_repeats_until_list_runs_low(self):
+        seen = []
+        rounds = len(group_games._EMOJI_PUZZLES) // group_games.EMOJI_ROUNDS
+        for _ in range(rounds):
+            seen += group_games._pick_puzzles(GROUP)
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(len(group_games._pick_puzzles(GROUP)), group_games.EMOJI_ROUNDS)
+
+
+class TestHangman(_GameDirCase):
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(group_games, "_HANGMAN_WORDS", ("puppy",))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_start_shows_board(self):
+        out = self.say(DAVID, "keanu hangman")
+        self.assertIn("_ _ _ _ _\nLives: 6/6", out[0])
+
+    def test_letters_then_win(self):
+        self.say(DAVID, "keanu hangman")
+        self.assertIn("Yes, there's P!\n\nP _ P P _", self.say(KID, "p")[0])
+        out = self.say(KID, "z")
+        self.assertIn("No Z!", out[0])
+        self.assertIn("Lives: 5/6\nWrong: Z", out[0])
+        self.assertIn("already guessed", self.say(DAVID, "P")[0])
+        self.say(FRIEND, "u")
+        out = self.say(FRIEND, "y")
+        self.assertEqual(out, ["Player 2 got it! The word was PUPPY, with 5 lives to spare."])
+        self.assertIsNone(group_games.load_game(GROUP))
+
+    def test_word_guesses(self):
+        self.say(DAVID, "keanu hangman")
+        self.assertIn("Not KITTY!", self.say(KID, "guess kitty")[0])
+        self.assertIn("already guessed", self.say(KID, "guess kitty")[0])
+        self.assertIn("got it", self.say(KID, "puppy")[0])
+
+    def test_chatter_ignored_and_mention_shows_board(self):
+        self.say(DAVID, "keanu hangman")
+        self.assertEqual(self.say(KID, "this is hard"), [])
+        self.assertIn("Lives: 6/6", self.say(KID, "keanu")[0])
+
+    def test_out_of_lives(self):
+        self.say(DAVID, "keanu hangman")
+        for letter in "abcde":
+            self.say(KID, letter)
+        self.assertEqual(self.say(KID, "f"), ["Out of lives! The word was PUPPY. I win this one!"])
+
+    def test_word_never_logged(self):
+        with self.assertLogs(group_games.log, level="INFO") as logs:
+            self.say(DAVID, "keanu hangman")
+            self.say(DAVID, "keanu stop")
+        self.assertFalse(any("puppy" in line.lower() for line in logs.output))
+
+    def test_expiry_notice_reveals(self):
+        self.say(DAVID, "keanu hangman")
+        with mock.patch.object(group_games.time, "time", return_value=time.time() + 2 * 86400):
+            out = self.say(KID, "a")
+        self.assertEqual(out, ["Our Hangman game timed out. The word was PUPPY."])
+
+
+class TestBalderdash(_GameDirCase):
+    """Dad, Kiddo and Sam; one word, ZARF; no shuffle, so fakes come first in
+    submission order and the real definition last."""
+
+    def setUp(self):
+        super().setUp()
+        self.private = []
+        self.fail_for = set()
+        for target, value in (("_BALDERDASH_WORDS", (("zarf", "A cup holder"),)),):
+            p = mock.patch.object(group_games, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(group_games.random, "shuffle", side_effect=lambda seq: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def send_private(self, handle, text):
+        self.private.append((handle, text))
+        return handle not in self.fail_for
+
+    def say(self, handle, text):
+        return group_games.handle_group_game_message(
+            GROUP, handle, text, is_family=handle in CONFIG["security"]["allowed_numbers"],
+            config=CONFIG, send_private=self.send_private)
+
+    def dm(self, handle, text):
+        return group_games.handle_private_game_message(handle, text)
+
+    def _deal(self):
+        self.say(DAVID, "keanu balderdash")
+        self.say(KID, "in")
+        self.say(FRIEND, "in Sam")
+        return self.say(DAVID, "keanu go")
+
+    def _write(self):
+        self._deal()
+        self.dm(DAVID, "a kind of hat")
+        self.dm(KID, "a tiny dragon.")
+        return self.dm(FRIEND, "a dance move")
+
+    def test_needs_three_players(self):
+        self.say(DAVID, "fake definitions keanu")
+        self.say(KID, "in")
+        self.assertIn("Need at least 3 players", self.say(DAVID, "keanu go")[0])
+
+    def test_deal_texts_every_player_privately(self):
+        out = self._deal()
+        self.assertIn("Round 1/3: what does ZARF mean?", out[0])
+        self.assertEqual({h for h, _ in self.private}, {DAVID, KID, FRIEND})
+        self.assertTrue(all("ZARF" in t and "not in the group" in t for _, t in self.private))
+
+    def test_failed_private_text_stops(self):
+        self.fail_for = {FRIEND}
+        self.assertIn("couldn't text Sam privately", self._deal()[0])
+        self.assertIsNone(group_games.load_game(GROUP))
+
+    def test_private_capture_only_for_players_who_owe_one(self):
+        self._deal()
+        self.assertIsNone(self.dm(STRANGER, "hello"))
+        self.assertEqual(self.dm(FRIEND, "a dance move"), (GROUP, "Got it! Head back to the group chat.", []))
+        self.assertIsNone(self.dm(FRIEND, "another one"))
+        self.assertIsNone(self.dm(KID, "   "))
+
+    def test_no_capture_outside_writing_or_without_game(self):
+        self.assertIsNone(self.dm(KID, "what's for dinner"))
+        self._write()
+        self.assertIsNone(self.dm(KID, "what's for dinner"))
+
+    def test_last_definition_posts_vote(self):
+        chat, reply, group = self._write()
+        self.assertEqual(chat, GROUP)
+        self.assertIn("Voting's starting", reply)
+        self.assertIn("1. A kind of hat\n2. A tiny dragon\n3. A dance move\n4. A cup holder", group[0])
+
+    def test_status_while_writing_and_reveal(self):
+        self._deal()
+        self.dm(KID, "a tiny dragon")
+        self.assertIn("Waiting on fake definitions from Dad, Sam", self.say(KID, "keanu?")[0])
+        self.assertEqual(self.say(FRIEND, "keanu reveal"), [])
+        out = self.say(DAVID, "keanu reveal")
+        self.assertIn("1. A tiny dragon\n2. A cup holder", out[0])
+
+    def test_votes_score_and_next_round(self):
+        self._write()
+        self.assertEqual(self.say(DAVID, "1"), ["That's your own! Pick another."])
+        self.assertEqual(self.say(DAVID, "9"), ["Pick a number from 1 to 4."])
+        self.say(DAVID, "4")
+        self.say(KID, "1")
+        out = self.say(FRIEND, "#4")
+        self.assertIn("ZARF really means: A cup holder (number 4).", out[0])
+        self.assertIn("Found it (+2): Dad, Sam.", out[0])
+        self.assertIn("Dad's fake fooled Kiddo (+1).", out[0])
+        self.assertIn("Scores: Dad 3, Sam 2, Kiddo 0", out[0])
+        self.assertIn("Round 2/3", out[1])
+
+    def test_three_rounds_then_winner(self):
+        for _ in range(3):
+            if group_games.load_game(GROUP) is None:
+                self._deal()
+            for h in (DAVID, KID, FRIEND):
+                self.dm(h, "a guess")
+            self.say(DAVID, "4")
+            self.say(KID, "4")
+            out = self.say(FRIEND, "4")
+        self.assertIn("That's the game! It's a tie between Dad and Kiddo and Sam!", out[0])
+        self.assertIsNone(group_games.load_game(GROUP))
+
+    def test_non_player_and_chatter_cannot_vote(self):
+        self._write()
+        self.assertEqual(self.say(STRANGER, "4"), [])
+        self.assertEqual(self.say(KID, "hmm tough one"), [])
+        self.say(KID, "4")
+        self.assertEqual(self.say(KID, "1"), [])
+
+    def test_game_start_parsing(self):
+        self.assertEqual(group_games.game_start("keanu balderdash"), "balderdash")
+        self.assertEqual(group_games.game_start("@Keanu fake definitions"), "balderdash")
+        self.assertEqual(group_games.game_start("keanu hang man"), "hangman")
+        self.assertEqual(group_games.game_start("keanu emojis!"), "emoji")
+
+
 if __name__ == "__main__":
     unittest.main()
