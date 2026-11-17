@@ -1068,7 +1068,8 @@ def handle_group_message(msg: dict, config: dict):
         return
 
     replies = group_games.handle_group_game_message(
-        chat_guid, handle, text, is_family=handle in allowed, config=config)
+        chat_guid, handle, text, is_family=handle in allowed, config=config,
+        send_private=send_imessage)
     if replies is not None:
         for reply in replies:
             send_imessage_chat(chat_guid, reply)

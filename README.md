@@ -10,7 +10,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Schedule** — upcoming soccer games, practices, events pulled from a calendar
 - **Recipes** — searches local collection first (all statuses, scored by keyword match); falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally; returns GitHub Pages URL for collection hits; appends any standing family notes/feedback for the recipe (via MenuBuilder's `get_recipe_notes`)
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
-- **Group chat games** — add Keanu to a group text that includes at least one family member and play **Story Chain**: "@keanu story" starts it, players reply "in" (friends add a name, "in Sam"), "keanu go" begins, and everyone adds one sentence in turn while Keanu writes the opening and the ending. "keanu skip" / "keanu stop" control it; "keanu who's next?" gives the turn. Games are saved per chat in `game_state/` and survive restarts; a game expires after 24 hours idle (30 minutes if it was never started) and Keanu posts the story so far when it does. In a group where everyone is family, any message mentioning Keanu gets a normal agent answer posted in the group (its own history, separate from each person's 1:1; no menu-build start from a group). With a friend in the chat it's games only: a mention gets a short "I can only run games here" reply, and friends never reach the agent
+- **Group chat games** — add Keanu to a group text that includes at least one family member. A family member starts a game, players reply "in" (friends add a name, "in Sam"), and "keanu go" begins; mentioning Keanu while it waits shows who's in. **Story Chain** ("@keanu story", 2+ players): everyone adds one sentence in turn while Keanu writes the opening and the ending. **Imposter** ("@keanu imposter", 3+ players): Keanu privately texts every player the secret word except the imposter, who only gets the category; two rounds of clues, then everyone votes, and a caught imposter gets one guess at the word ("keanu reveal" tallies early). Private texts go only to that game's players, only at the start, and the game is cancelled if one fails; the word and the imposter are never logged. "keanu skip" / "keanu stop" control a game; "keanu who's next?" gives the turn. Games are saved per chat in `game_state/` and survive restarts; a game expires after 24 hours idle (30 minutes if it was never started) and Keanu posts what happened when it does. In a group where everyone is family, any message mentioning Keanu gets a normal agent answer posted in the group (its own history, separate from each person's 1:1; no menu-build start from a group). With a friend in the chat it's games only: a mention gets a short "I can only run games here" reply, and friends never reach the agent
 - **Feedback** — logs family reactions to meals for future planning
 - **Proactive messages** — holiday morning messages, trash reminders, game-day good-luck texts
 - **Relay** — admin can ask Keanu to forward a message to another family member
@@ -122,7 +122,7 @@ osascript -e 'do shell script "kill $(pgrep -u botaccount -f server.py)" with ad
 ```
 server.py                  # Main loop — polls chat.db, routes messages, sends replies; HTTP API on :5050 (/send, /start_menu_workflow)
 agent.py                   # Conversation loop — Claude tool use, per-handle history
-group_games.py             # Group chat games (Story Chain) — chat-scoped, disk-persisted state in game_state/
+group_games.py             # Group chat games (shared lobby, Story Chain, Imposter) — chat-scoped, disk-persisted state in game_state/
 tools.py                   # Tool definitions and implementations
 trigger_menu.py            # Manual fallback — POSTs to /start_menu_workflow on Keanu's HTTP API (Sunday scheduling is handled in-loop now)
 groceryagent_bridge.py     # Subprocess bridge to GroceryAgent receipt parser
@@ -148,7 +148,7 @@ tests/
   test_chat_db_poll.py     # attributedBody decoding + reaction filtering in poll_new_messages
   test_outbox_spool.py     # Outbox spool queue/drain/quarantine
   test_sunday_trigger.py   # In-loop Sunday trigger guard
-  test_group_chat.py       # Group routing gate, family-only agent replies, chat-scoped coalescing/history, Story Chain lifecycle/expiry
+  test_group_chat.py       # Group routing gate, family-only agent replies, chat-scoped coalescing/history, Story Chain and Imposter lifecycle/expiry
   test_swap_tools.py       # switch_days, swap_meal already_planned/confirmation, add_lunch_recipe_url (MenuBuilder faked)
   test_tool_contract.py    # Bridge call sites vs live MenuBuilder signatures (also pre-flight check 4)
   test_tools_update.py     # Unit tests for update_meal_plan confirmation flow

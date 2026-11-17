@@ -220,7 +220,24 @@ class TestStoryChain(_GameDirCase):
 
     def test_go_needs_two_players(self):
         self.say(DAVID, "keanu story")
-        self.assertIn("at least 2", self.say(DAVID, "keanu go")[0])
+        self.assertEqual(self.say(DAVID, "keanu go"),
+                         ["Need at least 2 players. Dad's in so far. Reply \"in\" to join."])
+
+    def test_story_start_while_waiting_joins(self):
+        self.say(KID, "@keanu story")
+        self.assertEqual(self.say(DAVID, "Keanu story "), ["Dad's in! (2 players)"])
+
+    def test_mention_while_waiting_gets_status(self):
+        self.say(KID, "@keanu story")
+        self.say(FRIEND, "in Sam")
+        self.assertEqual(self.say(KID, "keanu"),
+                         ["Waiting to start: Kiddo and Sam are in. Reply \"in\" to join, or \"keanu go\" to begin."])
+        self.assertIn("Waiting to start", self.say(DAVID, "keanu what do I do")[0])
+
+    def test_chatter_while_waiting_stays_quiet(self):
+        self.say(KID, "@keanu story")
+        self.assertEqual(self.say(KID, "SAY IN"), [])
+        self.assertEqual(self.say(KID, "go"), [])
 
     def test_friend_cannot_go_or_cancel(self):
         self.say(DAVID, "keanu story")
@@ -313,6 +330,156 @@ class TestStoryChain(_GameDirCase):
         self.assertTrue(group_games.is_turn_question("keanu who's next?"))
         self.assertFalse(group_games.is_turn_question("Keanu died"))
         self.assertFalse(group_games.is_turn_question("no mention here, whose turn"))
+
+class TestImposter(_GameDirCase):
+    """Three players; Kiddo is always dealt the imposter, the word is BEACH."""
+
+    def setUp(self):
+        super().setUp()
+        self.private = []
+        self.fail_for = set()
+        for target, kw in (("_pick_secret", {"return_value": ("Places", "beach")}),):
+            p = mock.patch.object(group_games, target, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(group_games.random, "choice", side_effect=lambda seq: seq[1])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def send_private(self, handle, text):
+        self.private.append((handle, text))
+        return handle not in self.fail_for
+
+    def say(self, handle, text):
+        return group_games.handle_group_game_message(
+            GROUP, handle, text, is_family=handle in CONFIG["security"]["allowed_numbers"],
+            config=CONFIG, send_private=self.send_private)
+
+    def _deal(self):
+        self.say(DAVID, "@keanu imposter")
+        self.say(KID, "in")
+        self.say(FRIEND, "in Sam")
+        return self.say(DAVID, "keanu go")
+
+    def _clues(self):
+        self._deal()
+        for i in range(6):
+            out = self.say((DAVID, KID, FRIEND)[i % 3], f"clue{i}")
+        return out
+
+    def test_needs_three_players(self):
+        self.say(DAVID, "@keanu imposter")
+        self.say(KID, "in")
+        self.assertEqual(self.say(DAVID, "keanu go"),
+                         ["Need at least 3 players. Dad and Kiddo are in so far. Reply \"in\" to join."])
+        self.assertEqual(self.private, [])
+
+    def test_private_texts_only_to_players_with_right_content(self):
+        out = self._deal()
+        self.assertIn("check your texts", out[0])
+        self.assertTrue(out[0].endswith("Dad, you're up!"))
+        sent = dict(self.private)
+        self.assertEqual(set(sent), {DAVID, KID, FRIEND})
+        self.assertIn("BEACH", sent[DAVID])
+        self.assertIn("BEACH", sent[FRIEND])
+        self.assertIn("IMPOSTER", sent[KID])
+        self.assertIn("Places", sent[KID])
+        self.assertNotIn("BEACH", sent[KID])
+        self.assertNotIn("BEACH", out[0])
+
+    def test_failed_private_text_cancels(self):
+        self.fail_for = {FRIEND}
+        out = self._deal()
+        self.assertIn("couldn't text Sam privately", out[0])
+        self.assertIsNone(group_games.load_game(GROUP))
+
+    def test_secret_never_logged(self):
+        with self.assertLogs(group_games.log, level="INFO") as logs:
+            self._deal()
+        self.assertFalse(any("beach" in line.lower() for line in logs.output))
+
+    def test_clue_round_then_vote_prompt_with_recap(self):
+        self._deal()
+        self.assertEqual(self.say(KID, "out of turn"), [])
+        self.assertEqual(self.say(DAVID, "sand"), ["Kiddo, you're up! (clue 2/6)"])
+        for i in range(1, 6):
+            out = self.say((DAVID, KID, FRIEND)[i % 3], f"clue{i}")
+        out = out[0]
+        self.assertIn("Dad: sand, clue3", out)
+        self.assertIn("Kiddo: clue1, clue4", out)
+        self.assertIn("Vote!", out)
+
+    def test_caught_then_correct_guess(self):
+        self._clues()
+        self.assertEqual(self.say(DAVID, "kiddo"), ["Got it, Dad! (1/3 voted)"])
+        self.say(FRIEND, "I think Kiddo")
+        out = self.say(KID, "Dad")[0]
+        self.assertIn("Busted! Kiddo was the imposter!", out)
+        self.assertIn("Votes: Kiddo 2, Dad 1", out)
+        self.assertIn("steals the win", self.say(KID, "the beaches")[0])
+        self.assertIsNone(group_games.load_game(GROUP))
+
+    def test_caught_then_wrong_guess(self):
+        self._clues()
+        self.say(DAVID, "Kiddo")
+        self.say(FRIEND, "Kiddo")
+        self.say(KID, "Sam")
+        self.assertEqual(self.say(DAVID, "beach"), [])  # only the imposter guesses
+        self.assertEqual(self.say(KID, "pool"), ["Nope! The word was BEACH. Everyone else wins!"])
+
+    def test_wrong_person_imposter_wins(self):
+        self._clues()
+        self.say(DAVID, "Sam")
+        self.say(KID, "Sam")
+        out = self.say(FRIEND, "Dad")[0]
+        self.assertIn("Wrong person!", out)
+        self.assertIn("The imposter was Kiddo and the word was BEACH. Kiddo wins!", out)
+
+    def test_tie_imposter_escapes(self):
+        self._clues()
+        self.say(DAVID, "Sam")
+        self.say(KID, "Dad")
+        out = self.say(FRIEND, "Kiddo")[0]
+        self.assertIn("tie", out)
+        self.assertIn("Kiddo wins!", out)
+
+    def test_self_vote_rejected_and_double_vote_ignored(self):
+        self._clues()
+        self.assertIn("can't vote for yourself", self.say(DAVID, "Dad")[0])
+        self.say(DAVID, "Kiddo")
+        self.assertEqual(self.say(DAVID, "Sam"), [])
+        self.assertEqual(group_games.load_game(GROUP)["votes"], {DAVID: KID})
+
+    def test_voting_status_and_reveal(self):
+        self._clues()
+        self.say(DAVID, "Kiddo")
+        self.assertEqual(self.say(FRIEND, "keanu"),
+                         ["Waiting on votes from Kiddo, Sam. Reply with who you think the imposter is."])
+        self.assertEqual(self.say(FRIEND, "keanu reveal"), [])  # friends can't force it
+        self.assertIn("Busted!", self.say(DAVID, "keanu reveal")[0])
+
+    def test_stop_reveals(self):
+        self._deal()
+        self.assertEqual(self.say(KID, "keanu stop"),
+                         ["Game stopped. The imposter was Kiddo and the word was BEACH."])
+
+    def test_expiry_notice_reveals(self):
+        self._deal()
+        with mock.patch.object(group_games.time, "time",
+                               return_value=time.time() + group_games.PLAY_TIMEOUT + 1):
+            out = self.say(DAVID, "hello")
+        self.assertEqual(out, ["Our Imposter game timed out. The imposter was Kiddo and the word was BEACH."])
+
+    def test_game_start_parsing(self):
+        self.assertEqual(group_games.game_start("@Keanu imposter!"), "imposter")
+        self.assertEqual(group_games.game_start("keanu impostor"), "imposter")
+        self.assertEqual(group_games.game_start("keanu story"), "story_chain")
+        self.assertIsNone(group_games.game_start("imposter"))
+
+    def test_normalize_word(self):
+        self.assertEqual(group_games._normalize_word("The Beaches!"), "beach")
+        self.assertEqual(group_games._normalize_word("is it a pizza"), "pizza")
+
 
 if __name__ == "__main__":
     unittest.main()

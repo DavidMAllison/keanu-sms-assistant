@@ -84,7 +84,7 @@ def queue_outbox(entry: dict):
         f.write(json.dumps(entry))
 
 
-def send_imessage(handle: str, text: str):
+def send_imessage(handle: str, text: str) -> bool:
     safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
     tell application "Messages"
@@ -96,8 +96,9 @@ def send_imessage(handle: str, text: str):
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if result.returncode != 0:
         log.error(f"AppleScript error sending to {handle}: {result.stderr.strip()}")
-    else:
-        log.info(f"Sent reply to {handle}")
+        return False
+    log.info(f"Sent reply to {handle}")
+    return True
 
 
 def send_imessage_chat(chat_guid: str, text: str):
