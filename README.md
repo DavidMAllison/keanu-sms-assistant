@@ -10,7 +10,7 @@ The key design goal: every family member uses the device they already have. No a
 - **Schedule** — upcoming soccer games, practices, events pulled from a calendar
 - **Recipes** — searches local collection first (all statuses, scored by keyword match); falls back to online search (Rick Bayless, Pati Jinich, Smitten Kitchen, Serious Eats, and more) when nothing is found locally; returns GitHub Pages URL for collection hits; appends any standing family notes/feedback for the recipe (via MenuBuilder's `get_recipe_notes`)
 - **Fun** — jokes, riddles, trivia (kid-safe mode for younger family members)
-- **Group chat games** — add Keanu to a group text that includes at least one family member and play **Story Chain**: "@keanu story" starts it, players reply "in" (friends add a name, "in Sam"), "keanu go" begins, and everyone adds one sentence in turn while Keanu writes the opening and the ending. "keanu skip" / "keanu stop" control it; "keanu who's next?" gives the turn. Games are saved per chat in `game_state/` and survive restarts; a game expires after 24 hours idle (30 minutes if it was never started) and Keanu posts the story so far when it does. Friends can only play; nothing else in a group reaches the agent yet
+- **Group chat games** — add Keanu to a group text that includes at least one family member and play **Story Chain**: "@keanu story" starts it, players reply "in" (friends add a name, "in Sam"), "keanu go" begins, and everyone adds one sentence in turn while Keanu writes the opening and the ending. "keanu skip" / "keanu stop" control it; "keanu who's next?" gives the turn. Games are saved per chat in `game_state/` and survive restarts; a game expires after 24 hours idle (30 minutes if it was never started) and Keanu posts the story so far when it does. In a group where everyone is family, any message mentioning Keanu gets a normal agent answer posted in the group (its own history, separate from each person's 1:1; no menu-build start from a group). With a friend in the chat it's games only: a mention gets a short "I can only run games here" reply, and friends never reach the agent
 - **Feedback** — logs family reactions to meals for future planning
 - **Proactive messages** — holiday morning messages, trash reminders, game-day good-luck texts
 - **Relay** — admin can ask Keanu to forward a message to another family member
@@ -42,7 +42,7 @@ Outbound proactive messages go through the **outbox spool**: any process queues 
 
 **Split-message coalescing** — iMessage often delivers "Let's add this recipe:" and its link as separate messages. The poll loop (`coalesce_messages` in `server.py`) merges a sender's back-to-back messages into one turn and waits until they've been quiet for 4s — or 15s after a lead-in (ends in ":" or announces a recipe with no link) — before replying. A photo is merged only after a lead-in; tapbacks and different senders never merge.
 
-**Group chats** — `poll_new_messages` returns each message's `chat_guid` and flags groups by `chat.style = 43` (macOS 26 group identifiers no longer start with `chat`). Group messages never take the 1:1 path: `handle_group_message` answers only when the chat includes an allowed handle, only for games (`group_games.py`), and replies into the group via `send_imessage_chat` (`send ... to chat id`). Coalescing only merges messages from the same sender in the same chat.
+**Group chats** — `poll_new_messages` returns each message's `chat_guid` and flags groups by `chat.style = 43` (macOS 26 group identifiers no longer start with `chat`). Group messages never take the 1:1 path: `handle_group_message` answers only when the chat includes an allowed handle and replies into the group via `send_imessage_chat` (`send ... to chat id`). Games (`group_games.py`) come first; otherwise a Keanu mention goes to `get_reply` with `history_key="chat:<guid>"` only when every participant is an allowed handle, and gets a games-only reply when anyone else is in the chat. Coalescing only merges messages from the same sender in the same chat.
 
 **Reading chat.db** — since macOS Ventura some messages leave `message.text` NULL and store their content only in `attributedBody`; `poll_new_messages` decodes it in that case (logged as `[from attributedBody]`). Tapbacks and emoji reactions are excluded in SQL via `associated_message_type = 0`, with `is_tapback`'s text-prefix check kept as a fallback.
 
@@ -148,7 +148,7 @@ tests/
   test_chat_db_poll.py     # attributedBody decoding + reaction filtering in poll_new_messages
   test_outbox_spool.py     # Outbox spool queue/drain/quarantine
   test_sunday_trigger.py   # In-loop Sunday trigger guard
-  test_group_chat.py       # Group routing gate, chat-scoped coalescing, Story Chain lifecycle/expiry
+  test_group_chat.py       # Group routing gate, family-only agent replies, chat-scoped coalescing/history, Story Chain lifecycle/expiry
   test_swap_tools.py       # switch_days, swap_meal already_planned/confirmation, add_lunch_recipe_url (MenuBuilder faked)
   test_tool_contract.py    # Bridge call sites vs live MenuBuilder signatures (also pre-flight check 4)
   test_tools_update.py     # Unit tests for update_meal_plan confirmation flow

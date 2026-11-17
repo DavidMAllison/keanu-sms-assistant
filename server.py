@@ -1033,12 +1033,18 @@ def get_chat_participants(chat_guid: str) -> list:
         conn.close()
 
 
+GROUP_GAMES_ONLY_REPLY = "In this chat I can only run games. Say \"keanu story\" to start one!"
+# Friends can't start games, so they're pointed at a family member instead
+GROUP_FRIEND_REPLY = "Ask a family member to say \"keanu story\" to start a game!"
+
+
 def handle_group_message(msg: dict, config: dict):
     """
-    Group chats only get games for now. Keanu answers only when the chat
-    includes a family member (an allowed handle); friends in that chat can play
-    but never reach the agent. Anything that isn't a game is logged and ignored
-    rather than answered privately.
+    Keanu answers in a group only when the chat includes a family member (an
+    allowed handle), and never privately. Games come first. Otherwise a message
+    mentioning Keanu reaches the agent only when everyone in the chat is family;
+    with a friend in the chat it gets a games-only reply, so nothing about the
+    family is exposed. Anything else is ignored.
     """
     chat_guid = msg["chat_guid"]
     handle = msg["handle"]
@@ -1063,11 +1069,22 @@ def handle_group_message(msg: dict, config: dict):
 
     replies = group_games.handle_group_game_message(
         chat_guid, handle, text, is_family=handle in allowed, config=config)
-    if replies is None:
-        log.info(f"Group message in chat {tag} isn't a game, ignoring")
+    if replies is not None:
+        for reply in replies:
+            send_imessage_chat(chat_guid, reply)
         return
-    for reply in replies:
+    if not group_games.mentions_keanu(text):
+        log.info(f"Group message in chat {tag} isn't for Keanu, ignoring")
+        return
+    if handle in allowed and participants and all(p in allowed for p in participants):
+        names = [config["security"].get("handle_to_person", {}).get(p, "Family member")
+                 for p in participants]
+        log.info(f"Routing family group message in chat {tag} to agent")
+        reply = get_reply(handle, text, config, history_key=f"chat:{chat_guid}", group_names=names)
         send_imessage_chat(chat_guid, reply)
+        return
+    log.info(f"Group chat {tag} includes a non-family member, games only")
+    send_imessage_chat(chat_guid, GROUP_GAMES_ONLY_REPLY if handle in allowed else GROUP_FRIEND_REPLY)
 
 
 def poll_new_messages(last_rowid: int, min_date: Optional[float] = None) -> list[dict]:

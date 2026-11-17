@@ -89,10 +89,33 @@ class TestGroupRouting(_GameDirCase):
         self.assertEqual(self.sent[0][0], GROUP)
         self.send_imessage.assert_not_called()
 
-    def test_non_game_message_ignored(self):
+    def test_family_chat_mention_goes_to_agent_in_group(self):
+        self.get_reply.return_value = "Tacos tonight!"
         self.route(_msg(1, "keanu what's for dinner"), [DAVID, KID])
-        self.assertEqual(self.sent, [])
+        self.get_reply.assert_called_once_with(
+            DAVID, "keanu what's for dinner", CONFIG,
+            history_key="chat:" + GROUP, group_names=["Dad", "Kiddo"])
+        self.assertEqual(self.sent, [(GROUP, "Tacos tonight!")])
         self.send_imessage.assert_not_called()
+
+    def test_friend_in_chat_gets_games_only_reply(self):
+        self.route(_msg(1, "keanu what's for dinner"), [DAVID, FRIEND])
+        self.get_reply.assert_not_called()
+        self.assertEqual(self.sent, [(GROUP, server.GROUP_GAMES_ONLY_REPLY)])
+
+    def test_friend_asking_gets_games_only_reply(self):
+        self.route(_msg(1, "keanu where do you live", handle=FRIEND), [DAVID, FRIEND])
+        self.get_reply.assert_not_called()
+        self.assertEqual(self.sent, [(GROUP, server.GROUP_FRIEND_REPLY)])
+
+    def test_chatter_without_mention_ignored(self):
+        self.route(_msg(1, "what's for dinner"), [DAVID, KID])
+        self.assertEqual(self.sent, [])
+        self.get_reply.assert_not_called()
+
+    def test_running_game_takes_priority_over_agent(self):
+        self.route(_msg(1, "keanu story"), [DAVID, KID])
+        self.route(_msg(2, "keanu what's for dinner"), [DAVID, KID])
         self.get_reply.assert_not_called()
 
     def test_chat_without_family_ignored(self):
@@ -101,7 +124,8 @@ class TestGroupRouting(_GameDirCase):
 
     def test_friend_cannot_start_game(self):
         self.route(_msg(1, "keanu story", handle=FRIEND), [FRIEND, KID])
-        self.assertEqual(self.sent, [])
+        self.assertEqual(self.sent, [(GROUP, server.GROUP_FRIEND_REPLY)])
+        self.assertIsNone(group_games.load_game(GROUP))
 
     def test_friend_can_join_game_in_family_chat(self):
         self.route(_msg(1, "keanu story"), [DAVID, FRIEND])
@@ -111,6 +135,46 @@ class TestGroupRouting(_GameDirCase):
     def test_empty_text_ignored(self):
         self.route(_msg(1, ""), [DAVID])
         self.assertEqual(self.sent, [])
+
+
+class TestAgentGroupReply(unittest.TestCase):
+    """agent.get_reply in a group: own history, sender-labeled turns, no menu start."""
+
+    def setUp(self):
+        import agent
+        self.agent = agent
+        agent._conversation_history.clear()
+        agent._last_seen.clear()
+        response = mock.MagicMock(stop_reason="end_turn")
+        response.content = [mock.MagicMock(text="Tacos!")]
+        self.create = mock.MagicMock(return_value=response)
+        for target, value in (("_client", mock.MagicMock(messages=mock.MagicMock(create=self.create))),
+                              ("load_context", mock.MagicMock(return_value="Tonight: tacos"))):
+            p = mock.patch.object(agent, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.config = dict(CONFIG, security=dict(CONFIG["security"], menu_admin=DAVID))
+
+    def test_group_history_kept_apart_and_labeled(self):
+        self.agent.get_reply(DAVID, "keanu dinner?", self.config,
+                             history_key="chat:" + GROUP, group_names=["Dad", "Kiddo"])
+        self.assertNotIn(DAVID, self.agent._conversation_history)
+        turn = self.agent._conversation_history["chat:" + GROUP][0]["content"]
+        self.assertTrue(turn.endswith("] Dad: keanu dinner?"))
+        self.assertIn("family group text with Dad, Kiddo", self.create.call_args[1]["system"])
+
+    def test_group_drops_start_menu_workflow(self):
+        self.agent.get_reply(DAVID, "keanu plan the menu", self.config,
+                             history_key="chat:" + GROUP, group_names=["Dad", "Kiddo"])
+        names = [t["name"] for t in self.create.call_args[1]["tools"]]
+        self.assertNotIn("start_menu_workflow", names)
+
+    def test_one_to_one_unchanged(self):
+        self.agent.get_reply(DAVID, "dinner?", self.config)
+        names = [t["name"] for t in self.create.call_args[1]["tools"]]
+        self.assertIn("start_menu_workflow", names)
+        self.assertNotIn("Group chat", self.create.call_args[1]["system"])
+        self.assertTrue(self.agent._conversation_history[DAVID][0]["content"].endswith("] dinner?"))
 
 
 class TestParsing(unittest.TestCase):

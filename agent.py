@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
 import anthropic
 from dotenv import load_dotenv
@@ -94,7 +95,19 @@ def _pending_friend_request_note() -> str:
     return "\n".join(lines)
 
 
-def get_reply(handle: str, text: str, config: dict) -> str:
+def _group_note(group_names: list) -> str:
+    return (
+        "\n\n## Group chat\n"
+        f"You're replying in a family group text with {', '.join(group_names)}. "
+        "Everyone in it sees your reply. Each message is labeled with who sent it; "
+        "answer the person who asked, and keep it short."
+    )
+
+
+def get_reply(handle: str, text: str, config: dict, history_key: Optional[str] = None,
+              group_names: Optional[list] = None) -> str:
+    """group_names is set for a reply posted into an all-family group chat;
+    history_key keeps that chat's history apart from the sender's 1:1 history."""
     is_kid = handle in config["security"].get("kids", [])
     is_admin = handle == config["security"].get("menu_admin")
     is_idea_submitter = handle in config["security"].get("idea_submitters", [])
@@ -103,18 +116,27 @@ def get_reply(handle: str, text: str, config: dict) -> str:
     max_tokens = 250 if is_kid else 500
     tools = build_tool_list(is_kid, is_admin, is_idea_submitter)
     system = _build_system(handle, config, is_kid)
+    key = history_key or handle
+    speaker = ""
+    if group_names is not None:
+        # The menu build is a 1:1 back-and-forth with the admin; starting it
+        # from a group would split it across two chats.
+        tools = [t for t in tools if t["name"] != "start_menu_workflow"]
+        system += _group_note(group_names)
+        name = config["security"].get("handle_to_person", {}).get(handle, "Family member")
+        speaker = f"{name}: "
 
     now = time.time()
-    if now - _last_seen.get(handle, 0) > SESSION_TIMEOUT:
-        _conversation_history[handle] = []
-    _last_seen[handle] = now
+    if now - _last_seen.get(key, 0) > SESSION_TIMEOUT:
+        _conversation_history[key] = []
+    _last_seen[key] = now
 
-    history = _conversation_history[handle]
+    history = _conversation_history[key]
     now_str = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p")
-    history.append({"role": "user", "content": f"[{now_str}] {text}"})
+    history.append({"role": "user", "content": f"[{now_str}] {speaker}{text}"})
     if len(history) > MAX_HISTORY * 2:
         history = history[-(MAX_HISTORY * 2):]
-        _conversation_history[handle] = history
+        _conversation_history[key] = history
 
     # Filter empty entries before sending to API
     messages = [m for m in history if isinstance(m.get("content"), str) and m["content"].strip()]
@@ -139,7 +161,7 @@ def get_reply(handle: str, text: str, config: dict) -> str:
                         result_key = result[:80]
                         if seen_tool_results.get(block.name) == result_key:
                             log.warning(f"Stuck loop on {block.name} for {handle}, resetting context")
-                            _conversation_history[handle] = []
+                            _conversation_history[key] = []
                             return "My brain got a bit scrambled there — I've reset. What did you want to know?"
                         seen_tool_results[block.name] = result_key
                         tool_results.append({

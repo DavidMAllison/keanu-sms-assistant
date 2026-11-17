@@ -89,6 +89,10 @@ def chat_tag(chat_guid: str) -> str:
 
 # ── Parsing ────────────────────────────────────────────────────────────────────
 
+def mentions_keanu(text: str) -> bool:
+    return bool(_MENTION.search(text))
+
+
 def is_story_start(text: str) -> bool:
     return bool(_MENTION.search(text) and _STORY_START.search(text))
 
