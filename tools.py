@@ -28,6 +28,7 @@ from agents.menu_agent import (
     RECIPE_CHUNK_CHARS,
     get_dropbox_preview_url,
     METADATA_FILE,
+    recipe_name_for_site_url,
 )
 from agents.schedule_agent import (
     _load_schedule,
@@ -1027,7 +1028,7 @@ def _tool_update_meal_plan(instruction: str, confirmed: bool = False) -> str:
     if result.get("status") == "needs_confirmation":
         # MenuBuilder never applies a typed name until the user picks one
         return (
-            f"needs_confirmation: {result.get('message') or 'Did you mean ' + repr(result['suggested']) + '?'} "
+            f"needs_confirmation: {result.get('message') or 'Did you mean ' + repr(result['suggested']) + '?'}\n"
             "Send that to the user word for word. After they pick, call update_meal_plan again "
             "with the exact recipe name and confirmed=true."
         )
@@ -1368,9 +1369,36 @@ def _tool_log_capability_gap(description: str, handle: str) -> str:
     return "Noted."
 
 
+# The recipe question swap_meal last asked each person. Their next swap_meal
+# naming one of the options is their answer, even if the model drops
+# confirmed=true: three "Yes" replies each got the same question again (Nov 22).
+_pending_swap_confirmation: dict = {}
+SWAP_CONFIRM_TTL = 30 * 60
+
+
+def _confirmation_question(result: dict) -> str:
+    opts = [o for o in result.get("options", []) if o.get("recipe")]
+    if len(opts) == 1:
+        return f"Is this the right recipe? {opts[0]['recipe']} - {opts[0].get('url', '')}".strip(" -")
+    if opts:
+        lines = [f"{i}. {o['recipe']} - {o.get('url', '')}".strip(" -") for i, o in enumerate(opts, 1)]
+        return "Which one did you mean?\n" + "\n".join(lines)
+    # MenuBuilder appends instructions meant for the caller; keep only the question
+    return result.get("detail", "Which recipe did you mean?").split(" Ask the user")[0].strip()
+
+
 def _tool_swap_meal(day: str, outgoing: str, incoming: str,
-                    incoming_content: Optional[dict] = None, confirmed: bool = False) -> str:
+                    incoming_content: Optional[dict] = None, confirmed: bool = False,
+                    handle: str = "") -> str:
     import os
+    pending = _pending_swap_confirmation.pop(handle, None) if handle else None
+    if (not confirmed and pending and time.time() - pending["at"] < SWAP_CONFIRM_TTL
+            and incoming.strip().lower() in pending["options"]):
+        confirmed = True
+    own = recipe_name_for_site_url(incoming) if incoming.startswith("http") else None
+    if own:
+        # A link to our own recipe site names the recipe exactly
+        incoming, confirmed = own, True
     is_url = incoming.startswith("http")
     kwargs = {"day": day, "outgoing_recipe": outgoing, "confirmed": confirmed}
     if incoming_content:
@@ -1404,9 +1432,15 @@ def _tool_swap_meal(day: str, outgoing: str, incoming: str,
                 "incoming_content set to {title, time, servings, ingredients: [str], instructions: [str]}."
             )
         if result.get("message") == "needs_confirmation":
-            # Typed names are never trusted on their own — ask, then re-call confirmed
+            # Typed names are never trusted on their own — ask, then re-call confirmed.
+            # The question is the first line; agent.py sends it and ends the turn.
+            if handle:
+                _pending_swap_confirmation[handle] = {
+                    "at": time.time(),
+                    "options": [o["recipe"].lower() for o in result.get("options", []) if o.get("recipe")],
+                }
             return (
-                f"needs_confirmation: {result.get('detail', 'Which recipe did you mean?')} "
+                f"needs_confirmation: {_confirmation_question(result)}\n"
                 "Send that to the user word for word. After they pick, call swap_meal again with "
                 "that exact recipe name as incoming and confirmed=true."
             )
@@ -1620,7 +1654,8 @@ def execute_tool(name: str, inputs: dict, handle: str, config: dict) -> str:
             return _tool_relay_message(inputs["recipient"], inputs["message"], config)
         if name == "swap_meal":
             return _tool_swap_meal(inputs["day"], inputs["outgoing"], inputs["incoming"],
-                                   inputs.get("incoming_content"), bool(inputs.get("confirmed")))
+                                   inputs.get("incoming_content"), bool(inputs.get("confirmed")),
+                                   handle=handle)
         if name == "switch_days":
             return _tool_switch_days(inputs["day_a"], inputs["day_b"])
         if name == "get_prep_guide":

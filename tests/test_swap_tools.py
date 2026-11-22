@@ -88,6 +88,50 @@ class TestSwapMealConfirmation(unittest.TestCase):
         self.assertIn("Is this the right recipe? Test Salad - https://example.com/salad", reply)
         self.assertIn("confirmed=true", reply)
 
+    def test_question_built_from_options_without_caller_instructions(self):
+        reply, _ = self._swap({
+            "success": False, "message": "needs_confirmation",
+            "options": [{"recipe": "Test Salad", "url": "https://example.com/salad"}],
+            "detail": "Is this the right recipe? Test Salad - https://example.com/salad "
+                      "Ask the user, then call again with the exact name and confirmed=True.",
+        })
+        question = reply[len("needs_confirmation:"):].split("\nSend that to the user")[0].strip()
+        self.assertEqual(question, "Is this the right recipe? Test Salad - https://example.com/salad")
+
+    def test_next_pick_from_same_person_counts_as_confirmed(self):
+        tools._pending_swap_confirmation.clear()
+        asked = {"success": False, "message": "needs_confirmation",
+                 "options": [{"recipe": "Test Salad", "url": "u"}], "detail": "?"}
+        swap = MagicMock(side_effect=[asked, {"success": True, "message": "ok"}])
+        with patch.dict(sys.modules, {"meal_swap": _fake_meal_swap(execute_swap=swap)}), \
+             patch("tools.find_all_recipe_matches", return_value=[{"name": "Test Salad"}]):
+            tools._tool_swap_meal("Mon 11/23", "Test Miso", "Test Salad", handle="+15550000002")
+            tools._tool_swap_meal("Mon 11/23", "Test Miso", "Test Salad", handle="+15550000002")
+        self.assertFalse(swap.call_args_list[0].kwargs["confirmed"])
+        self.assertTrue(swap.call_args_list[1].kwargs["confirmed"])
+
+    def test_pending_pick_is_per_person(self):
+        tools._pending_swap_confirmation.clear()
+        asked = {"success": False, "message": "needs_confirmation",
+                 "options": [{"recipe": "Test Salad", "url": "u"}], "detail": "?"}
+        swap = MagicMock(side_effect=[asked, asked])
+        with patch.dict(sys.modules, {"meal_swap": _fake_meal_swap(execute_swap=swap)}), \
+             patch("tools.find_all_recipe_matches", return_value=[{"name": "Test Salad"}]):
+            tools._tool_swap_meal("Mon 11/23", "Test Miso", "Test Salad", handle="+15550000002")
+            tools._tool_swap_meal("Mon 11/23", "Test Miso", "Test Salad", handle="+15550000001")
+        self.assertFalse(swap.call_args_list[1].kwargs["confirmed"])
+
+    def test_own_site_link_swaps_by_name(self):
+        swap = MagicMock(return_value={"success": True, "message": "ok"})
+        with patch.dict(sys.modules, {"meal_swap": _fake_meal_swap(execute_swap=swap)}), \
+             patch("tools.recipe_name_for_site_url", return_value="Test Salad"), \
+             patch("tools.find_all_recipe_matches", return_value=[{"name": "Test Salad"}]):
+            tools._tool_swap_meal("Mon 11/23", "Test Miso", "https://site/Test_Salad")
+        kwargs = swap.call_args.kwargs
+        self.assertEqual(kwargs["incoming_name"], "Test Salad")
+        self.assertNotIn("incoming_url", kwargs)
+        self.assertTrue(kwargs["confirmed"])
+
     def test_confirmed_defaults_false_and_passes_through(self):
         _, swap = self._swap({"success": True, "message": "ok"})
         self.assertFalse(swap.call_args.kwargs["confirmed"])

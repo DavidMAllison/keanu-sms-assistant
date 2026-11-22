@@ -57,7 +57,7 @@ DAY_NAME_MAP = {
     "fri": "Fri", "sat": "Sat", "sun": "Sun",
 }
 
-from agents.menu_agent import load_system_prompt  # noqa: E402
+from agents.menu_agent import load_system_prompt, recipe_name_for_site_url  # noqa: E402
 _MENU_SYSTEM = load_system_prompt()
 
 MONTH_MAP = {
@@ -329,6 +329,8 @@ def _handle_needs_confirmation(
 # ── _handle_recipe_confirmation ───────────────────────────────────────────────
 
 _CONFIRM_WORDS = ("yes", "yeah", "yep", "yup", "that's it", "correct", "ok", "okay")
+# Whole words only: "looks good" and "book" contain "ok"
+_CONFIRM_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in _CONFIRM_WORDS) + r")\b")
 
 
 def _pick_confirmation_option(lower: str, options: list) -> Optional[str]:
@@ -343,19 +345,21 @@ def _pick_confirmation_option(lower: str, options: list) -> Optional[str]:
             return name
     return None
 
-def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
+def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> Optional[str]:
     """
     awaiting_recipe_confirmation state handler.
     '1'/'2'/'3' or an option's name → re-calls original tool with that recipe.
     'yes' → re-calls original tool with suggested name.
-    Anything else → restores previous state and asks for re-entry.
+    Anything else → restores previous state and returns None so the agent
+    answers it. A canned "What's the recipe name?" here swallowed "Friday is
+    not right, should be a red curry pasta" and lost the thread (Nov 22).
     MenuBuilder only applies a typed-name change on a confirmed=True re-call.
     """
     lower = text.lower().strip()
     pending = session.get("pending_confirmation", {})
     options = pending.get("options", [])
     chosen = _pick_confirmation_option(lower, options)
-    if chosen is None and any(w in lower for w in _CONFIRM_WORDS):
+    if chosen is None and _CONFIRM_RE.search(lower):
         chosen = session.get("pending_suggested", "")
     # prev_state is None when confirmation began during a bridge phase
     prev_state = session.get("pre_confirmation_state")
@@ -398,7 +402,7 @@ def _handle_recipe_confirmation(text: str, session: dict, config: dict) -> str:
             session.pop("state", None)
         _clear_pending()
         _save_session(session)
-        return "What's the recipe name?"
+        return None
 
 
 # ── cancel confirmation ───────────────────────────────────────────────────────
@@ -751,6 +755,10 @@ def _build_menu_tools() -> list:
                 "Swap the meal for a specific day in the current plan. "
                 "Call once per day when David asks to change something. "
                 "Pass the day abbreviation and his reason — the system handles finding a replacement. "
+                "If David names a recipe (even without a link), pass that name as replacement — "
+                "the system looks it up in the collection; don't ask him for a link. "
+                "For a night with no cooking (eating out, takeout), pass reason 'eating out' and "
+                "leave replacement empty. "
                 "Never use this for a recipe URL, and never pass a name guessed from a URL — "
                 "use add_recipe_url instead."
             ),
@@ -825,6 +833,46 @@ def _build_menu_tools() -> list:
 
 
 # ── Agent tool execution ──────────────────────────────────────────────────────
+
+# Names the model passes as a "recipe" when it means no cooking that night.
+# MenuBuilder blanks a day only from the reason with no replacement, so
+# "Going Out to Eat" as a replacement failed as "recipe not found" (Nov 22).
+_EATING_OUT_NAMES = ("going out to eat", "going out", "eating out", "eat out", "out to eat",
+                     "restaurant", "takeout", "take out", "no dinner")
+
+
+def _menu_swap(day: str, reason: str, replacement, session: dict, confirmed: bool = False) -> str:
+    if isinstance(replacement, str) and replacement.strip().lower() in _EATING_OUT_NAMES:
+        replacement = ""
+        reason = "eating out"
+    cuisine_direction = session.get("cuisine_direction", "")
+    kwargs = {"day": day, "reason": reason, "replacement": replacement,
+              "cuisine_direction": cuisine_direction}
+    if confirmed:
+        kwargs["confirmed"] = True
+    result = call_menubuilder_tool("swap_meal", **kwargs)
+    confirm_msg = _handle_needs_confirmation(
+        result, "swap_meal",
+        {"day": day, "reason": reason, "replacement": replacement, "cuisine_direction": cuisine_direction},
+        session,
+    )
+    if confirm_msg is not None:
+        return confirm_msg
+    if result.get("error") == "plan_finalized":
+        return ("This week's plan is already finalized, so it can't be changed from the menu build. "
+                "Tell David to text the swap as a normal message and it'll update the plan, "
+                "shopping list and calendar.")
+    if result.get("error"):
+        return f"Couldn't make that swap: {result['error']}"
+    updated = result.get("selected_meals")
+    if updated:
+        session["selected_meals"] = updated
+    _save_session(session)
+    week_start = date.fromisoformat(session["week_start"])
+    plan = _format_numbered_list(session.get("selected_meals", {}), week_start, session.get("quick_days", []))
+    note = result.get("note", "")
+    return f"{note}\n\n{plan}" if note else plan
+
 
 def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: dict) -> str:
     if tool_name == "log_meal_feedback":
@@ -912,42 +960,20 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         return _format_numbered_list(selected, ws)
 
     if tool_name == "swap_meal":
-        day = tool_input.get("day", "")
-        reason = tool_input.get("reason", "")
-        replacement = tool_input.get("replacement", "")
-        cuisine_direction = session.get("cuisine_direction", "")
-        result = call_menubuilder_tool(
-            "swap_meal",
-            day=day,
-            reason=reason,
-            replacement=replacement,
-            cuisine_direction=cuisine_direction,
-        )
-        confirm_msg = _handle_needs_confirmation(
-            result, "swap_meal",
-            {"day": day, "reason": reason, "replacement": replacement, "cuisine_direction": cuisine_direction},
-            session,
-        )
-        if confirm_msg is not None:
-            return confirm_msg
-        if result.get("error") == "plan_finalized":
-            return ("This week's plan is already finalized, so it can't be changed from the menu build. "
-                    "Tell David to text the swap as a normal message and it'll update the plan, "
-                    "shopping list and calendar.")
-        if result.get("error"):
-            return f"Couldn't make that swap: {result['error']}"
-        updated = result.get("selected_meals")
-        if updated:
-            session["selected_meals"] = updated
-        _save_session(session)
-        week_start = date.fromisoformat(session["week_start"])
-        plan = _format_numbered_list(session.get("selected_meals", {}), week_start, session.get("quick_days", []))
-        note = result.get("note", "")
-        return f"{note}\n\n{plan}" if note else plan
+        return _menu_swap(tool_input.get("day", ""), tool_input.get("reason", ""),
+                          tool_input.get("replacement", ""), session)
 
     if tool_name == "add_recipe_url":
         url = tool_input.get("url", "")
         day = tool_input.get("day", "")
+        own = recipe_name_for_site_url(url)
+        if own:
+            # Our own recipe page: the link names the recipe exactly, so no
+            # fetch and no "is this the right recipe?" round trip
+            if not day:
+                return (f"'{own}' is already in the collection. Ask David which day it's for, "
+                        f"then call swap_meal with replacement '{own}'.")
+            return _menu_swap(day, "recipe David linked from our collection", own, session, confirmed=True)
         result = call_menubuilder_tool(
             "process_recipe_url", url=url, day=day, force_add=bool(tool_input.get("force_add")),
         )
@@ -1062,6 +1088,9 @@ def _build_menu_system_prompt(session: dict) -> str:
         "   IMPORTANT: if David says 'lock in', 'keep', 'yes', or 'looks good' for a specific day without naming a new recipe — just confirm it verbally. Do NOT call swap_meal.\n"
         "   A day can hold two recipes — pass replacement as a list: [\"Recipe A\", \"Recipe B\"]. Both flow through to the shopping list.\n"
         "5. Call approve_menu when David is happy with the plan.\n"
+        "\nTool results are the truth. If one starts with \"Couldn't\", that change did NOT happen: "
+        "tell David plainly. When you show the plan, show only what the last tool result or the "
+        "current meal selection above says, never a day's meal from memory.\n"
         "\nThis is SMS — keep replies short. One question per message.\n"
         "David may step away and return hours later. If there's conversation history, "
         "pick up naturally where you left off without asking him to re-explain anything."
@@ -1082,6 +1111,48 @@ def _describe_tool_call(name: str, tool_input: dict) -> str:
     if len(args) > 100:
         args = args[:100] + "..."
     return f"{name} {args}"
+
+
+_REPLY_NUDGE = ("(Reply to David now in one short text: say what you just did, "
+                "then ask the next question in the menu build.)")
+
+
+def _with_reply_nudge(messages: list) -> list:
+    """The finisher's messages with a nudge in the last user turn. The model
+    returned blank text twice in a row on Nov 22 when nothing asked it to talk."""
+    if not messages or messages[-1]["role"] != "user":
+        return messages
+    last = messages[-1]["content"]
+    blocks = list(last) if isinstance(last, list) else [{"type": "text", "text": last}]
+    return messages[:-1] + [{"role": "user", "content": blocks + [{"type": "text", "text": _REPLY_NUDGE}]}]
+
+
+def _fallback_reply(session: dict) -> str:
+    """When the model still says nothing, ask the build's actual next question.
+    The old "text 'menu' to see the updated week" pointed at a keyword that
+    doesn't exist (only "menu status" does)."""
+    queue = session.get("feedback_queue", [])
+    if queue:
+        return f"Got it! How was {queue[0]}?"
+    selected = session.get("selected_meals", {})
+    if selected:
+        try:
+            ws = date.fromisoformat(session.get("week_start", ""))
+        except ValueError:
+            ws = date.today()
+        plan = _format_numbered_list(selected, ws, session.get("quick_days", []))
+        return f"Here's where we are:\n\n{plan}\n\nAnything to change?"
+    return "Got it! What's next?"
+
+
+def _remember_exchange(session: dict, text: str, reply: str):
+    """Record a turn handled outside the agent, so the agent's next turn knows it happened."""
+    conversation = session.get("conversation", [])
+    now_str = datetime.now().strftime("%A, %B %-d at %-I:%M %p")
+    conversation += [{"role": "user", "content": f"[{now_str}] {text}"},
+                     {"role": "assistant", "content": reply}]
+    session["conversation"] = conversation[-40:]
+    _save_session(session)
 
 
 def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str = "") -> str:
@@ -1115,9 +1186,14 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
     if state == "awaiting_week_confirmation":
         return _handle_week_confirmation(text, session, config)
 
-    # Recipe fuzzy-match confirmation — bypass agent entirely
+    # Recipe confirmation — a pick or "yes" is applied directly; anything else
+    # falls through to the agent with the state restored
     if state == "awaiting_recipe_confirmation":
-        return _handle_recipe_confirmation(text, session, config)
+        reply = _handle_recipe_confirmation(text, session, config)
+        if reply is not None:
+            _remember_exchange(session, text, reply)
+            return reply
+        state = session.get("state") or ""
 
     # Paste-based idea activation — doesn't fit agent model
     if state == "awaiting_idea_content":
@@ -1152,6 +1228,7 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
     # Local copy of messages for this turn (may grow with tool_use/tool_result blocks)
     messages = list(conversation)
     final_reply = ""
+    turn_results: list = []
 
     try:
         for _ in range(8):
@@ -1188,6 +1265,14 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
                         "role": "assistant",
                         "content": "[already done: " + "; ".join(executed) + "]",
                     })
+                turn_results += [r["content"] for r in tool_results]
+                if session.get("state") == "awaiting_recipe_confirmation":
+                    # Send MenuBuilder's question as-is and end the turn. Letting
+                    # the model carry on is how it answered its own "Is this the
+                    # right recipe?" with "Yep, that's the one!" (Nov 22).
+                    failures = [r for r in turn_results[:-1] if r.startswith("Couldn't")]
+                    final_reply = "\n\n".join(failures + [turn_results[-1]])
+                    break
             else:
                 final_reply = next(
                     (b.text for b in response.content if hasattr(b, "text")),
@@ -1210,7 +1295,7 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
                     system=system,
                     tools=tools,
                     tool_choice={"type": "none"},
-                    messages=messages,
+                    messages=_with_reply_nudge(messages),
                 )
                 final_reply = next(
                     (b.text for b in response.content if hasattr(b, "text")),
@@ -1219,7 +1304,7 @@ def menu_agent_reply(text: str, session: dict, config: dict, bridge_state: str =
             except Exception as e:
                 log.error(f"Menu finisher error: {e}")
             if not final_reply:
-                final_reply = "Done — text 'menu' to see the updated week."
+                final_reply = _fallback_reply(session)
 
     except Exception as e:
         log.error(f"Menu agent error: {e}")

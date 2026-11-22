@@ -177,6 +177,28 @@ class TestAgentGroupReply(unittest.TestCase):
         self.assertTrue(self.agent._conversation_history[DAVID][0]["content"].endswith("] dinner?"))
 
 
+class TestAgentConfirmationEndsTurn(unittest.TestCase):
+    """A needs_confirmation tool result is sent as the reply and ends the turn."""
+
+    def test_question_sent_and_model_not_called_again(self):
+        import agent
+        agent._conversation_history.clear()
+        agent._last_seen.clear()
+        block = mock.MagicMock(type="tool_use", input={"day": "Mon 11/23"}, id="tu_1")
+        block.name = "swap_meal"
+        response = mock.MagicMock(stop_reason="tool_use", content=[block])
+        create = mock.MagicMock(return_value=response)
+        result = ("needs_confirmation: Which one did you mean?\n1. A - u\n2. B - v\n"
+                  "Send that to the user word for word. After they pick, call swap_meal again.")
+        with mock.patch.object(agent, "_client", mock.MagicMock(messages=mock.MagicMock(create=create))), \
+             mock.patch.object(agent, "load_context", mock.MagicMock(return_value="")), \
+             mock.patch.object(agent, "execute_tool", return_value=result):
+            reply = agent.get_reply(KID, "swap monday", CONFIG)
+        self.assertEqual(reply, "Which one did you mean?\n1. A - u\n2. B - v")
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(agent._conversation_history[KID][-1]["content"], reply)
+
+
 class TestParsing(unittest.TestCase):
     def test_start_needs_mention_and_story(self):
         self.assertTrue(group_games.is_story_start("@Keanu story chain!"))

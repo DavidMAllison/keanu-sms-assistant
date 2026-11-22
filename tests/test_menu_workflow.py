@@ -385,13 +385,13 @@ class TestRecipeConfirmation(_Base):
     def test_no_restores_previous_local_state(self):
         session = self._confirmation_session(prev_state="awaiting_schedule")
         reply = mw._handle_recipe_confirmation("no", session, FAKE_CONFIG)
-        self.assertEqual(reply, "What's the recipe name?")
+        self.assertIsNone(reply)  # the agent answers it
         self.assertEqual(self._session()["state"], "awaiting_schedule")
 
     def test_no_clears_local_state_when_no_previous_state(self):
         session = self._confirmation_session()
         reply = mw._handle_recipe_confirmation("no", session, FAKE_CONFIG)
-        self.assertEqual(reply, "What's the recipe name?")
+        self.assertIsNone(reply)
         self.assertNotIn("state", self._session())
 
     def test_no_clears_all_pending_keys(self):
@@ -402,11 +402,19 @@ class TestRecipeConfirmation(_Base):
         self.assertNotIn("pending_suggested", saved)
         self.assertNotIn("pre_confirmation_state", saved)
 
-    def test_arbitrary_text_restores_state_and_asks_for_name(self):
+    def test_arbitrary_text_restores_state_and_hands_to_agent(self):
         session = self._confirmation_session(prev_state="awaiting_schedule")
         reply = mw._handle_recipe_confirmation("hmm not sure", session, FAKE_CONFIG)
-        self.assertEqual(reply, "What's the recipe name?")
+        self.assertIsNone(reply)
         self.assertEqual(self._session()["state"], "awaiting_schedule")
+
+    def test_looks_good_is_not_a_yes(self):
+        # "looks" contains "ok"
+        session = self._confirmation_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool") as call:
+            reply = mw._handle_recipe_confirmation("looks good but not that one", session, FAKE_CONFIG)
+        self.assertIsNone(reply)
+        call.assert_not_called()
 
 
 # ── TestSwapMealIntegration ───────────────────────────────────────────────────
@@ -938,11 +946,37 @@ class TestAgentLoop(_Base):
         finisher_kwargs = client.messages.create.call_args_list[-1][1]
         self.assertEqual(finisher_kwargs["tool_choice"], {"type": "none"})
 
-    def test_finisher_error_falls_back_to_static_done_message(self):
+    def test_finisher_error_falls_back_to_next_step(self):
         responses = [_tool_use_response(tool_id=f"tu_{i}") for i in range(8)]
         responses.append(RuntimeError("api down"))
         reply, _ = self._run(responses)
-        self.assertEqual(reply, "Done — text 'menu' to see the updated week.")
+        self.assertEqual(reply, "Got it! What's next?")
+        self.assertNotIn("text 'menu'", reply)
+
+    def test_finisher_gets_reply_nudge_in_last_user_turn(self):
+        responses = [_tool_use_response(), _text_response(""), _text_response("Logged! How was the curry?")]
+        reply, client = self._run(responses)
+        self.assertEqual(reply, "Logged! How was the curry?")
+        last = client.messages.create.call_args_list[-1][1]["messages"][-1]
+        self.assertEqual(last["role"], "user")
+        self.assertIn("Reply to David now", last["content"][-1]["text"])
+
+    def test_blank_finisher_asks_about_next_meal(self):
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [_tool_use_response(), _text_response(""), _text_response("")]
+        fake_anthropic = MagicMock()
+        fake_anthropic.Anthropic.return_value = fake_client
+        session = {"feedback_queue": ["Adobo Fish Tacos"], "week_start": "2026-11-23"}
+        with patch.dict(sys.modules, {"anthropic": fake_anthropic}), \
+             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}), \
+             patch("agents.menu_workflow._execute_menu_tool", return_value="ok"):
+            reply = mw.menu_agent_reply("great", session=session, config=FAKE_CONFIG)
+        self.assertEqual(reply, "Got it! How was Adobo Fish Tacos?")
+
+    def test_fallback_shows_plan_when_meals_selected(self):
+        reply = mw._fallback_reply({"week_start": "2026-11-23", "selected_meals": {"Mon": "Test Pasta"}})
+        self.assertIn("Test Pasta", reply)
+        self.assertTrue(reply.endswith("Anything to change?"))
 
     def test_tool_rounds_persist_already_done_notes(self):
         responses = [
@@ -968,6 +1002,118 @@ class TestAgentLoop(_Base):
         convo = self._session()["conversation"]
         self.assertTrue(convo[-2]["content"].startswith("[already done:"))
         self.assertEqual(convo[-1]["content"], "Here's the plan.")
+
+
+class TestNov22Fixes(_Base):
+    """Eating-out nights, our own recipe-site links, and confirmation turns."""
+
+    def _approval_session(self) -> dict:
+        s = {"week_start": "2026-11-23", "selected_meals": {"Mon": "Test Pasta"},
+             "quick_days": [], "cuisine_direction": ""}
+        self._write_session(s)
+        return s
+
+    def test_eating_out_replacement_becomes_reason(self):
+        session = self._approval_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_SUCCESS) as call:
+            mw._execute_menu_tool("swap_meal", {"day": "Mon", "reason": "going out to eat",
+                                                "replacement": "Going Out to Eat"}, session, FAKE_CONFIG)
+        kwargs = call.call_args[1]
+        self.assertEqual(kwargs["replacement"], "")
+        self.assertEqual(kwargs["reason"], "eating out")
+        self.assertNotIn("confirmed", kwargs)
+
+    def test_real_recipe_replacement_untouched(self):
+        session = self._approval_session()
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_SUCCESS) as call:
+            mw._execute_menu_tool("swap_meal", {"day": "Mon", "reason": "x", "replacement": "Test Tacos"},
+                                  session, FAKE_CONFIG)
+        self.assertEqual(call.call_args[1]["replacement"], "Test Tacos")
+
+    def test_own_site_link_swaps_by_name_confirmed(self):
+        session = self._approval_session()
+        with patch("agents.menu_workflow.recipe_name_for_site_url", return_value="Thai Red Curry Noodles"), \
+             patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_SUCCESS) as call:
+            mw._execute_menu_tool("add_recipe_url", {"url": "https://site/Thai_Red_Curry_Noodles", "day": "Fri"},
+                                  session, FAKE_CONFIG)
+        call.assert_called_once()
+        self.assertEqual(call.call_args[0][0], "swap_meal")
+        self.assertEqual(call.call_args[1]["replacement"], "Thai Red Curry Noodles")
+        self.assertTrue(call.call_args[1]["confirmed"])
+
+    def test_own_site_link_without_day_asks_for_day(self):
+        session = self._approval_session()
+        with patch("agents.menu_workflow.recipe_name_for_site_url", return_value="Thai Red Curry Noodles"), \
+             patch("agents.menu_workflow.call_menubuilder_tool") as call:
+            reply = mw._execute_menu_tool("add_recipe_url", {"url": "https://site/x"}, session, FAKE_CONFIG)
+        call.assert_not_called()
+        self.assertIn("which day", reply)
+
+    def test_other_links_still_fetched(self):
+        session = self._approval_session()
+        with patch("agents.menu_workflow.recipe_name_for_site_url", return_value=None), \
+             patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"status": "added", "recipe": "Chili", "swapped_day": "Mon"}) as call:
+            mw._execute_menu_tool("add_recipe_url", {"url": "https://example.com/chili", "day": "Mon"},
+                                  session, FAKE_CONFIG)
+        self.assertEqual(call.call_args[0][0], "process_recipe_url")
+
+    def _run(self, responses, tool_results, session=None, text="move curry to friday"):
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = responses
+        fake_anthropic = MagicMock()
+        fake_anthropic.Anthropic.return_value = fake_client
+        results = iter(tool_results)
+
+        def fake_tool(name, tool_input, sess, config):
+            result, asks = next(results)
+            if asks:
+                sess["state"] = "awaiting_recipe_confirmation"
+            return result
+
+        with patch.dict(sys.modules, {"anthropic": fake_anthropic}), \
+             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}), \
+             patch("agents.menu_workflow._execute_menu_tool", side_effect=fake_tool):
+            reply = mw.menu_agent_reply(text, session=session if session is not None else {},
+                                        config=FAKE_CONFIG)
+        return reply, fake_client
+
+    def test_confirmation_question_ends_the_turn(self):
+        question = "Is this the right recipe? Test Curry - https://site/Test_Curry"
+        reply, client = self._run([_tool_use_response(), _text_response("Yep, that's the one!")],
+                                  [(question, True)])
+        self.assertEqual(reply, question)
+        self.assertEqual(client.messages.create.call_count, 1)
+        self.assertEqual(self._session()["conversation"][-1]["content"], question)
+
+    def test_failure_earlier_in_turn_is_reported_with_question(self):
+        question = "Is this the right recipe? Test Curry - https://site/Test_Curry"
+        reply, _ = self._run(
+            [_tool_use_response(tool_id="a"), _tool_use_response(tool_id="b"), _text_response("All done!")],
+            [("Couldn't make that swap: nope", False), (question, True)])
+        self.assertEqual(reply, "Couldn't make that swap: nope\n\n" + question)
+
+    def test_unclear_confirmation_reply_goes_to_agent_with_context(self):
+        session = {"state": "awaiting_recipe_confirmation", "week_start": "2026-11-23",
+                   "pending_confirmation": {"tool": "swap_meal", "args": {}, "options": ["Test Curry"]},
+                   "pending_suggested": "Test Curry", "conversation": []}
+        self._write_session(session)
+        reply, client = self._run([_text_response("Got it, a red curry pasta then?")], [],
+                                  session=session, text="Friday is not right, should be a pasta")
+        self.assertEqual(reply, "Got it, a red curry pasta then?")
+        self.assertNotEqual(self._session().get("state"), "awaiting_recipe_confirmation")
+
+    def test_confirmed_pick_is_remembered_in_conversation(self):
+        session = {"state": "awaiting_recipe_confirmation", "week_start": "2026-11-23",
+                   "selected_meals": {"Fri": "Test Pasta"}, "quick_days": [],
+                   "pending_confirmation": {"tool": "swap_meal", "args": {"day": "Fri"}, "options": ["Test Curry"]},
+                   "pending_suggested": "Test Curry", "conversation": []}
+        self._write_session(session)
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_SUCCESS):
+            mw.menu_agent_reply("yes", session=session, config=FAKE_CONFIG)
+        convo = self._session()["conversation"]
+        self.assertTrue(convo[-2]["content"].endswith("] yes"))
+        self.assertEqual(convo[-1]["role"], "assistant")
 
 
 if __name__ == "__main__":

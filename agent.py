@@ -157,7 +157,13 @@ def get_reply(handle: str, text: str, config: dict, history_key: Optional[str] =
                 for block in response.content:
                     if block.type == "tool_use":
                         result = execute_tool(block.name, block.input, handle, config)
-                        log.info(f"Tool {block.name} -> {result[:80]}")
+                        log.info(f"Tool {block.name}({json.dumps(block.input, default=str)[:200]}) -> {result[:80]}")
+                        if result.startswith("needs_confirmation:"):
+                            # Send the question and end the turn, so the model
+                            # can't answer it or move on before the person picks
+                            reply = result[len("needs_confirmation:"):].split("\nSend that to the user")[0].strip()
+                            history.append({"role": "assistant", "content": reply})
+                            return reply
                         result_key = result[:80]
                         if seen_tool_results.get(block.name) == result_key:
                             log.warning(f"Stuck loop on {block.name} for {handle}, resetting context")

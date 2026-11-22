@@ -283,6 +283,29 @@ def find_all_recipe_matches(message: str, effort: Optional[str] = None) -> list[
         return []
 
 
+MENUBUILDER_CONFIG = Path("/Users/davidallison/projects/personal/MenuBuilder/config.json")
+
+
+def recipe_name_for_site_url(url: str) -> Optional[str]:
+    """The collection recipe a link to our own recipe site points at, or None.
+    Those pages are rendered markdown, so fetching one as a new recipe fails
+    ("Expecting value", Nov 22 2026)."""
+    try:
+        base = json.loads(MENUBUILDER_CONFIG.read_text()).get("github_pages_base_url", "").rstrip("/")
+        data = json.loads(METADATA_FILE.read_text())
+    except Exception:
+        return None
+    if not base or not url.strip().startswith(base + "/"):
+        return None
+    slug = url.strip()[len(base) + 1:].split("?")[0].split("#")[0].strip("/")
+    if slug.endswith(".html"):
+        slug = slug[:-5]
+    for name, meta in data.get("recipes", data).items():
+        if isinstance(meta, dict) and meta.get("filename") and Path(meta["filename"]).stem == slug:
+            return name
+    return None
+
+
 def extract_recipe_text(pdf_path: Path) -> Optional[str]:
     path = Path(pdf_path)
     try:
