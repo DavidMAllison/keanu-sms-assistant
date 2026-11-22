@@ -263,5 +263,45 @@ class TestPartnerReplyOutcomeTexts(unittest.TestCase):
         self.assertIn("Handle manually", self.outbox[0][1])
 
 
+class TestForwardUncapturedPartnerText(unittest.TestCase):
+    """Only texts sent while her signoff is pending are forwarded to David
+    (2026-11-22: every Sunday text of hers was forwarded)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.pending_file = self.tmp / "menu_pending.json"
+        self.outbox = []
+        self._ps = [
+            patch.object(server, "MENU_PENDING_FILE", self.pending_file),
+            patch.object(server, "queue_outbox",
+                         side_effect=lambda e: self.outbox.append((e["handle"], e["text"]))),
+        ]
+        for p in self._ps:
+            p.start()
+
+    def tearDown(self):
+        for p in self._ps:
+            p.stop()
+
+    def _pending(self):
+        self.pending_file.write_text(json.dumps({"sent_at": "2026-11-22T09:20:00",
+                                                 "partner_handle": _PARTNER}))
+
+    def test_forwarded_while_signoff_pending(self):
+        self._pending()
+        self.assertTrue(server.maybe_forward_uncaptured_partner_text(_PARTNER, "hmm tacos?", FAKE_CONFIG))
+        self.assertEqual(self.outbox, [(_ADMIN, "Partner texted while the menu is waiting on her, "
+                                                "not read as her answer: hmm tacos?")])
+
+    def test_not_forwarded_when_nothing_pending(self):
+        self.assertFalse(server.maybe_forward_uncaptured_partner_text(_PARTNER, "Yes", FAKE_CONFIG))
+        self.assertEqual(self.outbox, [])
+
+    def test_not_forwarded_from_someone_else(self):
+        self._pending()
+        self.assertFalse(server.maybe_forward_uncaptured_partner_text(_ADMIN, "Yes", FAKE_CONFIG))
+        self.assertEqual(self.outbox, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -891,6 +891,26 @@ def maybe_capture_partner_reply(handle: str, text: str, config: dict) -> bool:
         return False
 
 
+def maybe_forward_uncaptured_partner_text(handle: str, text: str, config: dict) -> bool:
+    """While the menu still waits on the partner's signoff, forward to David
+    any text of hers that wasn't read as her answer — it may be a menu reply
+    the classifier missed. Replaces forwarding every Sunday text, which sent
+    David each of her chat messages (2026-11-22). Returns True if forwarded."""
+    admin = config["security"].get("menu_admin")
+    if not admin or not MENU_PENDING_FILE.exists():
+        return False
+    try:
+        pending = json.loads(MENU_PENDING_FILE.read_text())
+    except Exception:
+        return False
+    if handle != pending.get("partner_handle"):
+        return False
+    queue_outbox({"handle": admin, "text": f"{_partner_name(config)} texted while the menu is "
+                                          f"waiting on her, not read as her answer: {text}"})
+    log.info(f"Forwarded uncaptured partner text from {handle} to admin")
+    return True
+
+
 # ── iMessage send ──────────────────────────────────────────────────────────────
 # send_imessage and send_imessage_group imported from tools
 
@@ -1689,16 +1709,7 @@ def main():
                 if maybe_capture_partner_reply(handle, text, config):
                     continue
 
-                # Sunday menu feedback from idea submitters → forward to admin
-                admin = config["security"].get("menu_admin")
-                idea_submitters = config["security"].get("idea_submitters", [])
-                if (date.today().weekday() == 6
-                        and handle in idea_submitters
-                        and handle != admin
-                        and admin):
-                    sender_name = config["security"].get("handle_to_person", {}).get(handle, "Family member")
-                    queue_outbox({"handle": admin, "text": f"{sender_name} re: menu — {text}"})
-                    log.info(f"Forwarded Sunday menu feedback from {handle} to admin")
+                maybe_forward_uncaptured_partner_text(handle, text, config)
 
                 # Everything else goes through the agent
                 reply = get_reply(handle, text, config)
