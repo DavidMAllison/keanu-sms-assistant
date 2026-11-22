@@ -1058,6 +1058,25 @@ class TestNov22Fixes(_Base):
                                   session, FAKE_CONFIG)
         self.assertEqual(call.call_args[0][0], "process_recipe_url")
 
+    def test_generate_reports_dish_placements(self):
+        session = self._approval_session()
+        result = {"selected_meals": {"Mon": "Test Pasta", "Fri": "Thai Red Curry Noodles"},
+                  "quick_days": [], "dish_placements": {"Fri": "Thai Red Curry Noodles"}}
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=result):
+            reply = mw._execute_menu_tool("generate_meal_plan",
+                                          {"cuisine_direction": "red curry pasta one night"},
+                                          session, FAKE_CONFIG)
+        self.assertTrue(reply.endswith("\n\nThai Red Curry Noodles is on Fri, like you asked."))
+
+    def test_generate_without_placements_unchanged(self):
+        session = self._approval_session()
+        result = {"selected_meals": {"Mon": "Test Pasta"}, "quick_days": []}
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=result):
+            reply = mw._execute_menu_tool("generate_meal_plan", {"cuisine_direction": "mix it up"},
+                                          session, FAKE_CONFIG)
+        self.assertNotIn("like you asked", reply)
+        self.assertIn("Test Pasta", reply)
+
     def _run(self, responses, tool_results, session=None, text="move curry to friday"):
         fake_client = MagicMock()
         fake_client.messages.create.side_effect = responses

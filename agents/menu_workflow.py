@@ -957,7 +957,12 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
 
         # MCP already wrote to activity — no advance_to_meal_approval needed
         ws = date.fromisoformat(session.get("week_start", date.today().isoformat()))
-        return _format_numbered_list(selected, ws)
+        plan = _format_numbered_list(selected, ws)
+        # Dishes named in the request ("red curry pasta one night") that
+        # MenuBuilder gave a night of their own
+        placed = [f"{recipe} is on {day}, like you asked."
+                  for day, recipe in (result.get("dish_placements") or {}).items()]
+        return "\n\n".join([plan, "\n".join(placed)]) if placed else plan
 
     if tool_name == "swap_meal":
         return _menu_swap(tool_input.get("day", ""), tool_input.get("reason", ""),
