@@ -1135,5 +1135,69 @@ class TestNov22Fixes(_Base):
         self.assertEqual(convo[-1]["role"], "assistant")
 
 
+class TestCarryOverUnmadeMeals(_Base):
+    """2026-11-22: "didn't make it" was saved as feedback but never offered back."""
+
+    def _plan_session(self, **extra) -> dict:
+        s = {"week_start": "2026-11-23", "selected_meals": {"Mon": "Test Pasta"},
+             "quick_days": [], "cuisine_direction": ""}
+        s.update(extra)
+        self._write_session(s)
+        return s
+
+    def test_last_feedback_keeps_not_cooked_meals(self):
+        session = self._plan_session(last_week_meals=[{"day": "Sat", "name": "Test Rice Soup"}],
+                                feedback_queue=["Test Rice Soup"])
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"not_cooked_meals": ["Test Rice Soup"]}):
+            mw._execute_menu_tool("log_meal_feedback",
+                                  {"meal_name": "Test Rice Soup", "feedback": "didn't make it"},
+                                  session, FAKE_CONFIG)
+        self.assertEqual(session["not_cooked_meals"], ["Test Rice Soup"])
+
+    def test_curly_apostrophe_sent_straight(self):
+        session = self._plan_session(last_week_meals=[{"day": "Sat", "name": "Test Rice Soup"}],
+                                feedback_queue=["Test Rice Soup", "Test Tacos"])
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value={}) as call:
+            mw._execute_menu_tool("log_meal_feedback",
+                                  {"meal_name": "Test Rice Soup", "feedback": "didn\u2019t make it"},
+                                  session, FAKE_CONFIG)
+        self.assertEqual(call.call_args[1]["feedback"], "Test Rice Soup: didn't make it")
+
+    def test_plan_offers_unmade_meal(self):
+        session = self._plan_session(not_cooked_meals=["Test Rice Soup"])
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"selected_meals": {"Mon": "Test Pasta"}, "quick_days": []}):
+            reply = mw._execute_menu_tool("generate_meal_plan", {"cuisine_direction": "mix it up"},
+                                          session, FAKE_CONFIG)
+        self.assertTrue(reply.endswith("Not made last week: Test Rice Soup. Want it on a night this week?"))
+
+    def test_no_offer_when_already_in_plan(self):
+        session = self._plan_session(not_cooked_meals=["Test Pasta"])
+        with patch("agents.menu_workflow.call_menubuilder_tool",
+                   return_value={"selected_meals": {"Mon": "Test Pasta"}, "quick_days": []}):
+            reply = mw._execute_menu_tool("generate_meal_plan", {"cuisine_direction": ""},
+                                          session, FAKE_CONFIG)
+        self.assertNotIn("Not made last week", reply)
+
+    def test_carry_over_swaps_confirmed(self):
+        session = self._plan_session(not_cooked_meals=["Test Rice Soup"])
+        with patch("agents.menu_workflow.call_menubuilder_tool", return_value=SWAP_SUCCESS) as call:
+            mw._execute_menu_tool("carry_over_meal", {"meal_name": "test rice soup", "day": "Tue"},
+                                  session, FAKE_CONFIG)
+        self.assertEqual(call.call_args[0][0], "swap_meal")
+        self.assertEqual(call.call_args[1]["day"], "Tue")
+        self.assertEqual(call.call_args[1]["replacement"], "Test Rice Soup")
+        self.assertTrue(call.call_args[1]["confirmed"])
+
+    def test_carry_over_rejects_other_names(self):
+        session = self._plan_session(not_cooked_meals=["Test Rice Soup"])
+        with patch("agents.menu_workflow.call_menubuilder_tool") as call:
+            reply = mw._execute_menu_tool("carry_over_meal", {"meal_name": "Test Steak", "day": "Tue"},
+                                          session, FAKE_CONFIG)
+        call.assert_not_called()
+        self.assertTrue(reply.startswith("Couldn't"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -468,6 +468,10 @@ def handle_partner_reply(text: str, session: dict, config: dict):
     """
     Called from server.py after the partner replies while awaiting partner signoff.
     Delegates to MenuBuilder via bridge.
+
+    Returns True when she has already been sent the outcome (the re-sent menu,
+    "Plan ready!", or a URL result), so the caller skips its generic
+    "Passed it on to David" — which was wrong when Keanu made the change itself.
     """
     admin_handle = config["security"].get("menu_admin")
     partner_handle = config["security"].get("partner_handle", "")
@@ -475,7 +479,7 @@ def handle_partner_reply(text: str, session: dict, config: dict):
     # If we're mid URL-swap resolution, handle that first
     if session.get("pending_url_swap"):
         _handle_pending_url_swap(text, session, config)
-        return
+        return True
 
     result = call_menubuilder_tool("handle_partner_reply", reply=text)
 
@@ -513,21 +517,25 @@ def handle_partner_reply(text: str, session: dict, config: dict):
                     _send_to_partner(f"Added {new_recipe}, but couldn't swap it onto {day} — David will sort it.", partner_handle)
                     if admin_handle:
                         _send_outbox(admin_handle, f"{_partner_name(config)}'s URL {how} '{new_recipe}' but swap onto {day} failed: {swap_result['error']}")
-                    return
+                    return True
                 _send_to_partner(f"Got it — swapped {day} to {new_recipe}.", partner_handle)
             if admin_handle:
                 _send_outbox(admin_handle, f"{_partner_name(config)}'s URL {how} '{new_recipe}' and scheduled for {day}.")
+            # No day in her message: nothing was sent to her
+            return bool(day)
         else:
             _send_to_partner("Couldn't fetch that recipe. Can you paste the name?", partner_handle)
             if admin_handle:
                 _send_outbox(admin_handle, f"{_partner_name(config)} sent an unfetchable URL: {url}")
-        return
+        return True
 
     new_state = result.get("state", "")
 
     if new_state == "complete":
+        # MenuBuilder's finalize texts both of them "Plan ready!" with the site link
         if admin_handle:
-            _send_outbox(admin_handle, "Plan written, apps launched.")
+            _send_outbox(admin_handle, f"{_partner_name(config)} approved the menu: '{text}'")
+        return True
     elif new_state == "awaiting_idea_activation":
         pending_ideas = result.get("pending_ideas", [])  # list of {"name": str, "source_url": str}
         if admin_handle and pending_ideas:
@@ -547,21 +555,24 @@ def handle_partner_reply(text: str, session: dict, config: dict):
                 session["state"] = "awaiting_idea_url"
                 _save_session(session)
                 _send_outbox(admin_handle, f"I don't have a source URL for '{name}'. What's the URL?")
+        return False
     elif new_state in SIGNOFF_STATES:
         if result.get("parsed") is False:
             # Unparseable reply — nothing was changed or re-sent
             _recreate_pending_file(partner_handle)
             if admin_handle:
                 _send_outbox(admin_handle, f"Couldn't parse {_partner_name(config)}'s reply: '{text}'. Handle manually.")
+            return False
         else:
             # Partner requested a change — MenuBuilder re-sent the updated menu.
             # Re-arm capture so her reply to the re-sent menu isn't missed.
             _recreate_pending_file(partner_handle)
             if admin_handle:
-                _send_outbox(admin_handle, f"{_partner_name(config)} requested a change: '{text}'. Updated and re-sent.")
-    else:
-        if admin_handle:
-            _send_outbox(admin_handle, f"{_partner_name(config)} replied but something went wrong. Handle manually: '{text}'")
+                _send_outbox(admin_handle, f"{_partner_name(config)} asked for a change: '{text}'. Updated and re-sent to her.")
+            return True
+    if admin_handle:
+        _send_outbox(admin_handle, f"{_partner_name(config)} replied but something went wrong. Handle manually: '{text}'")
+    return False
 
 
 # ── _handle_pending_url_swap ──────────────────────────────────────────────────
@@ -818,6 +829,28 @@ def _build_menu_tools() -> list:
             },
         },
         {
+            "name": "carry_over_meal",
+            "description": (
+                "Put a meal that wasn't made last week onto a night this week. Only for the meals "
+                "the plan lists as 'Not made last week'. Call when David says yes and names the "
+                "night; ask which night if he didn't say."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "meal_name": {
+                        "type": "string",
+                        "description": "Exact meal name from the 'Not made last week' line",
+                    },
+                    "day": {
+                        "type": "string",
+                        "description": "Three-letter day abbreviation: Mon, Tue, Wed, Thu, Fri, Sat, or Sun",
+                    },
+                },
+                "required": ["meal_name", "day"],
+            },
+        },
+        {
             "name": "approve_menu",
             "description": (
                 "Approve the current meal plan and send it to the menu partner for sign-off. "
@@ -877,7 +910,8 @@ def _menu_swap(day: str, reason: str, replacement, session: dict, confirmed: boo
 def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: dict) -> str:
     if tool_name == "log_meal_feedback":
         meal_name = tool_input.get("meal_name", "")
-        feedback = tool_input.get("feedback", "")
+        # MenuBuilder spots "didn't make it" with a straight apostrophe only
+        feedback = tool_input.get("feedback", "").replace("’", "'")
         meals = session.get("last_week_meals", [])
         queue = session.get("feedback_queue", [])
 
@@ -905,6 +939,9 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         # When all feedback is collected, signal done and handle first-cook detection
         if not queue:
             result = call_menubuilder_tool("log_meal_feedback", feedback="done")
+            # Skipped meals get a cooldown in MenuBuilder, so the plan won't
+            # pick them — offered back to David once the plan is shown
+            session["not_cooked_meals"] = result.get("not_cooked_meals", [])
             first_cooks = result.get("first_cook_meals", [])
             if first_cooks:
                 session["first_cook_queue"] = first_cooks
@@ -962,7 +999,21 @@ def _execute_menu_tool(tool_name: str, tool_input: dict, session: dict, config: 
         # MenuBuilder gave a night of their own
         placed = [f"{recipe} is on {day}, like you asked."
                   for day, recipe in (result.get("dish_placements") or {}).items()]
+        skipped = [m for m in session.get("not_cooked_meals", []) if m not in selected.values()]
+        if skipped:
+            placed.append(f"Not made last week: {', '.join(skipped)}. Want it on a night this week?")
         return "\n\n".join([plan, "\n".join(placed)]) if placed else plan
+
+    if tool_name == "carry_over_meal":
+        meal_name = tool_input.get("meal_name", "")
+        day = tool_input.get("day", "")
+        skipped = session.get("not_cooked_meals", [])
+        match = next((m for m in skipped if m.lower() == meal_name.strip().lower()), None)
+        if not match:
+            return (f"Couldn't carry that over: '{meal_name}' isn't one of last week's unmade meals "
+                    f"({', '.join(skipped) or 'none'}). Use swap_meal for other recipes.")
+        # Name came from MenuBuilder's not_cooked_meals, not typed — trusted
+        return _menu_swap(day, "carry over a meal not made last week", match, session, confirmed=True)
 
     if tool_name == "swap_meal":
         return _menu_swap(tool_input.get("day", ""), tool_input.get("reason", ""),

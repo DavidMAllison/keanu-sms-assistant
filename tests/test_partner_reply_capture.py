@@ -63,7 +63,9 @@ class TestMaybeCapturePartnerReply(unittest.TestCase):
             side_effect=lambda entry: self.outbox.append((entry["handle"], entry["text"])))
         self._p_har = patch.object(
             server.menu_workflow, "handle_partner_reply",
-            side_effect=lambda text, session, config: self.handle_partner_reply_calls.append(text))
+            side_effect=lambda text, session, config: (
+                self.handle_partner_reply_calls.append(text), self._answered)[1])
+        self._answered = True
         self._p_send.start()
         self._p_outbox.start()
         self._p_har.start()
@@ -108,6 +110,36 @@ class TestMaybeCapturePartnerReply(unittest.TestCase):
         response = json.loads(self.response_file.read_text())
         self.assertEqual(response["message"], "Looks good")
         self.assertEqual(self.handle_partner_reply_calls, ["Looks good"])
+
+    # 2026-11-22: each reply sent David a generic notice on top of the
+    # workflow's own, and told her "Passed it on" when Keanu made the change
+
+    def test_answered_reply_sends_no_generic_texts(self):
+        self._answered = True
+        self._run("Looks good", {
+            "classify_partner_reply": "approve",
+            "get_workflow_state": {"state": "awaiting_partner_signoff"},
+        })
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.outbox, [])
+
+    def test_unanswered_reply_gets_passed_on_but_no_generic_admin_notice(self):
+        self._answered = False
+        self._run("Hmm not sure", {
+            "classify_partner_reply": "swap_request",
+            "get_workflow_state": {"state": "awaiting_partner_signoff"},
+        })
+        self.assertEqual(self.sent, [(_PARTNER, "Thanks! Passed it on to David.")])
+        self.assertEqual(self.outbox, [])
+
+    def test_workflow_error_falls_back_to_both_generic_texts(self):
+        self._p_har.stop()
+        with patch.object(server.menu_workflow, "handle_partner_reply", side_effect=RuntimeError("bridge down")):
+            self._run("Looks good", {
+                "classify_partner_reply": "approve",
+                "get_workflow_state": {"state": "awaiting_partner_signoff"},
+            })
+        self._p_har.start()
         self.assertEqual(self.sent, [(_PARTNER, "Thanks! Passed it on to David.")])
         self.assertEqual(self.outbox, [(_ADMIN, "Partner replied to the menu: Looks good")])
 
@@ -121,6 +153,8 @@ class TestMaybeCapturePartnerReply(unittest.TestCase):
         )
         self.assertTrue(result)
         self.assertEqual(self.handle_partner_reply_calls, [])
+        self.assertEqual(self.sent, [(_PARTNER, "Thanks! Passed it on to David.")])
+        self.assertEqual(self.outbox, [(_ADMIN, "Partner replied to the menu: Looks good")])
 
     # ── Case 3: bridge failure fails safe ───────────────────────────────────
 
@@ -183,6 +217,50 @@ class TestChangeRequestRearmsPending(unittest.TestCase):
         self.assertTrue(self.pending_file.exists())
         saved = json.loads(self.pending_file.read_text())
         self.assertEqual(saved["partner_handle"], _PARTNER)
+
+
+class TestPartnerReplyOutcomeTexts(unittest.TestCase):
+    """handle_partner_reply sends David one outcome text and reports whether
+    she was answered, so server.py can skip its generic texts."""
+
+    def setUp(self):
+        import agents.menu_workflow as menu_workflow
+        self.mw = menu_workflow
+        self.tmp = Path(tempfile.mkdtemp())
+        self.outbox = []
+        self._ps = [
+            patch.object(menu_workflow, "MENU_PENDING_FILE", self.tmp / "menu_pending.json"),
+            patch.object(menu_workflow, "_send_outbox",
+                         side_effect=lambda h, t: self.outbox.append((h, t))),
+        ]
+        for p in self._ps:
+            p.start()
+
+    def tearDown(self):
+        for p in self._ps:
+            p.stop()
+
+    def _reply(self, text, bridge_result):
+        with patch.object(self.mw, "call_menubuilder_tool", MagicMock(return_value=bridge_result)):
+            return self.mw.handle_partner_reply(text, {}, FAKE_CONFIG)
+
+    def test_change_request_is_answered_with_one_admin_text(self):
+        answered = self._reply("Pick something else for Monday",
+                               {"state": "awaiting_partner_signoff", "parsed": True})
+        self.assertTrue(answered)
+        self.assertEqual(self.outbox, [(_ADMIN, "Partner asked for a change: "
+                                                "'Pick something else for Monday'. Updated and re-sent to her.")])
+
+    def test_approval_is_answered_and_names_her_reply(self):
+        answered = self._reply("Looks good", {"state": "complete"})
+        self.assertTrue(answered)
+        self.assertEqual(self.outbox, [(_ADMIN, "Partner approved the menu: 'Looks good'")])
+
+    def test_unparsed_reply_is_not_answered(self):
+        answered = self._reply("hmm", {"state": "awaiting_partner_signoff", "parsed": False})
+        self.assertFalse(answered)
+        self.assertEqual(len(self.outbox), 1)
+        self.assertIn("Handle manually", self.outbox[0][1])
 
 
 if __name__ == "__main__":

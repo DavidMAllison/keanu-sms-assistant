@@ -863,22 +863,28 @@ def maybe_capture_partner_reply(handle: str, text: str, config: dict) -> bool:
             "message": text,
         }))
         MENU_PENDING_FILE.unlink()
-        admin_handle = config["security"].get("menu_admin")
-        if admin_handle:
-            queue_outbox({"handle": admin_handle, "text": f"{_partner_name(config)} replied to the menu: {text}"})
-        send_imessage(handle, "Thanks! Passed it on to David.")
         log.info(f"Menu feedback captured from {handle}: {text[:80]}")
-        # Also advance the menu workflow if awaiting the partner's signoff
-        # (bridge state — read via get_workflow_state, never from menu_session.json)
+        # Advance the menu workflow if awaiting the partner's signoff
+        # (bridge state — read via get_workflow_state, never from menu_session.json).
+        # handle_partner_reply texts David the outcome itself and says whether
+        # she was answered, so the generic texts below go only when it didn't run
+        # or didn't answer her — otherwise each reply sent David two notices.
+        dispatched = answered = False
         try:
             wf = _call_menubuilder_tool("get_workflow_state")
             if isinstance(wf, dict) and wf.get("state") in menu_workflow.SIGNOFF_STATES:
                 wf_session = {}
                 if MENU_SESSION_FILE.exists():
                     wf_session = json.loads(MENU_SESSION_FILE.read_text())
-                menu_workflow.handle_partner_reply(text, wf_session, config)
+                answered = bool(menu_workflow.handle_partner_reply(text, wf_session, config))
+                dispatched = True
         except Exception as e:
             log.error(f"Partner reply session update error: {e}")
+        admin_handle = config["security"].get("menu_admin")
+        if admin_handle and not dispatched:
+            queue_outbox({"handle": admin_handle, "text": f"{_partner_name(config)} replied to the menu: {text}"})
+        if not answered:
+            send_imessage(handle, "Thanks! Passed it on to David.")
         return True
     except Exception as e:
         log.error(f"Menu pending check error: {e}")
