@@ -946,46 +946,73 @@ def _tool_get_schedule(person: str, event_type: str = "any") -> str:
     return "\n".join(lines)
 
 
+# Words that say nothing about which dish it is — "with" alone matched most of the collection
+_SIMILARITY_FILLER = {
+    "with", "and", "the", "for", "recipe", "easy", "quick", "best", "simple",
+    "homemade", "style", "from", "into", "our", "your",
+}
+
+
+def _name_words(text: str) -> set:
+    """Distinct meaningful words in a recipe name, slug or filename."""
+    return {w for w in re.findall(r"[a-z]+", text.lower())
+            if len(w) > 2 and w not in _SIMILARITY_FILLER}
+
+
+def _names_similar(a: set, b: set) -> bool:
+    """At least 2 shared words, making up at least half of both names' words."""
+    shared = a & b
+    return len(shared) >= 2 and len(shared) / len(a | b) >= 0.5
+
+
+def _norm_url(u: str) -> str:
+    return re.sub(r"^https?://(www\.)?", "", u.strip().lower()).rstrip("/")
+
+
 def _tool_check_recipe_similarity(content: str) -> str:
     results = []
 
-    # 1. Exact URL match in ideas list
     url_match = re.search(r"https?://\S+", content)
     url = url_match.group().rstrip(".,)") if url_match else None
-    if url and IDEAS_DIR.exists():
-        for f in IDEAS_DIR.iterdir():
-            if f.suffix == ".txt" and url in f.read_text():
-                results.append(f"Already in ideas list: {f.name}")
+    slug = re.sub(r"^\d+[-_]?", "", url.rstrip("/").split("/")[-1]) if url else ""
+    search_term = slug.replace("-", " ").replace("_", " ") if url else content
+    search_words = _name_words(search_term)
 
-    # 2. Name/keyword match against ideas list filenames
     if IDEAS_DIR.exists():
-        slug = url_match and re.sub(r"^\d+[-_]?", "", url.rstrip("/").split("/")[-1]) or ""
-        slug_words = [w for w in re.split(r"[-_]", slug) if len(w) > 3]
+        # 1. Exact URL match in ideas list
+        if url:
+            for f in IDEAS_DIR.iterdir():
+                if f.suffix == ".txt" and url in f.read_text():
+                    results.append(f"Already in ideas list: {f.name}")
+
+        # 2. Name match against ideas list filenames
         for f in IDEAS_DIR.iterdir():
             if f.suffix != ".txt":
                 continue
-            fname = f.stem.lower()
-            if slug_words and sum(1 for w in slug_words if w in fname) >= 2:
+            if _names_similar(search_words, _name_words(f.stem)):
                 if not any(f.name in r for r in results):
                     results.append(f"Similar idea already saved: {f.name}")
 
-    # 3. Keyword match against all JSON entries (active, idea, any status)
-    search_term = slug.replace("-", " ").replace("_", " ") if url else content
-    search_lower = search_term.lower()
+    # 3. Match against all JSON entries (active, idea, any status):
+    # same link, then same name, then similar name
     try:
         meta_data = json.loads(METADATA_FILE.read_text()).get("recipes", {})
     except Exception:
         meta_data = {}
     json_matches = []
+    target_url = _norm_url(url) if url else ""
+    search_key = " ".join(re.findall(r"[a-z0-9]+", search_term.lower()))
     for name, meta in meta_data.items():
         if not isinstance(meta, dict):
             continue
-        name_lower = name.lower()
-        if name_lower == search_lower:
+        if target_url and any(_norm_url(str(meta.get(k) or "")) == target_url
+                              for k in ("url", "source_url")):
             json_matches = [name]
             break
-        words = [w for w in name_lower.split() if len(w) > 3]
-        if len(words) >= 2 and sum(1 for w in words if w in search_lower) >= 2:
+        if " ".join(re.findall(r"[a-z0-9]+", name.lower())) == search_key:
+            json_matches = [name]
+            break
+        if _names_similar(search_words, _name_words(name)):
             json_matches.append(name)
     for name in json_matches[:4]:
         meta = meta_data.get(name, {})

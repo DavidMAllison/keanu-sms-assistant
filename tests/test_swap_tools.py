@@ -167,6 +167,61 @@ class TestRecipeSimilarityListCuisine(unittest.TestCase):
         self.assertIn("Chinese, Taiwanese", reply)
 
 
+class TestRecipeSimilarityMatching(unittest.TestCase):
+
+    RECIPES = {
+        "Test Roasted Chicken Thighs with Potatoes and Green Beans": {
+            "status": "active", "url": "https://example.com/roasted-thighs"},
+        "Test Miso Chicken": {"status": "active"},
+        "Test Khao Man Gai (Thai-Style Chicken and Rice)": {"status": "active"},
+        "Test Green Chicken Chili": {
+            "status": "active", "source_url": "https://www.example.com/recipes/111-test-green-chicken-chili"},
+    }
+
+    def _check(self, content, recipes=None):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            meta_file = Path(d) / "recipe_metadata.json"
+            meta_file.write_text(json.dumps({"recipes": recipes or self.RECIPES}))
+            with patch("tools.METADATA_FILE", meta_file), patch("tools.IDEAS_DIR", Path(d)):
+                return tools._tool_check_recipe_similarity(content)
+
+    def test_shared_generic_words_do_not_match(self):
+        reply = self._check("https://example.com/recipes/222-quick-green-chicken-soup",
+                            {k: v for k, v in self.RECIPES.items() if "Chili" not in k})
+        self.assertNotIn("Roasted Chicken Thighs", reply)
+
+    def test_exact_link_match(self):
+        reply = self._check("http://example.com/recipes/111-test-green-chicken-chili/")
+        self.assertEqual(reply.count("Already in collection"), 1)
+        self.assertIn("Test Green Chicken Chili", reply)
+
+    def test_name_differing_by_punctuation(self):
+        reply = self._check("Test Khao Man Gai Thai Style Chicken and Rice")
+        self.assertEqual(reply.count("Already in collection"), 1)
+        self.assertIn("Test Khao Man Gai", reply)
+
+    def test_near_duplicate_still_flagged(self):
+        reply = self._check("Test Miso Chicken and Rice")
+        self.assertIn("Test Miso Chicken", reply)
+
+    def test_filler_or_repeated_word_alone_does_not_match(self):
+        recipes = {"Test Chicken with Chicken Sauce": {"status": "active"}}
+        self.assertEqual(self._check("Beef with chicken broth", recipes),
+                         "No duplicates or similar recipes found.")
+
+    def test_no_ideas_dir_with_url_does_not_crash(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            meta_file = Path(d) / "recipe_metadata.json"
+            meta_file.write_text(json.dumps({"recipes": {}}))
+            with patch("tools.METADATA_FILE", meta_file), patch("tools.IDEAS_DIR", Path(d) / "missing"):
+                reply = tools._tool_check_recipe_similarity("https://example.com/some-dish")
+        self.assertEqual(reply, "No duplicates or similar recipes found.")
+
+
 class TestAddLunchRecipeUrl(unittest.TestCase):
 
     def _call(self, return_value, force_add=False):
